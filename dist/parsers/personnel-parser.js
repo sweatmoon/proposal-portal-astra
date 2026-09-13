@@ -51,24 +51,36 @@ function extractAnchorSectionHtml(html, anchorName) {
     const nextIdx = rest.search(/<a\s+name="[^"]+"\s*>/i);
     return nextIdx === -1 ? rest : rest.slice(0, nextIdx);
 }
-// ─── 기간 파싱: "2015년10월～2017년3월" or "2015.10 ~ 2017.03" → { start, end } ──
+// ─── 기간 파싱: 구분자 방식 대신 날짜 패턴 직접 추출 ──────────────────────────
+// 지원 형식 (구분자 종류 무관):
+//   YYYY.MM / YYYY년MM월  → "2019.08-2021.05(1년9개월)", "2015년10월～2017년3월"
+//   YYYY-MM              → "2019-08-2021-05", "2019-08~2021-05"
+//   YYYY만               → "2019~2021", "2019년-2021년"
+//   단일 날짜(진행 중)     → "2023.01-현재"  (end = '')
 function parsePeriod(raw) {
-    // 구분자: ～ | ~ | - (단, 연도 내부 - 는 제외)
-    const sep = raw.includes('～') ? '～' : raw.includes('~') ? '~' : ' - ';
-    const parts = raw.split(sep).map(s => s.trim());
     const toYYYYMM = (s) => {
-        const m1 = s.match(/(\d{4})[년.\/\-](\d{1,2})/);
-        if (m1)
-            return `${m1[1]}.${m1[2].padStart(2, '0')}`;
-        const m2 = s.match(/(\d{4})\.(\d{1,2})/);
-        if (m2)
-            return `${m2[1]}.${m2[2].padStart(2, '0')}`;
+        const m = s.match(/(\d{4})[년.\-](\d{1,2})/);
+        if (m)
+            return `${m[1]}.${m[2].padStart(2, '0')}`;
+        if (/^\d{4}$/.test(s))
+            return s; // 연도만 있는 경우 그대로
         return s;
     };
-    return {
-        start: toYYYYMM(parts[0] ?? ''),
-        end: toYYYYMM(parts[1] ?? ''),
-    };
+    // ① YYYY.MM 또는 YYYY년MM 패턴 두 개 추출 (구분자 무관)
+    const m1 = raw.match(/(\d{4}[년.]\d{1,2})[^0-9]*?(\d{4}[년.]\d{1,2})/);
+    if (m1)
+        return { start: toYYYYMM(m1[1]), end: toYYYYMM(m1[2]) };
+    // ② YYYY-MM 형식: matchAll로 전체 추출 → 첫/마지막
+    const hyphenDates = [...raw.matchAll(/\d{4}-\d{2}/g)].map(m => m[0]);
+    if (hyphenDates.length >= 2)
+        return { start: toYYYYMM(hyphenDates[0]), end: toYYYYMM(hyphenDates[hyphenDates.length - 1]) };
+    // ③ 연도만 두 개
+    const years = [...raw.matchAll(/\d{4}/g)].map(m => m[0]);
+    if (years.length >= 2)
+        return { start: years[0], end: years[years.length - 1] };
+    // ④ 단일 날짜 (현재 진행 중 등)
+    const single = raw.match(/(\d{4}[년.]\d{1,2})/);
+    return { start: single ? toYYYYMM(single[1]) : '', end: '' };
 }
 // ─── 메인 파서 ───────────────────────────────────────────────
 export function parsePersonnelHtml(html) {
