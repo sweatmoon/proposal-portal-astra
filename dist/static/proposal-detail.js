@@ -2310,13 +2310,20 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
               if (em) rEmbedAttr = em[1]
             }
             if (!rEmbedAttr) continue
-            console.log(`[PhotoPptx-DBG] si=${si} name=${person.name} rEmbedAttr=${rEmbedAttr}`)
-            // rId → 이 시점에서 targetRemap 아직 미구성이므로 직접 tplZip에서 원본 경로 조회
-            // rawRelsXml은 아직 미정의 → tplZip .rels에서 직접 읽어야 함
-            // 대신: picOrigRidMap에 {rId → origTarget} 저장해두고 targetRemap 구성 후 교체
-            // → _picRidOverride 맵에 기록, targetRemap 구성 이후에 바이트 교체
+            // ── 핵심 수정: 슬롯마다 고유 rId를 새로 발급 ──
+            // 문제: 2인/4인/6인/9인 템플릿의 여러 슬롯 pic이 같은 rId(예: rId2)를 공유
+            // → _picRidOverride["rId2"] = buf 기록 시 마지막 슬롯 사진이 덮어씀
+            // 해결: 슬롯마다 새 rId("_photo_si0", "_photo_si1" ...) 발급,
+            //       원본 rId → 새 rId 매핑을 _picRidOrigMap에 저장 (slideXmlStr 교체 시 사용)
             if (!page._picRidOverride) page._picRidOverride = {}
-            page._picRidOverride[rEmbedAttr] = person.photoArrayBuffer
+            if (!page._picRidOrigMap)  page._picRidOrigMap  = []  // [{origRid, newRid}]
+
+            const newPhotoRid = `_photo_si${si}`
+            page._picRidOverride[newPhotoRid] = person.photoArrayBuffer
+            // 원본 rId → 새 rId 저장 (slideXmlStr에서 이 슬롯 blip만 교체하기 위해)
+            // 단, 같은 origRid가 여러 슬롯에 쓰일 수 있으므로 slotIndex도 함께 저장
+            page._picRidOrigMap.push({ origRid: rEmbedAttr, newRid: newPhotoRid, si })
+            console.log(`[PhotoPptx] si=${si} name=${person.name} origRid=${rEmbedAttr} → newRid=${newPhotoRid}`)
             break  // 슬롯당 사진 1장만 교체
           }
         }
@@ -2408,8 +2415,51 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       }
     )
 
-    // 슬라이드 XML 내 r:embed / r:link / r:id 참조도 동일하게 교체
+    // _photo_si0, _photo_si1 ... 신규 rId → rels에 image Relationship 추가
+    // (슬롯마다 새 rId를 발급했으므로 rels에 해당 Relationship이 없음 → 추가 필요)
+    const picRidOrigMap = page._picRidOrigMap || []
+    const IMAGE_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image'
+    for (const { newRid } of picRidOrigMap) {
+      if (!targetRemap[newRid]) continue  // ①에서 png 파일이 생성되지 않은 경우 skip
+      const finalRid = `rId${++maxRid}`
+      rIdMap[newRid] = finalRid  // 슬라이드 XML r:embed 교체용
+      remappedRelsXml = remappedRelsXml.replace(
+        '</Relationships>',
+        `<Relationship Id="${finalRid}" Type="${IMAGE_TYPE}" Target="${targetRemap[newRid]}"/></Relationships>`
+      )
+      console.log(`[PhotoPptx] rels 추가: ${newRid} → ${finalRid} Target=${targetRemap[newRid]}`)
+    }
+
+    // 슬라이드 XML 내 r:embed 교체
+    // 1단계: 원본 rId → 새 rId 교체 (같은 origRid가 여러 슬롯에 쓰인 경우 순서대로 각각 교체)
+    //   picRidOrigMap: [{origRid:'rId2', newRid:'_photo_si0'}, {origRid:'rId2', newRid:'_photo_si1'}, ...]
+    //   같은 origRid가 슬라이드 XML에 여러 번 등장 → 첫 번째는 si0, 두 번째는 si1 ...
     let slideXmlStr = new XMLSerializer().serializeToString(xmlDoc)
+
+    // origRid별로 교체 대기열 구성 (등장 순서대로 소비)
+    const ridReplaceQueue = {}  // origRid → [newRid, newRid, ...]
+    for (const { origRid, newRid } of picRidOrigMap) {
+      if (!ridReplaceQueue[origRid]) ridReplaceQueue[origRid] = []
+      ridReplaceQueue[origRid].push(newRid)
+    }
+    // blip r:embed가 origRid인 부분을 순서대로 소비하며 교체
+    // XMLSerializer가 r:embed를 다양한 형태로 직렬화할 수 있으므로 패턴을 넓게 잡음
+    // (r:embed="rId2" / xmlns:r="..." r:embed="rId2" / ns0:embed="rId2" 모두 대응)
+    for (const [origRid, queue] of Object.entries(ridReplaceQueue)) {
+      let qIdx = 0
+      // :embed="origRid" 패턴으로 넓게 매칭 (prefix 무관)
+      const escaped = origRid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const pattern = new RegExp(`(:embed=")${escaped}(")`,'g')
+      slideXmlStr = slideXmlStr.replace(pattern, (_, pre, post) => {
+        if (qIdx < queue.length) {
+          const nr = queue[qIdx++]
+          return `${pre}${nr}${post}`
+        }
+        return _ // 큐 소진 후에는 원본 유지
+      })
+    }
+
+    // 2단계: 나머지 rId (슬라이드 레이아웃 등) → rIdMap으로 교체
     slideXmlStr = slideXmlStr.replace(/\br:(embed|link|id)="([^"]+)"/g, (full, attr, oldId) =>
       rIdMap[oldId] ? `r:${attr}="${rIdMap[oldId]}"` : full
     )
