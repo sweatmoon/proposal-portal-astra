@@ -37,6 +37,7 @@ import pptCareerCertificateApiRoute from './routes/ppt-career-certificate.js'
 import pptStaffingStatusApiRoute from './routes/ppt-staffing-status.js'
 import pptCoverApiRoute from './routes/ppt-cover.js'
 import pptAttachmentBundleApiRoute from './routes/ppt-attachment-bundle.js'
+import pptPersonnelProfileApiRoute from './routes/ppt-personnel-profile.js'
 
 // [ppt-portal 추가 기능 — 인력정보 탭] 감리원 경력 확인서 발급요청 엑셀 생성.
 // src/lib/auditor-career-request-doc.ts + xlsx-runtext.ts/xlsx-sheet-clone.ts/
@@ -82,6 +83,7 @@ app.route('/api/ppt-career-certificate',   pptCareerCertificateApiRoute)
 app.route('/api/ppt-staffing-status',      pptStaffingStatusApiRoute)
 app.route('/api/ppt-cover',                pptCoverApiRoute)
 app.route('/api/ppt-attachment-bundle',    pptAttachmentBundleApiRoute)
+app.route('/api/ppt-personnel-profile',    pptPersonnelProfileApiRoute)
 app.route('/api/personnel-career-request', personnelCareerRequestApiRoute)
 
 // ── 페이지 라우트 (홈, /proposals, /personnel, /upload) ───────

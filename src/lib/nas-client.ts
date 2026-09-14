@@ -390,6 +390,61 @@ export async function fetchPersonalStampPngs(personNames: string[]): Promise<Map
   return result
 }
 
+// 인력별 증명사진 PNG가 저장된 폴더.
+// 파일명 패턴: "증명사진(이름).png" (2026-09-14 사용자 확인)
+const PHOTO_FOLDER = '/activo/04.제안팀/99.악티보포털참조용/02.제안/04.증명사진'
+
+/**
+ * 인력 이름 목록으로 증명사진 PNG를 NAS에서 한 번에 찾아 반환합니다.
+ * (이름 → Buffer | null, 못 찾은 사람은 null)
+ *
+ * 파일명 패턴: "증명사진(이름).png"
+ * 로그인/로그아웃은 전체 목록에 대해 1회만 수행하고, 폴더 목록도 1회만 조회해서
+ * 이름별로 필터링합니다(fetchPersonalStampPngs와 동일한 패턴).
+ *
+ * NAS 연동이 실패해도 예외를 던지지 않고 전원 null로 채워 반환합니다 —
+ * 사진을 못 구해도 PPT 생성 자체는 막지 않기 위함입니다.
+ */
+export async function fetchPersonnelPhotos(personNames: string[]): Promise<Map<string, Buffer | null>> {
+  const result = new Map<string, Buffer | null>(personNames.map(name => [name, null]))
+  if (!NAS_BASE_URL || !NAS_USERNAME || !NAS_PASSWORD) {
+    console.warn('[nas-client] NAS_BASE_URL/NAS_USERNAME/NAS_PASSWORD 환경변수가 없어 증명사진 조회를 건너뜁니다.')
+    return result
+  }
+
+  let sid: string
+  try {
+    sid = await login()
+  } catch (e) {
+    console.warn('[nas-client] NAS 로그인 실패:', (e as Error).message)
+    return result
+  }
+
+  try {
+    // 폴더 목록 1회 조회 → 이름별로 재사용
+    let files: { name: string; isdir: boolean }[] = []
+    try {
+      files = await listFolder(sid, PHOTO_FOLDER)
+    } catch (e) {
+      console.warn('[nas-client] 증명사진 폴더 목록 조회 실패:', (e as Error).message)
+    }
+
+    await Promise.all(
+      personNames.map(async name => {
+        // "증명사진(이름).png" 패턴으로 매칭
+        const target = files.find(f => f.name === `증명사진(${name}).png`)
+        if (!target) return
+        const buf = await downloadFile(sid, `${PHOTO_FOLDER}/${target.name}`)
+        if (buf) result.set(name, buf)
+      })
+    )
+  } finally {
+    await logout(sid)
+  }
+
+  return result
+}
+
 // 감리원 경력 확인서 발급요청 엑셀 템플릿 — 재직증명서 발행파일처럼 폴더가 아니라 파일
 // 경로 자체가 고정돼있다(2026-09-08 사용자 확인 — "양식_변경X"라는 파일명 그대로 항상 이
 // 파일 하나만 씀).
