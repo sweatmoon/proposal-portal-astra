@@ -2056,6 +2056,73 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       if (si >= 0 && si < N) slotShapes[si].push(el)
     })
 
+    // ── 슬롯별 pic 요소 별도 분류 ──
+    // slotShapes 귀속 방식(shapeXfrm P_NS 기반)으로 pic이 누락될 수 있으므로
+    // spTree 전체를 재귀 탐색해 pic만 따로 좌표 분류
+    // slotPicEl[si] = 해당 슬롯의 pic DOM 요소 (사진 교체용)
+    function getAllPics(root) {
+      const pics = []
+      function walk(node) {
+        for (const child of Array.from(node.childNodes)) {
+          if (child.nodeType !== 1) continue
+          if (child.localName === 'pic') pics.push(child)
+          else walk(child)
+        }
+      }
+      walk(root)
+      return pics
+    }
+    // pic의 좌표는 p:spPr > a:xfrm > a:off (P_NS 또는 localName 탐색)
+    function getPicXfrm(picEl) {
+      // p:spPr: P_NS 우선, 없으면 localName fallback
+      let spPr = picEl.getElementsByTagNameNS(P_NS, 'spPr')[0]
+      if (!spPr) {
+        for (const c of Array.from(picEl.childNodes)) {
+          if (c.nodeType === 1 && c.localName === 'spPr') { spPr = c; break }
+        }
+      }
+      if (!spPr) return null
+      let xfrm = spPr.getElementsByTagNameNS(A_NS, 'xfrm')[0]
+      if (!xfrm) {
+        for (const c of Array.from(spPr.childNodes)) {
+          if (c.nodeType === 1 && c.localName === 'xfrm') { xfrm = c; break }
+        }
+      }
+      if (!xfrm) return null
+      let off = xfrm.getElementsByTagNameNS(A_NS, 'off')[0]
+      if (!off) {
+        for (const c of Array.from(xfrm.childNodes)) {
+          if (c.nodeType === 1 && c.localName === 'off') { off = c; break }
+        }
+      }
+      if (!off) return null
+      return { x: +off.getAttribute('x'), y: +off.getAttribute('y') }
+    }
+    const slotPicEl = Array.from({ length: N }, () => null)
+    if (bounds) {
+      const allPics = getAllPics(spTree)
+      const cols3 = bounds.colBounds.length + 1
+      // ① 좌표 기반 분류
+      allPics.forEach(picEl => {
+        const xf = getPicXfrm(picEl)
+        if (!xf) { console.warn('[PhotoPptx] pic 좌표 없음'); return }
+        const col = bounds.colBounds.filter(b => xf.x >= b).length
+        const row = bounds.rowBounds.filter(b => xf.y >= b).length
+        const si = row * cols3 + col
+        if (si >= 0 && si < N && !slotPicEl[si]) slotPicEl[si] = picEl
+        console.log(`[PhotoPptx] pic 분류: si=${si} x=${xf.x} y=${xf.y} (size=${size})`)
+      })
+      // ② 좌표 분류 실패 슬롯 → 미할당 pic을 순서대로 보충
+      const unassigned = getAllPics(spTree).filter(p => !slotPicEl.includes(p))
+      let ui = 0
+      for (let si = 0; si < N; si++) {
+        if (!slotPicEl[si] && ui < unassigned.length) {
+          slotPicEl[si] = unassigned[ui++]
+          console.log(`[PhotoPptx] pic 순서 fallback: si=${si}`)
+        }
+      }
+    }
+
     // ── 라벨 매칭 헬퍼 ──
     function normLabel(s) { return s.replace(/\s+/g, '') }
     function paraMatchesLabel(pEl, label) {
@@ -2274,13 +2341,11 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       }
 
       // ── 증명사진 교체: DOM의 blip r:embed를 newRid로 직접 교체 ──
-      // XMLSerializer 직렬화 후에도 DOM 변경이 그대로 반영되므로
-      // 이후 slideXmlStr에서 별도 pic 블록 역검색 불필요
+      // slotPicEl[si]: spTree 전체 재귀 탐색으로 분류된 pic 요소 (slotShapes 귀속 실패 케이스 커버)
       if (person.photoArrayBuffer) {
-        const picShapes = slotShapes[si].filter(el => el.localName === 'pic')
-        if (picShapes.length > 0) {
-          const picEl = picShapes[0]
-
+        // slotPicEl 우선, 없으면 slotShapes에서 fallback
+        const picEl = slotPicEl[si] || slotShapes[si].find(el => el.localName === 'pic') || null
+        if (picEl) {
           function findByLocalName(root, localName) {
             if (!root || !root.childNodes) return null
             for (const child of Array.from(root.childNodes)) {
@@ -2310,13 +2375,14 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
 
               // ★ DOM에서 직접 r:embed를 newPhotoRid로 교체
               // → XMLSerializer 직렬화 결과에 그대로 반영됨
-              // setAttributeNS: localName 'embed'로 설정 (prefix 없이)
-              // 직렬화 시 xmlns:r 선언이 있으면 r:embed="val" 또는 ns:embed="val"로 출력
-              // ⑤ regex /:embed="([^"]+)"/g 가 prefix 무관하게 잡아줌
               blip.setAttributeNS(R_NS, 'embed', newPhotoRid)
               console.log(`[PhotoPptx] DOM embed 교체: si=${si} name=${person.name} ${origRid} → ${newPhotoRid}`)
             }
+          } else {
+            console.warn(`[PhotoPptx] blip 못 찾음: si=${si} name=${person.name}`)
           }
+        } else {
+          console.warn(`[PhotoPptx] pic 요소 없음: si=${si} name=${person.name} slotPicEl=${!!slotPicEl[si]} slotShapes=${slotShapes[si].length}`)
         }
       }
     }
