@@ -2278,15 +2278,8 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       if (person.photoArrayBuffer) {
         // 슬롯에 속하는 pic shape 찾기
         const picShapes = slotShapes[si].filter(el => el.localName === 'pic')
-        console.log(`[PhotoPptx-DBG] si=${si} name=${person.name} picShapes.length=${picShapes.length} hasPhoto=true`)
         if (picShapes.length > 0) {
-          // picShapeToRid: pic shape의 blipFill > blip r:embed 값 추출
           for (const picEl of picShapes) {
-            const P_NS2 = 'http://schemas.openxmlformats.org/presentationml/2006/main'
-            const A_NS2 = 'http://schemas.openxmlformats.org/drawingml/2006/main'
-            const DR_NS = 'http://schemas.openxmlformats.org/drawingml/2006/picture'
-            // p:pic > p:spPr > ... 이 아니라 p:pic > p:blipFill > a:blip 구조
-            // 네임스페이스 없이 localName으로 탐색
             function findByLocalName(root, localName) {
               if (!root || !root.childNodes) return null
               for (const child of Array.from(root.childNodes)) {
@@ -2298,33 +2291,39 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
             }
             const blip = findByLocalName(picEl, 'blip')
             if (!blip) continue
-            // r:embed 속성값(rId)
-            // r:embed 추출 (네임스페이스 방식 + fallback)
+
+            // r:embed 추출
             const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
             let rEmbedAttr = blip.getAttributeNS(R_NS, 'embed')
             if (!rEmbedAttr) rEmbedAttr = blip.getAttribute('r:embed')
             if (!rEmbedAttr) {
-              // XML 직렬화 후 정규식으로 추출 (브라우저 파서 네임스페이스 처리 차이 대응)
               const blipStr = new XMLSerializer().serializeToString(blip)
               const em = blipStr.match(/r:embed="([^"]+)"/)
               if (em) rEmbedAttr = em[1]
             }
             if (!rEmbedAttr) continue
-            // ── 핵심 수정: 슬롯마다 고유 rId를 새로 발급 ──
-            // 문제: 2인/4인/6인/9인 템플릿의 여러 슬롯 pic이 같은 rId(예: rId2)를 공유
-            // → _picRidOverride["rId2"] = buf 기록 시 마지막 슬롯 사진이 덮어씀
-            // 해결: 슬롯마다 새 rId("_photo_si0", "_photo_si1" ...) 발급,
-            //       원본 rId → 새 rId 매핑을 _picRidOrigMap에 저장 (slideXmlStr 교체 시 사용)
-            if (!page._picRidOverride) page._picRidOverride = {}
-            if (!page._picRidOrigMap)  page._picRidOrigMap  = []  // [{origRid, newRid}]
 
+            // ── 핵심: picEl 전체를 직렬화해서 고유 식별자로 사용 ──
+            // picEl의 직렬화 문자열 안에서 blip의 r:embed 값만 새 rId로 교체한
+            // 새 picEl 문자열을 만들고, slideXmlStr에서 old → new 1:1 치환
+            // → XML 문서 내 등장 순서와 무관하게 이 슬롯의 pic만 정확히 교체됨
             const newPhotoRid = `_photo_si${si}`
+            if (!page._picRidOverride) page._picRidOverride = {}
+            if (!page._picRidPicMap)   page._picRidPicMap   = []  // [{oldPicXml, newPicXml}]
+
+            // picEl 직렬화
+            const oldPicXml = new XMLSerializer().serializeToString(picEl)
+            // blip r:embed 값만 newPhotoRid로 교체한 새 picXml 생성
+            const newPicXml = oldPicXml.replace(
+              /(:embed=")([^"]+)(")/,   // 첫 번째 :embed 값만 교체 (blip 하나)
+              (_, pre, _old, post) => `${pre}${newPhotoRid}${post}`
+            )
+            if (oldPicXml === newPicXml) continue  // :embed 없으면 skip
+
             page._picRidOverride[newPhotoRid] = person.photoArrayBuffer
-            // 원본 rId → 새 rId 저장 (slideXmlStr에서 이 슬롯 blip만 교체하기 위해)
-            // 단, 같은 origRid가 여러 슬롯에 쓰일 수 있으므로 slotIndex도 함께 저장
-            page._picRidOrigMap.push({ origRid: rEmbedAttr, newRid: newPhotoRid, si })
+            page._picRidPicMap.push({ oldPicXml, newPicXml, origRid: rEmbedAttr, newRid: newPhotoRid })
             console.log(`[PhotoPptx] si=${si} name=${person.name} origRid=${rEmbedAttr} → newRid=${newPhotoRid}`)
-            break  // 슬롯당 사진 1장만 교체
+            break  // 슬롯당 사진 1장만
           }
         }
       }
@@ -2346,22 +2345,21 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
     // ─────────────────────────────────────────────────────────────────
     const targetRemap = {}  // oldRid → '../media/image_gsN.png'  (rId 기준)
 
-    // 슬롯별 치환 때 기록된 { oldRid → ArrayBuffer }
+    // 슬롯별 치환 때 기록된 { newRid → ArrayBuffer }
     const picRidOverride = page._picRidOverride || {}
-    console.log(`[PhotoPptx-DBG] page=${page.slideTitle} _picRidOverride keys=`, Object.keys(picRidOverride))
+    // 슬롯별 picEl 직렬화 기반 교체 맵: [{oldPicXml, newPicXml, origRid, newRid}]
+    const picRidPicMap   = page._picRidPicMap   || []
 
-    // ① picRidOverride에 있는 rId마다 별도 png 파일 생성 (NAS 증명사진)
-    for (const [oldRid, arrayBuf] of Object.entries(picRidOverride)) {
+    // ① picRidOverride에 있는 newRid마다 별도 png 파일 생성 (NAS 증명사진)
+    for (const [newRid, arrayBuf] of Object.entries(picRidOverride)) {
       const pngIdx = ++maxMediaIdx
       const pngFileName = `ppt/media/image_gs${pngIdx}.png`
       baseZip.file(pngFileName, arrayBuf)
-      targetRemap[oldRid] = `../media/image_gs${pngIdx}.png`
-      console.log('[PhotoPptx] 증명사진 교체: rId=', oldRid, '→', pngFileName)
+      targetRemap[newRid] = `../media/image_gs${pngIdx}.png`
+      console.log('[PhotoPptx] 증명사진 저장: rId=', newRid, '→', pngFileName)
     }
 
-    // ② 나머지 image rId는 origTarget → 새 이름으로 복사 (placeholder 유지)
-    //    동일 origTarget이 여러 rId에서 참조되면 rId마다 별도 복사본 생성
-    //    Type/Id 속성 순서가 달라도 동작하도록 모든 Relationship 파싱 후 image 필터
+    // ② 나머지 image rId(원본 placeholder)는 origTarget을 새 이름으로 복사
     const allRelEntries = [...rawRelsXml.matchAll(/<Relationship\b([^>]*)\/>/g)]
     const imageRels = allRelEntries
       .filter(m => /Type="[^"]*\/image"/.test(m[1]))
@@ -2374,14 +2372,13 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
 
     for (const rel of imageRels) {
       const { id: oldRid, target: origTarget } = rel
-      if (targetRemap[oldRid]) continue  // ①에서 이미 NAS 사진으로 교체됨
+      if (targetRemap[oldRid]) continue  // 이미 NAS 사진으로 교체됨
 
       const ext = origTarget.replace(/.*\./, '.')
       const newIdx = ++maxMediaIdx
       const newFileName = `ppt/media/image_gs${newIdx}${ext}`
       targetRemap[oldRid] = `../media/image_gs${newIdx}${ext}`
 
-      // tplZip에서 원본 placeholder 이미지 복사
       const origPath = ('ppt/slides/' + origTarget).replace(/\/[^/]+\/\.\.\//g, '/')
       const srcFile = tplZip.file(origPath)
       if (srcFile) {
@@ -2390,9 +2387,7 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       }
     }
 
-    // rels: rId 재번호매김 + Target 새 이름으로 교체
-    // targetRemap이 이제 oldRid → newTarget 구조이므로
-    // 각 Relationship 태그 전체를 파싱해서 Id→newId, Target→newTarget 동시 교체
+    // rels: rId 재번호매김 + Target 교체
     const rIdMap = {}
     let remappedRelsXml = rawRelsXml.replace(
       /<Relationship\b([^>]*)\/>/g,
@@ -2406,23 +2401,19 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
         if (oldId) rIdMap[oldId] = newId
 
         let newTag = fullTag
-        if (oldId)  newTag = newTag.replace(`Id="${oldId}"`,   `Id="${newId}"`)
-        // rId 기준 Target 교체 (oldId → newTarget)
-        if (oldId && targetRemap[oldId] && oldTgt) {
+        if (oldId) newTag = newTag.replace(`Id="${oldId}"`, `Id="${newId}"`)
+        if (oldId && targetRemap[oldId] && oldTgt)
           newTag = newTag.replace(`Target="${oldTgt}"`, `Target="${targetRemap[oldId]}"`)
-        }
         return newTag
       }
     )
 
-    // _photo_si0, _photo_si1 ... 신규 rId → rels에 image Relationship 추가
-    // (슬롯마다 새 rId를 발급했으므로 rels에 해당 Relationship이 없음 → 추가 필요)
-    const picRidOrigMap = page._picRidOrigMap || []
+    // ③ _photo_si* 신규 rId → rels에 image Relationship 추가 + rIdMap 등록
     const IMAGE_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image'
-    for (const { newRid } of picRidOrigMap) {
-      if (!targetRemap[newRid]) continue  // ①에서 png 파일이 생성되지 않은 경우 skip
+    for (const { newRid } of picRidPicMap) {
+      if (!targetRemap[newRid]) continue
       const finalRid = `rId${++maxRid}`
-      rIdMap[newRid] = finalRid  // 슬라이드 XML r:embed 교체용
+      rIdMap[newRid] = finalRid
       remappedRelsXml = remappedRelsXml.replace(
         '</Relationships>',
         `<Relationship Id="${finalRid}" Type="${IMAGE_TYPE}" Target="${targetRemap[newRid]}"/></Relationships>`
@@ -2430,38 +2421,21 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       console.log(`[PhotoPptx] rels 추가: ${newRid} → ${finalRid} Target=${targetRemap[newRid]}`)
     }
 
-    // 슬라이드 XML 내 r:embed 교체
-    // 1단계: 원본 rId → 새 rId 교체 (같은 origRid가 여러 슬롯에 쓰인 경우 순서대로 각각 교체)
-    //   picRidOrigMap: [{origRid:'rId2', newRid:'_photo_si0'}, {origRid:'rId2', newRid:'_photo_si1'}, ...]
-    //   같은 origRid가 슬라이드 XML에 여러 번 등장 → 첫 번째는 si0, 두 번째는 si1 ...
+    // ④ slideXmlStr: picEl 단위로 정확히 교체 (oldPicXml → newPicXml)
+    //    → 순서 의존 없이 각 슬롯의 pic 블록만 1:1 교체 (같은 origRid여도 개별 처리)
     let slideXmlStr = new XMLSerializer().serializeToString(xmlDoc)
-
-    // origRid별로 교체 대기열 구성 (등장 순서대로 소비)
-    const ridReplaceQueue = {}  // origRid → [newRid, newRid, ...]
-    for (const { origRid, newRid } of picRidOrigMap) {
-      if (!ridReplaceQueue[origRid]) ridReplaceQueue[origRid] = []
-      ridReplaceQueue[origRid].push(newRid)
-    }
-    // blip r:embed가 origRid인 부분을 순서대로 소비하며 교체
-    // XMLSerializer가 r:embed를 다양한 형태로 직렬화할 수 있으므로 패턴을 넓게 잡음
-    // (r:embed="rId2" / xmlns:r="..." r:embed="rId2" / ns0:embed="rId2" 모두 대응)
-    for (const [origRid, queue] of Object.entries(ridReplaceQueue)) {
-      let qIdx = 0
-      // :embed="origRid" 패턴으로 넓게 매칭 (prefix 무관)
-      const escaped = origRid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      const pattern = new RegExp(`(:embed=")${escaped}(")`,'g')
-      slideXmlStr = slideXmlStr.replace(pattern, (_, pre, post) => {
-        if (qIdx < queue.length) {
-          const nr = queue[qIdx++]
-          return `${pre}${nr}${post}`
-        }
-        return _ // 큐 소진 후에는 원본 유지
-      })
+    for (const { oldPicXml, newPicXml } of picRidPicMap) {
+      slideXmlStr = slideXmlStr.replace(oldPicXml, newPicXml)
     }
 
-    // 2단계: 나머지 rId (슬라이드 레이아웃 등) → rIdMap으로 교체
+    // ⑤ 모든 rId (레이아웃 rel 포함) → rIdMap으로 최종 교체
+    //    _photo_si* → finalRid, 원본 rId → 재번호매김된 rId
     slideXmlStr = slideXmlStr.replace(/\br:(embed|link|id)="([^"]+)"/g, (full, attr, oldId) =>
       rIdMap[oldId] ? `r:${attr}="${rIdMap[oldId]}"` : full
+    )
+    // XMLSerializer가 :embed prefix를 다르게 직렬화한 경우 대응
+    slideXmlStr = slideXmlStr.replace(/:embed="([^"]+)"/g, (full, oldId) =>
+      rIdMap[oldId] ? `:embed="${rIdMap[oldId]}"` : full
     )
     baseZip.file(`ppt/slides/${fname}`, slideXmlStr)
     baseZip.file(`ppt/slides/_rels/${fname}.rels`, remappedRelsXml)
