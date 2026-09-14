@@ -2330,39 +2330,48 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
 
     // 이미지 Target → 새 이름 매핑 테이블 구성
     // + _picRidOverride: 해당 rId의 원본 이미지를 NAS 증명사진으로 교체
-    const targetRemap = {}  // '../media/image3.png' → '../media/image_new_N.png'
+    // ─────────────────────────────────────────────────────────────────
+    // 수정: origTarget 기준 일괄 처리 → rId 기준 개별 처리
+    //   여러 슬롯이 같은 ../media/imageX.png(origTarget)을 참조하더라도
+    //   각 rId 마다 별도 png 파일을 생성하여 슬롯별 독립 교체를 보장
+    // ─────────────────────────────────────────────────────────────────
+    const targetRemap = {}  // oldRid → '../media/image_gsN.png'  (rId 기준)
 
-    // rawRelsXml에서 rId → origTarget 역매핑 (NAS 교체 판별용)
-    const ridToOrigTarget = {}
-    for (const m of [...rawRelsXml.matchAll(/Id="([^"]+)"[^>]*Target="([^"]+)"/g)]) {
-      ridToOrigTarget[m[1]] = m[2]
-    }
     // 슬롯별 치환 때 기록된 { oldRid → ArrayBuffer }
     const picRidOverride = page._picRidOverride || {}
-    const picOverriddenTargets = new Set()  // NAS 교체된 origTarget 중복 방지
 
-    const imgRelEntries = [...rawRelsXml.matchAll(/Type="[^"]*\/image"[^>]*Target="([^"]+)"/g)]
-    for (const m of imgRelEntries) {
-      const origTarget = m[1]  // e.g. ../media/image3.png
-      const ext = origTarget.replace(/.*\./, '.')  // .png / .jpeg
+    // ① picRidOverride에 있는 rId마다 별도 png 파일 생성 (NAS 증명사진)
+    for (const [oldRid, arrayBuf] of Object.entries(picRidOverride)) {
+      const pngIdx = ++maxMediaIdx
+      const pngFileName = `ppt/media/image_gs${pngIdx}.png`
+      baseZip.file(pngFileName, arrayBuf)
+      targetRemap[oldRid] = `../media/image_gs${pngIdx}.png`
+      console.log('[PhotoPptx] 증명사진 교체: rId=', oldRid, '→', pngFileName)
+    }
+
+    // ② 나머지 image rId는 origTarget → 새 이름으로 복사 (placeholder 유지)
+    //    동일 origTarget이 여러 rId에서 참조되면 rId마다 별도 복사본 생성
+    //    Type/Id 속성 순서가 달라도 동작하도록 모든 Relationship 파싱 후 image 필터
+    const allRelEntries = [...rawRelsXml.matchAll(/<Relationship\b([^>]*)\/>/g)]
+    const imageRels = allRelEntries
+      .filter(m => /Type="[^"]*\/image"/.test(m[1]))
+      .map(m => {
+        const idM  = m[1].match(/\bId="([^"]+)"/)
+        const tgtM = m[1].match(/\bTarget="([^"]+)"/)
+        return idM && tgtM ? { id: idM[1], target: tgtM[1] } : null
+      })
+      .filter(Boolean)
+
+    for (const rel of imageRels) {
+      const { id: oldRid, target: origTarget } = rel
+      if (targetRemap[oldRid]) continue  // ①에서 이미 NAS 사진으로 교체됨
+
+      const ext = origTarget.replace(/.*\./, '.')
       const newIdx = ++maxMediaIdx
       const newFileName = `ppt/media/image_gs${newIdx}${ext}`
-      targetRemap[origTarget] = `../media/image_gs${newIdx}${ext}`
+      targetRemap[oldRid] = `../media/image_gs${newIdx}${ext}`
 
-      // 이 origTarget에 대응하는 rId가 picRidOverride에 있으면 NAS 증명사진으로 교체
-      const matchedOldRid = Object.keys(ridToOrigTarget).find(rid => ridToOrigTarget[rid] === origTarget)
-      const overrideBuf = matchedOldRid ? picRidOverride[matchedOldRid] : null
-      if (overrideBuf && !picOverriddenTargets.has(origTarget)) {
-        const pngIdx = ++maxMediaIdx
-        const pngFileName = `ppt/media/image_gs${pngIdx}.png`
-        baseZip.file(pngFileName, overrideBuf)
-        targetRemap[origTarget] = `../media/image_gs${pngIdx}.png`
-        picOverriddenTargets.add(origTarget)
-        console.log('[PhotoPptx] 증명사진 교체:', origTarget, '→', pngFileName)
-        continue  // 원본 placeholder 이미지 복사 건너뜀
-      }
-
-      // tplZip에서 소스 파일 읽어 baseZip에 새 이름으로 저장
+      // tplZip에서 원본 placeholder 이미지 복사
       const origPath = ('ppt/slides/' + origTarget).replace(/\/[^/]+\/\.\.\//g, '/')
       const srcFile = tplZip.file(origPath)
       if (srcFile) {
@@ -2372,19 +2381,28 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
     }
 
     // rels: rId 재번호매김 + Target 새 이름으로 교체
+    // targetRemap이 이제 oldRid → newTarget 구조이므로
+    // 각 Relationship 태그 전체를 파싱해서 Id→newId, Target→newTarget 동시 교체
     const rIdMap = {}
     let remappedRelsXml = rawRelsXml.replace(
-      /(<Relationship\s+Id=")([^"]+)(")/g,
-      (_, pre, oldId, post) => {
+      /<Relationship\b([^>]*)\/>/g,
+      (fullTag, attrs) => {
+        const idM  = attrs.match(/\bId="([^"]+)"/)
+        const tgtM = attrs.match(/\bTarget="([^"]+)"/)
+        const oldId  = idM  ? idM[1]  : null
+        const oldTgt = tgtM ? tgtM[1] : null
+
         const newId = `rId${++maxRid}`
-        rIdMap[oldId] = newId
-        return pre + newId + post
+        if (oldId) rIdMap[oldId] = newId
+
+        let newTag = fullTag
+        if (oldId)  newTag = newTag.replace(`Id="${oldId}"`,   `Id="${newId}"`)
+        // rId 기준 Target 교체 (oldId → newTarget)
+        if (oldId && targetRemap[oldId] && oldTgt) {
+          newTag = newTag.replace(`Target="${oldTgt}"`, `Target="${targetRemap[oldId]}"`)
+        }
+        return newTag
       }
-    )
-    // Target 교체 (이미지만)
-    remappedRelsXml = remappedRelsXml.replace(
-      /Target="([^"]+)"/g,
-      (full, tgt) => targetRemap[tgt] ? `Target="${targetRemap[tgt]}"` : full
     )
 
     // 슬라이드 XML 내 r:embed / r:link / r:id 참조도 동일하게 교체
