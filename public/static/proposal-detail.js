@@ -2278,6 +2278,7 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       if (person.photoArrayBuffer) {
         // 슬롯에 속하는 pic shape 찾기
         const picShapes = slotShapes[si].filter(el => el.localName === 'pic')
+        console.log(`[PhotoPptx-DBG] si=${si} name=${person.name} picShapes.length=${picShapes.length} hasPhoto=true`)
         if (picShapes.length > 0) {
           // picShapeToRid: pic shape의 blipFill > blip r:embed 값 추출
           for (const picEl of picShapes) {
@@ -2309,6 +2310,7 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
               if (em) rEmbedAttr = em[1]
             }
             if (!rEmbedAttr) continue
+            console.log(`[PhotoPptx-DBG] si=${si} name=${person.name} rEmbedAttr=${rEmbedAttr}`)
             // rId → 이 시점에서 targetRemap 아직 미구성이므로 직접 tplZip에서 원본 경로 조회
             // rawRelsXml은 아직 미정의 → tplZip .rels에서 직접 읽어야 함
             // 대신: picOrigRidMap에 {rId → origTarget} 저장해두고 targetRemap 구성 후 교체
@@ -2339,6 +2341,7 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
 
     // 슬롯별 치환 때 기록된 { oldRid → ArrayBuffer }
     const picRidOverride = page._picRidOverride || {}
+    console.log(`[PhotoPptx-DBG] page=${page.slideTitle} _picRidOverride keys=`, Object.keys(picRidOverride))
 
     // ① picRidOverride에 있는 rId마다 별도 png 파일 생성 (NAS 증명사진)
     for (const [oldRid, arrayBuf] of Object.entries(picRidOverride)) {
