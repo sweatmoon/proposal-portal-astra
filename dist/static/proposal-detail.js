@@ -2273,57 +2273,49 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
         txBody.removeChild(itPara)
       }
 
-      // ── 증명사진 교체: 슬롯 내 <p:pic> shape를 NAS 사진으로 교체 ──
-      // person.photoArrayBuffer 가 있을 때만 처리 (없으면 템플릿 placeholder 그대로 유지)
+      // ── 증명사진 교체: DOM의 blip r:embed를 newRid로 직접 교체 ──
+      // XMLSerializer 직렬화 후에도 DOM 변경이 그대로 반영되므로
+      // 이후 slideXmlStr에서 별도 pic 블록 역검색 불필요
       if (person.photoArrayBuffer) {
-        // 슬롯에 속하는 pic shape 찾기
         const picShapes = slotShapes[si].filter(el => el.localName === 'pic')
         if (picShapes.length > 0) {
-          for (const picEl of picShapes) {
-            function findByLocalName(root, localName) {
-              if (!root || !root.childNodes) return null
-              for (const child of Array.from(root.childNodes)) {
-                if (child.nodeType === 1 && child.localName === localName) return child
-                const found = findByLocalName(child, localName)
-                if (found) return found
-              }
-              return null
-            }
-            const blip = findByLocalName(picEl, 'blip')
-            if (!blip) continue
+          const picEl = picShapes[0]
 
-            // r:embed 추출
+          function findByLocalName(root, localName) {
+            if (!root || !root.childNodes) return null
+            for (const child of Array.from(root.childNodes)) {
+              if (child.nodeType === 1 && child.localName === localName) return child
+              const found = findByLocalName(child, localName)
+              if (found) return found
+            }
+            return null
+          }
+          const blip = findByLocalName(picEl, 'blip')
+          if (blip) {
             const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
-            let rEmbedAttr = blip.getAttributeNS(R_NS, 'embed')
-            if (!rEmbedAttr) rEmbedAttr = blip.getAttribute('r:embed')
-            if (!rEmbedAttr) {
-              const blipStr = new XMLSerializer().serializeToString(blip)
-              const em = blipStr.match(/r:embed="([^"]+)"/)
-              if (em) rEmbedAttr = em[1]
+            // 원본 rId 읽기
+            let origRid = blip.getAttributeNS(R_NS, 'embed') || blip.getAttribute('r:embed')
+            if (!origRid) {
+              const m = new XMLSerializer().serializeToString(blip).match(/:embed="([^"]+)"/)
+              if (m) origRid = m[1]
             }
-            if (!rEmbedAttr) continue
 
-            // ── 핵심: picEl 전체를 직렬화해서 고유 식별자로 사용 ──
-            // picEl의 직렬화 문자열 안에서 blip의 r:embed 값만 새 rId로 교체한
-            // 새 picEl 문자열을 만들고, slideXmlStr에서 old → new 1:1 치환
-            // → XML 문서 내 등장 순서와 무관하게 이 슬롯의 pic만 정확히 교체됨
-            const newPhotoRid = `_photo_si${si}`
-            if (!page._picRidOverride) page._picRidOverride = {}
-            if (!page._picRidPicMap)   page._picRidPicMap   = []  // [{oldPicXml, newPicXml}]
+            if (origRid) {
+              if (!page._picRidOverride) page._picRidOverride = {}
+              if (!page._picRidPicMap)   page._picRidPicMap   = []
 
-            // picEl 직렬화
-            const oldPicXml = new XMLSerializer().serializeToString(picEl)
-            // blip r:embed 값만 newPhotoRid로 교체한 새 picXml 생성
-            const newPicXml = oldPicXml.replace(
-              /(:embed=")([^"]+)(")/,   // 첫 번째 :embed 값만 교체 (blip 하나)
-              (_, pre, _old, post) => `${pre}${newPhotoRid}${post}`
-            )
-            if (oldPicXml === newPicXml) continue  // :embed 없으면 skip
+              const newPhotoRid = `_photo_si${si}`
+              page._picRidOverride[newPhotoRid] = person.photoArrayBuffer
+              page._picRidPicMap.push({ origRid, newRid: newPhotoRid })
 
-            page._picRidOverride[newPhotoRid] = person.photoArrayBuffer
-            page._picRidPicMap.push({ oldPicXml, newPicXml, origRid: rEmbedAttr, newRid: newPhotoRid })
-            console.log(`[PhotoPptx] si=${si} name=${person.name} origRid=${rEmbedAttr} → newRid=${newPhotoRid}`)
-            break  // 슬롯당 사진 1장만
+              // ★ DOM에서 직접 r:embed를 newPhotoRid로 교체
+              // → XMLSerializer 직렬화 결과에 그대로 반영됨
+              // setAttributeNS: localName 'embed'로 설정 (prefix 없이)
+              // 직렬화 시 xmlns:r 선언이 있으면 r:embed="val" 또는 ns:embed="val"로 출력
+              // ⑤ regex /:embed="([^"]+)"/g 가 prefix 무관하게 잡아줌
+              blip.setAttributeNS(R_NS, 'embed', newPhotoRid)
+              console.log(`[PhotoPptx] DOM embed 교체: si=${si} name=${person.name} ${origRid} → ${newPhotoRid}`)
+            }
           }
         }
       }
@@ -2421,19 +2413,14 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       console.log(`[PhotoPptx] rels 추가: ${newRid} → ${finalRid} Target=${targetRemap[newRid]}`)
     }
 
-    // ④ slideXmlStr: picEl 단위로 정확히 교체 (oldPicXml → newPicXml)
-    //    → 순서 의존 없이 각 슬롯의 pic 블록만 1:1 교체 (같은 origRid여도 개별 처리)
+    // ④ XMLSerializer로 직렬화 — DOM에서 이미 blip r:embed가 교체되어 있으므로
+    //    slideXmlStr에 _photo_si* rId가 그대로 포함됨
     let slideXmlStr = new XMLSerializer().serializeToString(xmlDoc)
-    for (const { oldPicXml, newPicXml } of picRidPicMap) {
-      slideXmlStr = slideXmlStr.replace(oldPicXml, newPicXml)
-    }
 
-    // ⑤ 모든 rId (레이아웃 rel 포함) → rIdMap으로 최종 교체
-    //    _photo_si* → finalRid, 원본 rId → 재번호매김된 rId
+    // ⑤ 모든 rId → rIdMap으로 최종 교체 (_photo_si* → finalRid, 원본 rId → 재번호매김)
     slideXmlStr = slideXmlStr.replace(/\br:(embed|link|id)="([^"]+)"/g, (full, attr, oldId) =>
       rIdMap[oldId] ? `r:${attr}="${rIdMap[oldId]}"` : full
     )
-    // XMLSerializer가 :embed prefix를 다르게 직렬화한 경우 대응
     slideXmlStr = slideXmlStr.replace(/:embed="([^"]+)"/g, (full, oldId) =>
       rIdMap[oldId] ? `:embed="${rIdMap[oldId]}"` : full
     )
