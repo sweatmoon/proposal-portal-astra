@@ -465,6 +465,23 @@ app.get('/:id/photo-image', async (c) => {
 })
 
 /**
+ * GET /api/personnel/photo-image-by-name?name=홍길동
+ * personnel_id가 없어도 이름만으로 NAS 증명사진을 조회한다.
+ * personnelId=0인 인원(proposal_members.personnel_id=NULL)을 위한 fallback 엔드포인트.
+ */
+app.get('/photo-image-by-name', async (c) => {
+  const name = (c.req.query('name') || '').trim()
+  if (!name) return c.json({ ok: false, error: 'name required' }, 400)
+
+  const photoMap = await fetchPersonnelPhotos([name])
+  const buf = photoMap.get(name)
+  if (!buf) return c.json({ ok: false, error: 'not_found' })
+
+  const b64 = buf.toString('base64')
+  return c.json({ ok: true, name, dataUri: `data:image/png;base64,${b64}` })
+})
+
+/**
  * POST /api/personnel/fix-links
  * proposal_members.personnel_id 가 NULL인 행을 person_name 기준으로 일괄 업데이트
  */
