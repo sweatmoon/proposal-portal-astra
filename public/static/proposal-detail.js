@@ -2272,6 +2272,53 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
         }
         txBody.removeChild(itPara)
       }
+
+      // ── 증명사진 교체: 슬롯 내 <p:pic> shape를 NAS 사진으로 교체 ──
+      // person.photoArrayBuffer 가 있을 때만 처리 (없으면 템플릿 placeholder 그대로 유지)
+      if (person.photoArrayBuffer) {
+        // 슬롯에 속하는 pic shape 찾기
+        const picShapes = slotShapes[si].filter(el => el.localName === 'pic')
+        if (picShapes.length > 0) {
+          // picShapeToRid: pic shape의 blipFill > blip r:embed 값 추출
+          for (const picEl of picShapes) {
+            const P_NS2 = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+            const A_NS2 = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+            const DR_NS = 'http://schemas.openxmlformats.org/drawingml/2006/picture'
+            // p:pic > p:spPr > ... 이 아니라 p:pic > p:blipFill > a:blip 구조
+            // 네임스페이스 없이 localName으로 탐색
+            function findByLocalName(root, localName) {
+              if (!root || !root.childNodes) return null
+              for (const child of Array.from(root.childNodes)) {
+                if (child.nodeType === 1 && child.localName === localName) return child
+                const found = findByLocalName(child, localName)
+                if (found) return found
+              }
+              return null
+            }
+            const blip = findByLocalName(picEl, 'blip')
+            if (!blip) continue
+            // r:embed 속성값(rId)
+            // r:embed 추출 (네임스페이스 방식 + fallback)
+            const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+            let rEmbedAttr = blip.getAttributeNS(R_NS, 'embed')
+            if (!rEmbedAttr) rEmbedAttr = blip.getAttribute('r:embed')
+            if (!rEmbedAttr) {
+              // XML 직렬화 후 정규식으로 추출 (브라우저 파서 네임스페이스 처리 차이 대응)
+              const blipStr = new XMLSerializer().serializeToString(blip)
+              const em = blipStr.match(/r:embed="([^"]+)"/)
+              if (em) rEmbedAttr = em[1]
+            }
+            if (!rEmbedAttr) continue
+            // rId → 이 시점에서 targetRemap 아직 미구성이므로 직접 tplZip에서 원본 경로 조회
+            // rawRelsXml은 아직 미정의 → tplZip .rels에서 직접 읽어야 함
+            // 대신: picOrigRidMap에 {rId → origTarget} 저장해두고 targetRemap 구성 후 교체
+            // → _picRidOverride 맵에 기록, targetRemap 구성 이후에 바이트 교체
+            if (!page._picRidOverride) page._picRidOverride = {}
+            page._picRidOverride[rEmbedAttr] = person.photoArrayBuffer
+            break  // 슬롯당 사진 1장만 교체
+          }
+        }
+      }
     }
 
     // ── 슬라이드 XML 저장 (rels rId 재번호매김 + 미디어 파일 복사) ──
@@ -2282,7 +2329,18 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
     const rawRelsXml = await getSlideLayoutRel(tplZip, tplFile)
 
     // 이미지 Target → 새 이름 매핑 테이블 구성
+    // + _picRidOverride: 해당 rId의 원본 이미지를 NAS 증명사진으로 교체
     const targetRemap = {}  // '../media/image3.png' → '../media/image_new_N.png'
+
+    // rawRelsXml에서 rId → origTarget 역매핑 (NAS 교체 판별용)
+    const ridToOrigTarget = {}
+    for (const m of [...rawRelsXml.matchAll(/Id="([^"]+)"[^>]*Target="([^"]+)"/g)]) {
+      ridToOrigTarget[m[1]] = m[2]
+    }
+    // 슬롯별 치환 때 기록된 { oldRid → ArrayBuffer }
+    const picRidOverride = page._picRidOverride || {}
+    const picOverriddenTargets = new Set()  // NAS 교체된 origTarget 중복 방지
+
     const imgRelEntries = [...rawRelsXml.matchAll(/Type="[^"]*\/image"[^>]*Target="([^"]+)"/g)]
     for (const m of imgRelEntries) {
       const origTarget = m[1]  // e.g. ../media/image3.png
@@ -2290,6 +2348,19 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       const newIdx = ++maxMediaIdx
       const newFileName = `ppt/media/image_gs${newIdx}${ext}`
       targetRemap[origTarget] = `../media/image_gs${newIdx}${ext}`
+
+      // 이 origTarget에 대응하는 rId가 picRidOverride에 있으면 NAS 증명사진으로 교체
+      const matchedOldRid = Object.keys(ridToOrigTarget).find(rid => ridToOrigTarget[rid] === origTarget)
+      const overrideBuf = matchedOldRid ? picRidOverride[matchedOldRid] : null
+      if (overrideBuf && !picOverriddenTargets.has(origTarget)) {
+        const pngIdx = ++maxMediaIdx
+        const pngFileName = `ppt/media/image_gs${pngIdx}.png`
+        baseZip.file(pngFileName, overrideBuf)
+        targetRemap[origTarget] = `../media/image_gs${pngIdx}.png`
+        picOverriddenTargets.add(origTarget)
+        console.log('[PhotoPptx] 증명사진 교체:', origTarget, '→', pngFileName)
+        continue  // 원본 placeholder 이미지 복사 건너뜀
+      }
 
       // tplZip에서 소스 파일 읽어 baseZip에 새 이름으로 저장
       const origPath = ('ppt/slides/' + origTarget).replace(/\/[^/]+\/\.\.\//g, '/')
@@ -2499,6 +2570,36 @@ async function downloadPhotoAssignPptx(btn, opts) {
         p.profile = prof
         // photo-profile API가 반환한 분야가 있으면 우선 사용
         if (!p.field && prof['분야']) p.field = prof['분야']
+      })
+    })
+
+    // ── 증명사진 로드: NAS photo-image API 병렬 호출 ──────────────
+    // 각 인원의 personnelId로 /api/personnel/:id/photo-image 호출 → ArrayBuffer 주입
+    await Promise.all(
+      allPeople
+        .filter(p => p.personnelId)
+        .map(async p => {
+          try {
+            const res = await fetch(`/api/personnel/${p.personnelId}/photo-image`)
+            if (res.ok) {
+              const json = await res.json()
+              if (json.ok && json.dataUri) {
+                // data URI → ArrayBuffer 변환
+                const b64 = json.dataUri.replace(/^data:[^;]+;base64,/, '')
+                const bin = atob(b64)
+                const bytes = new Uint8Array(bin.length)
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+                p.photoArrayBuffer = bytes.buffer
+              }
+            }
+          } catch (e) { console.warn('photo-image 로드 실패:', p.name, e) }
+        })
+    )
+    // slotPeople에 photoArrayBuffer 주입
+    pages.forEach(pg => {
+      Object.values(pg.slotPeople).forEach(p => {
+        const found = allPeople.find(x => x.personnelId === p.personnelId)
+        if (found && found.photoArrayBuffer) p.photoArrayBuffer = found.photoArrayBuffer
       })
     })
 

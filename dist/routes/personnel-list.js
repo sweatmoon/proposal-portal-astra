@@ -4,6 +4,7 @@
  */
 import { Hono } from 'hono';
 import { query, queryOne } from '../db/client.js';
+import { fetchPersonnelPhotos } from '../lib/nas-client.js';
 const app = new Hono();
 app.get('/', async (c) => {
     const search = c.req.query('search') || '';
@@ -378,6 +379,27 @@ app.get('/:id/photo-profile', async (c) => {
             실적,
         },
     });
+});
+/**
+ * GET /api/personnel/:id/photo-image
+ * NAS 증명사진 PNG를 base64(data URI)로 반환.
+ * 파일명 패턴: 증명사진(이름).png
+ * 사진이 없으면 { ok: false, error: 'not_found' } 반환 (404 아님 — 프론트 fallback용)
+ */
+app.get('/:id/photo-image', async (c) => {
+    const personnelId = Number(c.req.param('id'));
+    if (isNaN(personnelId) || personnelId <= 0)
+        return c.json({ ok: false, error: 'invalid personnelId' }, 400);
+    const person = await queryOne(`SELECT name FROM personnel WHERE id = $1`, [personnelId]);
+    if (!person)
+        return c.json({ ok: false, error: 'not_found' });
+    const photoMap = await fetchPersonnelPhotos([person.name]);
+    const buf = photoMap.get(person.name);
+    if (!buf)
+        return c.json({ ok: false, error: 'not_found' });
+    // base64 data URI로 반환 (프론트에서 ArrayBuffer로 변환 후 PPTX media 교체)
+    const b64 = buf.toString('base64');
+    return c.json({ ok: true, name: person.name, dataUri: `data:image/png;base64,${b64}` });
 });
 /**
  * POST /api/personnel/fix-links
