@@ -1576,6 +1576,68 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
     templateData[size] = { xml, file, zip: tplZip }
   }
 
+  // ── 기본 placeholder 이미지(홍길동) 추출: PERSON_2 템플릿 첫 번째 pic의 이미지 ──
+  // NAS 사진이 없는 슬롯에 9인/4인/6인 템플릿 고유 placeholder(ISMSP 로고 등) 대신
+  // 2인 템플릿의 홍길동 이미지를 표시하기 위해 미리 추출해 둔다.
+  let defaultPhotoBuffer = null
+  try {
+    const tpl2 = templateZips[2]
+    const { xml: xml2, file: file2 } = templateData[2]
+    const relsPath2 = `ppt/slides/_rels/${file2}.rels`
+    const relsXml2 = await tpl2.file(relsPath2).async('string')
+    // 슬라이드 XML에서 첫 번째 pic > blipFill > blip의 r:embed 추출
+    const doc2 = new DOMParser().parseFromString(xml2, 'application/xml')
+    const P_NS2 = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+    const R_NS2 = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    const spTree2 = doc2.getElementsByTagNameNS(P_NS2, 'spTree')[0]
+    // 재귀로 첫 번째 pic 탐색
+    function findFirstPic(node) {
+      for (const c of Array.from(node.childNodes)) {
+        if (c.nodeType !== 1) continue
+        if (c.localName === 'pic') return c
+        const found = findFirstPic(c)
+        if (found) return found
+      }
+      return null
+    }
+    const pic2 = spTree2 ? findFirstPic(spTree2) : null
+    if (pic2) {
+      // blip 탐색
+      function findBlip(node) {
+        for (const c of Array.from(node.childNodes)) {
+          if (c.nodeType !== 1) continue
+          if (c.localName === 'blip') return c
+          const found = findBlip(c)
+          if (found) return found
+        }
+        return null
+      }
+      const blip2 = findBlip(pic2)
+      if (blip2) {
+        let rid2 = blip2.getAttributeNS(R_NS2, 'embed') || blip2.getAttribute('r:embed')
+        if (!rid2) {
+          const m2 = new XMLSerializer().serializeToString(blip2).match(/:embed="([^"]+)"/)
+          if (m2) rid2 = m2[1]
+        }
+        if (rid2) {
+          // rels에서 rId → Target 경로 추출
+          const relM = relsXml2.match(new RegExp(`Id="${rid2}"[^>]*Target="([^"]+)"`))
+          if (relM) {
+            const imgPath = ('ppt/slides/' + relM[1]).replace(/\/[^/]+\/\.\.\//g, '/')
+            const imgFile = tpl2.file(imgPath)
+            if (imgFile) {
+              defaultPhotoBuffer = await imgFile.async('arraybuffer')
+              console.log('[PhotoPptx] 기본 placeholder 이미지 추출 성공:', imgPath, `(${defaultPhotoBuffer.byteLength} bytes)`)
+            }
+          }
+        }
+      }
+    }
+    if (!defaultPhotoBuffer) console.warn('[PhotoPptx] 기본 placeholder 이미지 추출 실패 — NAS 사진 없는 슬롯은 원본 placeholder 유지')
+  } catch (e) {
+    console.warn('[PhotoPptx] 기본 placeholder 추출 오류:', e)
+  }
+
   // ── 합본용 베이스 ZIP: PERSON_2 ZIP을 기반으로 사용 ──────────
   // (마스터/테마/레이아웃은 PERSON_2 것을 그대로 유지)
   const baseZip = templateZips[2]
@@ -2367,7 +2429,10 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       }
 
       // ── 증명사진 교체: slotPicEl[si]의 origRid 등록 (DOM embed 직접 교체 방식) ──
-      if (person.photoArrayBuffer) {
+      // NAS 사진이 있으면 NAS 사진, 없으면 defaultPhotoBuffer(홍길동)로 교체
+      // → 9인/4인/6인 템플릿의 고유 placeholder(ISMSP 로고 등)를 홍길동으로 대체
+      const photoForSlot = person.photoArrayBuffer || defaultPhotoBuffer
+      if (photoForSlot) {
         const picEl = slotPicEl[si] || slotShapes[si].find(el => el.localName === 'pic') || null
         if (picEl) {
           function findByLocalName(root, localName) {
@@ -2393,7 +2458,7 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
               if (!page._picRidPicMap)   page._picRidPicMap   = []
 
               const newPhotoRid = `_photo_si${si}`
-              page._picRidOverride[newPhotoRid] = person.photoArrayBuffer
+              page._picRidOverride[newPhotoRid] = photoForSlot
               // picEl DOM 레퍼런스도 함께 저장 → 직렬화 후 해당 pic 블록 특정에 활용
               page._picRidPicMap.push({ origRid, newRid: newPhotoRid, picEl })
 
@@ -2403,7 +2468,8 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
                 // setAttribute로도 덮어쓰기 (DOMParser가 namespace를 flat하게 파싱한 경우)
                 if (blip.getAttribute('r:embed')) blip.setAttribute('r:embed', newPhotoRid)
               } catch(_) {}
-              console.log(`[PhotoPptx] DOM embed 교체: si=${si} name=${person.name} ${origRid} → ${newPhotoRid}`)
+              const photoSrc = person.photoArrayBuffer ? 'NAS' : '기본(홍길동)'
+              console.log(`[PhotoPptx] DOM embed 교체: si=${si} name=${person.name} src=${photoSrc} ${origRid} → ${newPhotoRid}`)
             }
           } else {
             console.warn(`[PhotoPptx] blip 못 찾음: si=${si} name=${person.name}`)
