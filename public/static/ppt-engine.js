@@ -803,11 +803,7 @@ async function downloadProposalPpt(btn, selectedCodes = null) {
     const vm = buildProjectViewModel(parsedData);
     const finalZip = await generateProposalPpt(vm, selectedCodes);
 
-    const report = finalZip.proposalReport;
-    if (report && !confirm(`${report.status}: 생성 결과를 확인하세요. 누락·검토 항목이 있는 초안을 다운로드하시겠습니까?`)) {
-      showAutoAlert('다운로드를 취소했습니다. 생성 결과를 확인하세요.', false);
-      return;
-    }
+    // 경고는 결과 보고서에 남기되 생성된 장표의 다운로드를 막지 않는다.
     const blob = await finalZip.generateAsync({
       type: 'blob',
       mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',

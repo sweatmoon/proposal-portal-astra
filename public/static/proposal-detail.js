@@ -2929,7 +2929,7 @@ async function downloadPhotoAssignPptx(btn, opts) {
     const missingProfiles = [...new Set(people.filter(p => !p.personnelId || !profileMap[p.personnelId]).map(p => p.name))]
     if (missingProfiles.length) warnings.push('프로파일 확인 필요: ' + missingProfiles.join(', '))
     if (opts.returnZip) return { zip, warnings }
-    if (warnings.length && !confirm('사진장표 검토 필요:\n' + warnings.join('\n') + '\n대체 이미지가 포함된 검토용 파일을 다운로드할까요?')) return null
+    // 단독 다운로드도 확인창 없이 진행하고 경고는 완료 메시지에 표시한다.
 
     const today = new Date().toISOString().slice(0, 10)
     const blob = await zip.generateAsync({
@@ -2941,7 +2941,7 @@ async function downloadPhotoAssignPptx(btn, opts) {
     a.href = url; a.download = `사진장표_${today}.pptx`
     document.body.appendChild(a); a.click(); a.remove()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
-    showAutoAlert('✅ 사진장표 생성 완료', true)
+    showAutoAlert(warnings.length ? '사진장표 다운로드 완료. 검토 사항: ' + warnings.join(' / ') : '사진장표 다운로드 완료', !warnings.length)
     return null
   } catch (e) {
     console.error(e)
