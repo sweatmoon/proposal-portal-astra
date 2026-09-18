@@ -112,7 +112,7 @@ function manyStages(count = 12) {
     startDate: `2026-${String(i%12+1).padStart(2,'0')}-10`, endDate: `2026-${String(i%12+1).padStart(2,'0')}-11` }));
   return d;
 }
-test('all stages and extra expert fields fit one plan slide with resized rows and month columns', async () => {
+test('all stages and extra expert fields remain on one plan slide without reducing original fonts', async () => {
   const c = sandbox(), d = manyStages();
   for (let i=0;i<7;i++) { const name=`전문가${i}`; d.portalOrder.push({name, group:'전문가',expertSubGroup:'핵심기술'}); d.personFieldMap[name]=`분야-${i+1}`; }
   const b64 = await template(sizedTable([row(['단계감리팀','[단계1]','']), row(['','[단계2]','']), row(['핵심기술','[분야1]',''])], [800000,1600000,6400000],500000,2900000)
@@ -125,7 +125,10 @@ test('all stages and extra expert fields fit one plan slide with resized rows an
   assert(!/\[단계|\[분야|\[n/.test(txt));
   const tables=c.ProposalTemplate.nodes(doc,'tbl'), stageRows=c.ProposalTemplate.nodes(tables[0],'tr');
   assert.equal(stageRows.length,19);
-  assert(stageRows.reduce((s,r)=>s+Number(r.getAttribute('h')),0)<=720000);
+  assert(stageRows.reduce((s,r)=>s+Number(r.getAttribute('h')),0)>720000);
+  for (const run of c.ProposalTemplate.nodes(tables[0], 'r').filter(r=>c.ProposalTemplate.text(r).trim())) {
+    assert.equal(c.ProposalTemplate.nodes(run,'rPr')[0].getAttribute('sz'),'1200');
+  }
   assert.equal(c.ProposalTemplate.nodes(tables[1],'gridCol').length,16);
   const shapes=c.ProposalTemplate.nodes(doc,'cNvPr',P).map(n=>n.getAttribute('id'));
   assert.equal(new Set(shapes).size,shapes.length);
@@ -144,7 +147,10 @@ test('detail duplicates complete merged blocks for regular, multiple resident an
   assert(txt.includes('총 120MD'));
   assert(!txt.includes('[단계'));
   const rows=c.ProposalTemplate.nodes(doc,'tr');assert.equal(rows.length,22);
-  assert(rows.reduce((s,r)=>s+Number(r.getAttribute('h')),0)<=1440000);
+  assert(rows.reduce((s,r)=>s+Number(r.getAttribute('h')),0)>1440000);
+  for (const run of c.ProposalTemplate.nodes(doc, 'r').filter(r=>c.ProposalTemplate.text(r).trim())) {
+    assert.equal(c.ProposalTemplate.nodes(run,'rPr')[0].getAttribute('sz'),'1200');
+  }
   const cells=c.ProposalTemplate.nodes(doc,'tc');
   assert.equal(cells.filter(c=>c.getAttribute('rowSpan')==='2').length,8);
   assert.equal(cells.filter(c=>c.getAttribute('vMerge')==='1').length,8);
@@ -197,6 +203,69 @@ test('action-confirmation repeated name tokens are resolved per phase column', a
   assert.deepEqual(Array.from(values(rows[1]).slice(3, 6)), ['가', '', '']);
   assert.deepEqual(Array.from(values(rows[2]).slice(3, 6)), ['', '나', '']);
   assert.deepEqual(Array.from(values(rows[3]).slice(3, 6)), ['1', '2', '']);
+});
+test('five-person 1:5:1 / 0:5:1 example produces 1/1, 5/25, 1/5 and 7/31', async () => {
+  const c=sandbox(),d=data();
+  d.portalOrder=Array.from({length:5},(_,i)=>({name:`인력${i}`,group:'감리원팀'}));
+  d.stages[0].감리원.people=d.portalOrder.map((p,i)=>({name:p.name,pre:i===0?1:0,audit:5,post:1}));
+  const metrics=c.ProposalTemplate.activityTotals(c.ProposalTemplate.context(d).stages[0]);
+  assert.deepEqual(JSON.parse(JSON.stringify(metrics)),{pre:{days:1,md:1},audit:{days:5,md:25},post:{days:1,md:5},total:{days:7,md:31}});
+  const b64=await template(table([
+    row(['[단계1]','예비조사','예비조사','[단계1시작일-7]','(0)일 / (0)MD']),
+    row(['','감리시행','현장감리','[단계1시작일]','(0)일 / (0)MD']),
+    row(['','사후관리','시정조치 결과 확인','요청 후','(0)일 / (0)MD']),
+    row(['','소계','','','(0)일 / (0)MD']),
+  ]));
+  const r=await c.ProposalTemplate.build(menu('DETAIL_SCHEDULE',b64),{_raw:d});
+  const txt=docText(c,await r.zip.file('ppt/slides/slide1.xml').async('string'));
+  for(const value of ['(1)일 / (1)MD','(5)일 / (25)MD','(1)일 / (5)MD','(7)일 / (31)MD'])assert(txt.includes(value));
+  assert(!r.warnings.some(w=>w.includes('역산')));
+});
+test('parallel activity days use longest assignment, with zeros and invalid values handled', () => {
+  const c=sandbox(),d=data();
+  d.stages[0].감리원.people=[{name:'가',pre:0,audit:5,post:1},{name:'나',pre:0,audit:3,post:2}];
+  let out=c.ProposalTemplate.activityTotals(c.ProposalTemplate.context(d).stages[0]);
+  assert.equal(out.pre.days,0);assert.equal(out.audit.days,5);assert.equal(out.post.days,2);
+  assert.equal(out.total.days,7);assert.equal(out.total.md,11);
+  d.stages[0].감리원.people[1].pre=null;
+  out=c.ProposalTemplate.activityTotals(c.ProposalTemplate.context(d).stages[0]);
+  assert.equal(out.pre.days,null);assert.equal(out.total.days,null);
+});
+test('month-precision target periods stay month-precision instead of unresolved placeholders', async () => {
+  const c=sandbox(),d=data();d.targetStartDate='2026.09';d.targetEndDate='2026.12';
+  const r=await c.ProposalTemplate.build(menu('DETAIL_SCHEDULE',await template(shape(para('[대상사업시작일] ~ [대상사업종료일]')))),{_raw:d});
+  const txt=docText(c,await r.zip.file('ppt/slides/slide1.xml').async('string'));
+  assert.equal(txt,'2026.09 ~ 2026.12');assert(!r.warnings.some(w=>w.includes('미치환')));
+  assert.equal(c.ProposalTemplate.fmtPeriod('2026.13'),'');
+});
+async function actionFixture() {
+  const body=Array.from({length:15},(_,i)=>row([i===0?'수행인력':'',`[그룹${i+1}]`,`[세부${i+1}]`,`[이름${i+1}]`,`[이름${i+1}]`,`[이름${i+1}]`,i===0?'원본 수행 방안':'']));
+  return template(sizedTable([row(['감리 단계','','','[단계1]','[단계2]','[단계3]','수행 방안']),...body,
+    row(['투입 공수','','','[단계1MD] MD','[단계2MD] MD','[단계3MD] MD','']),
+    row(['주요 활동','','','고정 활동','','',''])], [800000,500000,900000,700000,700000,700000,1000000]));
+}
+test('action table grows to four positive-post columns and eighteen people without shrinking', async () => {
+  const c=sandbox(),d=data();d.portalOrder=Array.from({length:18},(_,i)=>({name:`가${i}`,group:'감리원팀'}));
+  const make=(stage,positive)=>({...d.stages[0],stage,감리원:{people:d.portalOrder.map(p=>({name:p.name,pre:0,audit:5,post:positive?1:0}))}});
+  d.stages=[make('설계A',true),make('설계B',true),make('종료A',true),make('종료B',true),make('검수지원',false)];
+  const r=await c.ProposalTemplate.build(menu('ACTION_CONFIRM_STAFF',await actionFixture()),{_raw:d});
+  const doc=c.ProposalTemplate.parse(await r.zip.file('ppt/slides/slide1.xml').async('string')),T=c.ProposalTemplate;
+  const rows=T.nodes(doc,'tr');assert.equal(rows.length,21);
+  assert.equal(T.nodes(doc,'gridCol').length,8);assert(rows.every(r=>T.nodes(r,'tc').length===8));
+  assert.equal(T.text(rows[0]),'감리 단계설계A설계B종료A종료B수행 방안');
+  assert(!T.text(doc).includes('검수지원'));
+  for(const p of d.portalOrder)assert(T.text(doc).includes(p.name));
+  assert.equal(T.nodes(rows[19],'tc').slice(3,7).map(T.text).join('|'),'18 MD|18 MD|18 MD|18 MD');
+  for(const run of T.nodes(doc,'r').filter(r=>T.text(r).trim())) assert.equal(T.nodes(run,'rPr')[0].getAttribute('sz'),'1200');
+  assert.equal(r.slideCount,1);
+});
+test('action table with zero positive-post stages shows no-target state, not phantom columns', async () => {
+  const c=sandbox(),d=data();d.stages[0].감리원.people.forEach(p=>p.post=0);
+  const r=await c.ProposalTemplate.build(menu('ACTION_CONFIRM_STAFF',await actionFixture()),{_raw:d});
+  const doc=c.ProposalTemplate.parse(await r.zip.file('ppt/slides/slide1.xml').async('string'));
+  assert.equal(c.ProposalTemplate.nodes(doc,'gridCol').length,4);
+  assert.match(c.ProposalTemplate.text(doc),/조치확인 공수가 있는 단계 없음/);
+  assert(!/\[단계|\[이름|\[그룹/.test(c.ProposalTemplate.text(doc)));
 });
 test('registry retries after failed requests instead of caching rejected promise', async () => {
   let calls = 0;
