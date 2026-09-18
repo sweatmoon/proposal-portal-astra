@@ -780,10 +780,12 @@ var ProposalTemplate = (() => {
     });
   }
   // 원본 표의 행 높이·글꼴·문단을 변경하지 않고, 실제 셀 폭/행간에 따른 초과 가능성을 보고한다.
-  function complianceOverflow(doc, warnings) {
+  function complianceOverflow(doc, warnings, label = '3.6', editedCells = null) {
     for (const table of nodes(doc, 'tbl')) {
       const widths = nodes(table, 'gridCol').map(c => +c.getAttribute('w'));
-      children(table, 'tr').forEach((row, ri) => children(row, 'tc').forEach((cell, ci) => {
+      const rows = children(table, 'tr');
+      rows.forEach((row, ri) => children(row, 'tc').forEach((cell, ci) => {
+        if (editedCells && !editedCells.has(cell)) return;
         if (cell.getAttribute('vMerge') === '1' || cell.getAttribute('hMerge') === '1') return;
         const prop = children(cell, 'tcPr')[0];
         const width = widths.slice(ci, ci + Math.max(1, +cell.getAttribute('gridSpan') || 1)).reduce((a, b) => a + b, 0);
@@ -814,7 +816,10 @@ var ProposalTemplate = (() => {
             if (sp) needed += (+children(sp, 'spcPts')[0]?.getAttribute('val') || 0) * 127;
           }
         }
-        if (needed > +row.getAttribute('h')) warnings.push(`3.6 표 ${ri + 1}행 ${ci + 1}열: 원본 글꼴에서 셀 높이 초과 가능성이 있습니다. 전체 내용을 보존했으므로 배치를 확인하세요.`);
+        const available = label === '3.7'
+          ? rows.slice(ri, ri + Math.max(1, +cell.getAttribute('rowSpan') || 1)).reduce((s, r) => s + +r.getAttribute('h'), 0)
+          : +row.getAttribute('h');
+        if (needed > available) warnings.push(`${label} 표 ${ri + 1}행 ${ci + 1}열: 원본 글꼴에서 셀 높이 초과 가능성이 있습니다. 전체 내용을 보존했으므로 배치를 확인하세요.`);
       }));
     }
   }
@@ -855,7 +860,144 @@ var ProposalTemplate = (() => {
     warnings.push('장표 밖 참고 표·작업용 객체는 원본대로 보존하며 자동 치환하지 않습니다. 제출 전 편집 화면에서 확인하세요.');
     return { zip, warnings: unique(warnings), slideCount: 1, mergeStrategy: 'FOREIGN_TEMPLATE' };
   }
+  // 3.7: 단계 배정의 두 버킷(감리원 / 전문가·테스터)을 동일한 범위로 합산한다.
+  function ratioData(ctx, menu, limit) {
+    const round = n => Math.round(n * 10000) / 10000;
+    const sum = people => people.every(validAssignment) ? round(people.reduce((s, p) => s + md(p), 0)) : null;
+    const rows = ctx.stages.map(s => {
+      const A = sum(s.auditors), B = sum(s.experts);
+      return { stage: s.stage || '단계 미입력', A, B, C: A === null || B === null ? null : round(A + B) };
+    });
+    const total = key => rows.length && rows.every(r => r[key] !== null) ? round(rows.reduce((s, r) => s + r[key], 0)) : null;
+    const A = total('A'), B = total('B'), C = total('C');
+    const ratio = C !== null && C > 0 ? B / C * 100 : null;
+    const shown = n => n === null ? '미확인' : n;
+    const percent = n => n === null ? '미확인' : Math.round(n * 100) / 100;
+    const comparison = ratio === null || limit === null ? '검토 필요' : ratio <= limit ? `${limit}% 이내` : `${limit}% 초과`;
+    const warnings = [...ctx.warnings,
+      '3.7 전문가(B)는 단계 배정의 전문가·테스터 공수를 포함합니다. 사업 RFP의 전문가 인정 범위는 담당자가 확인하세요.',
+      '3.7 비율은 전체 단계의 pre+audit+post MD 합계 기준입니다. 추가·상시·상주·검수지원 단계도 포함하며 법적 배치요건 충족을 확정하지 않습니다.'];
+    if (ratio === null) warnings.push('3.7 배정 공수 누락·오류 또는 전체 공수 0으로 비율을 확정할 수 없습니다.');
+    if (limit === null) warnings.push('3.7 등록 양식에서 명시적인 전문가 비율 상한을 확인하지 못해 판정은 검토 필요입니다.');
+    if (ratio !== null && limit !== null && ratio > limit) warnings.push(`3.7 전문가 비율이 양식의 ${limit}% 상한을 초과합니다.`);
+    const map = { ...common(ctx, menu), '[A]': shown(A), '[B]': shown(B), '[C]': shown(C),
+      '[PA]': percent(ratio === null ? null : A / C * 100), '[PB]': percent(ratio), '[판정]': comparison,
+      '[배치기준검토문구]': '실제 배정 공수 기준 투입 비율입니다. RFP 배치요건은 별도 확인이 필요합니다.',
+      '[배치기준요약]': `배정 MD 기준 / ${comparison}`,
+      '[비율검토문구]': ratio === null ? '공수 확인 후 비율 및 배치요건 검토 필요' : `전문가·테스터 비율 ${percent(ratio)}% / ${comparison} (수치 비교)` };
+    const resolve = token => {
+      const match = token.match(/^\[(단계|A|B|C)([1-9]\d*)\]$/);
+      if (!match) return map[token];
+      const r = rows[Number(match[2]) - 1];
+      return r ? match[1] === '단계' ? r.stage : shown(r[match[1]]) : '';
+    };
+    return { rows, ratio, map, resolve, warnings };
+  }
+  function expandRatioTable(root, count, warnings) {
+    for (const table of nodes(root, 'tbl')) {
+      const rows = children(table, 'tr');
+      const slots = rows.filter(r => /\[단계[1-9]\d*\]/.test(text(r).replace(/\s+/g, '')));
+      if (!slots.length || count <= slots.length) continue;
+      const first = rows.indexOf(slots[0]), last = rows.indexOf(slots.at(-1));
+      if (last - first + 1 !== slots.length || slots.some((r, i) => !text(r).replace(/\s+/g, '').includes(`[단계${i + 1}]`))) {
+        throw new Error('3.7 단계 행 구조가 불규칙하여 모든 단계를 안전하게 확장할 수 없습니다.');
+      }
+      const added = count - slots.length, source = slots.at(-1), anchor = source.nextSibling;
+      // 단계 영역을 가로지르는 기존 세로 병합(비율 열)을 늘린다.
+      for (let ri = 0; ri <= last; ri++) for (const cell of children(rows[ri], 'tc')) {
+        const span = +cell.getAttribute('rowSpan');
+        if (span > 1 && ri + span - 1 >= last) cell.setAttribute('rowSpan', span + added);
+      }
+      const height = slots.reduce((s, r) => s + +r.getAttribute('h'), 0);
+      for (let i = slots.length; i < count; i++) {
+        const copy = source.cloneNode(true);
+        for (const ext of children(copy, 'extLst')) copy.removeChild(ext); // 복제 행의 rowId 중복 방지.
+        replace(copy, token => {
+          const m = token.match(/^\[(단계|A|B|C)[1-9]\d*\]$/);
+          return m ? `[${m[1]}${i + 1}]` : undefined;
+        });
+        for (let ci = 0; ci < children(copy, 'tc').length; ci++) {
+          const cell = children(copy, 'tc')[ci];
+          const spans = rows.slice(0, last + 1).some((r, ri) => {
+            const c = children(r, 'tc')[ci]; return c && +c.getAttribute('rowSpan') > 1 && ri + +c.getAttribute('rowSpan') - 1 > last;
+          });
+          if (spans) { cell.removeAttribute('rowSpan'); cell.setAttribute('vMerge', '1'); setText(cell, ''); }
+        }
+        table.insertBefore(copy, anchor); slots.push(copy);
+      }
+      if (height > 0) slots.forEach((r, i) => r.setAttribute('h', Math.floor(height / count) + (i < height % count ? 1 : 0)));
+      warnings.push(`3.7 전체 ${count}단계를 원본 표 영역에 표시했습니다. 원본 글꼴을 유지하므로 행 높이와 배치를 확인하세요.`);
+    }
+  }
+  function updateRatioBar(visible, ratio, warnings) {
+    const find = name => visible.filter(s => s.localName === 'sp' && nodes(s, 'cNvPr', P)[0]?.getAttribute('name') === name);
+    const bars = find('전문가비율막대_PB_높이연동대상');
+    if (!bars.length) { warnings.push('3.7 연동 대상으로 이름 지정된 전문가 비율 막대가 없어 그래프 도형은 변경하지 않았습니다.'); return; }
+    const refs = find('기준비율막대_30퍼센트'), labels = find('전문가비율라벨_PB');
+    if (bars.length !== 1 || refs.length !== 1) { warnings.push('3.7 비율 막대 식별이 불명확하여 도형을 변경하지 않았습니다.'); return; }
+    if (labels.length !== 1 || !text(labels[0]).replace(/\s+/g, '').includes('[PB]')) {
+      warnings.push('3.7 비율 라벨에 [PB] 토큰이 없거나 중복되어 고정 그래프는 변경하지 않았습니다.'); return;
+    }
+    const bar = geometry(bars[0]), ref = geometry(refs[0]);
+    if (!bar || !ref || ref.h <= 0) { warnings.push('3.7 비율 막대 좌표를 확인할 수 없어 도형을 변경하지 않았습니다.'); return; }
+    // 숫자가 두 줄로 꺾이지 않도록 연동 라벨만 폭을 확보한다. 원본 글꼴·색상은 유지한다.
+    const label = geometry(labels[0]);
+    if (label) {
+      const width = Math.max(label.w, 600000);
+      label.ext.setAttribute('cx', width);
+      nodes(labels[0], 'off')[0].setAttribute('x', Math.round(bar.x + bar.w / 2 - width / 2));
+    }
+    // 고정 0~30% 축을 임의로 바꾸거나 초과 비율을 30%로 잘라 표시하지 않는다.
+    if (ratio === null || ratio > 30) {
+      nodes(bars[0], 'cNvPr', P)[0].setAttribute('hidden', '1');
+      warnings.push('3.7 비율 미확인 또는 30% 축 상한 초과로 연동 막대를 숨겼습니다. 표의 실제 비율을 확인하세요.');
+      return;
+    }
+    const h = Math.round(ref.h * ratio / 30), bottom = bar.y + bar.h, y = bottom - h;
+    nodes(bars[0], 'cNvPr', P)[0].removeAttribute('hidden');
+    nodes(bars[0], 'off')[0].setAttribute('y', y); bar.ext.setAttribute('cy', h);
+    if (label) nodes(labels[0], 'off')[0].setAttribute('y', Math.max(0, y - (bar.y - label.y)));
+  }
+  async function buildRatio(menu, vm) {
+    const template = (menu.templates || []).find(t => t.pptx_b64_key && t.variant_code === 'DEFAULT') || (menu.templates || []).find(t => t.pptx_b64_key);
+    if (!template) throw new Error('3.7 목차에 PPT 양식을 등록하세요. 별도 표로 대체하지 않습니다.');
+    const zip = await JSZip.loadAsync(template.pptx_b64_key, { base64: true }), slides = await slidePaths(zip);
+    if (slides.length !== 1) throw new Error('3.7은 원본 한 장 양식을 사용해야 합니다.');
+    const pres = parse(await zip.file('ppt/presentation.xml').async('string')), size = nodes(pres, 'sldSz', P)[0];
+    const doc = parse(await zip.file(slides[0]).async('string')), tree = nodes(doc, 'spTree', P)[0];
+    if (!size || !tree) throw new Error('3.7 슬라이드 크기 또는 도형 목록이 없습니다.');
+    const visible = Array.from(tree.childNodes).filter(el => {
+      if (el.nodeType !== 1) return false;
+      const b = geometry(el);
+      return b && b.x < +size.getAttribute('cx') && b.y < +size.getAttribute('cy') && b.x + b.w > 0 && b.y + b.h > 0;
+    });
+    // 양식에 명시된 숫자 상한만 비교한다. 법령/RFP를 추론하거나 고정 문구를 변경하지 않는다.
+    const limits = unique(visible.flatMap(s => [...text(s).replace(/\s+/g, '').matchAll(/전문가비율\((\d+(?:\.\d+)?)%(?:범위내|이내)\)/g)].map(m => +m[1])));
+    const limit = limits.length === 1 && limits[0] >= 0 && limits[0] <= 100 ? limits[0] : null;
+    const out = ratioData(context(vm._raw || vm, options()), menu, limit);
+    for (const shape of visible) expandRatioTable(shape, out.rows.length, out.warnings);
+    // 단계 수가 양식 슬롯보다 많아도 일부만 조용히 누락하지 않는다.
+    const content = visible.map(text).join('').replace(/\s+/g, '');
+    const slots = [...content.matchAll(/\[단계([1-9]\d*)\]/g)].map(m => +m[1]);
+    if (slots.length && out.rows.some((_, i) => !slots.includes(i + 1))) throw new Error('3.7 양식의 단계 슬롯에 전체 단계를 표시할 수 없습니다.');
+    updateRatioBar(visible, out.ratio, out.warnings);
+    for (const shape of visible) {
+      const editedCells = new Set(nodes(shape, 'tc').filter(cell => /\[[^\]]+\]/.test(text(cell))));
+      const unresolved = replace(shape, out.resolve);
+      if (unresolved.length) out.warnings.push(`3.7 미치환: ${unresolved.join(', ')}`);
+      complianceOverflow(shape, out.warnings, '3.7', editedCells);
+    }
+    zip.file(slides[0], new XMLSerializer().serializeToString(doc));
+    for (const path of Object.keys(zip.files).filter(p => /^ppt\/(slideLayouts|slideMasters)\/[^/]+\.xml$/.test(p))) {
+      const layout = parse(await zip.file(path).async('string'));
+      const unresolved = replace(layout, out.resolve);
+      if (unresolved.length) out.warnings.push(`${path.split('/').pop()} 미치환: ${unresolved.join(', ')}`);
+      zip.file(path, new XMLSerializer().serializeToString(layout));
+    }
+    return { zip, warnings: unique(out.warnings), slideCount: 1, mergeStrategy: 'FOREIGN_TEMPLATE' };
+  }
   async function build(menu, vm) {
+    if (menu.menu_code === 'MANPOWER_RATIO') return buildRatio(menu, vm);
     if (['COMPLIANCE', 'SUMMARY_TABLE'].includes(menu.menu_code)) return buildCompliance(menu, vm);
     const template = (menu.templates || []).find(t => t.pptx_b64_key && t.variant_code === 'DEFAULT') || (menu.templates || []).find(t => t.pptx_b64_key);
     if (!template) throw new Error('업로드된 본문 템플릿이 없습니다.');

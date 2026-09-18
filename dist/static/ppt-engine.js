@@ -610,6 +610,7 @@ async function generateMenuPpt(menu, vm) {
     case 'DETAIL_SCHEDULE':
     case 'SCHEDULE_PLAN':
     case 'ACTION_CONFIRM_STAFF':
+    case 'MANPOWER_RATIO':
       result = await ProposalTemplate.build(menu, vm);
       break;
 

@@ -47,6 +47,175 @@ function data() {
 }
 const docText = (c, xml) => c.ProposalTemplate.text(c.ProposalTemplate.parse(xml));
 
+const ratioB64 = readFileSync(new URL('../artifacts/3.7_staff_ratio_placeholders.pptx', import.meta.url)).toString('base64');
+const ratioSlide = 'ppt/slides/slide1.xml';
+const ratioBarName = '전문가비율막대_PB_높이연동대상';
+const ratioLabelName = '전문가비율라벨_PB';
+function ratioFixture(count = 4, expertMD = 20) {
+  const d = data(); d.proposedMD = count * 100;
+  d.portalOrder.push({ name: '전문가', group: '전문가' }, { name: '테스터', group: '테스터' });
+  d.personGradeMap.전문가 = { group: '전문가' }; d.personGradeMap.테스터 = { group: '테스터' };
+  d.stages = Array.from({ length: count }, (_, i) => ({ ...d.stages[0], stage: ['설계', '구현', '종료', '상주감리'][i] || `추가단계${i + 1}`,
+    감리원: { total: 999, people: [{ name: '가', pre: 1, audit: 98 - expertMD, post: 1 }] },
+    전문가: { total: 999, people: [{ name: '전문가', pre: 0, audit: expertMD / 2, post: 0 }, { name: '테스터', pre: 0, audit: expertMD / 2, post: 0 }] },
+  }));
+  return d;
+}
+function namedShape(c, doc, name) {
+  return Array.from(doc.getElementsByTagNameNS(P, 'sp')).find(s => c.ProposalTemplate.nodes(s, 'cNvPr', P)[0]?.getAttribute('name') === name);
+}
+const serialized = node => new XMLSerializer().serializeToString(node);
+const ratioBox = (T, shape) => {
+  const xf = T.nodes(shape, 'xfrm')[0];
+  return { off: T.nodes(xf, 'off')[0], ext: T.nodes(xf, 'ext')[0] };
+};
+test('3.7 dispatcher fills actual stage MD including testers and extra stages, ratios and numeric-only verdict', async () => {
+  const c = sandbox({ getExtraSet: () => new Set(['종료']) }), d = ratioFixture();
+  const result = await c.generateMenuPpt(menu('MANPOWER_RATIO', ratioB64), c.buildProjectViewModel(d));
+  assert.equal(result.slideCount, 1); assert.equal(result.mergeStrategy, 'FOREIGN_TEMPLATE');
+  const doc = c.ProposalTemplate.parse(await result.zip.file(ratioSlide).async('string')), T = c.ProposalTemplate;
+  const rows = T.nodes(doc, 'tr'), values = r => Array.from(T.nodes(r, 'tc').map(T.text));
+  assert.deepEqual(values(rows[1]).slice(0, 4), ['설계', '80', '20', '100']);
+  assert.deepEqual(values(rows[4]).slice(0, 4), ['상주감리', '80', '20', '100']);
+  assert.deepEqual(values(rows[5]).slice(0, 4), ['소계', '320', '80', '400']);
+  assert(T.text(doc).includes('80MD (20%)')); assert(T.text(doc).includes('320MD (80%)'));
+  assert(T.text(doc).includes('30% 이내')); assert(!T.text(doc).includes('충족'));
+  assert(!result.warnings.some(w => w.includes('미치환')));
+  assert(result.warnings.some(w => w.includes('전문가·테스터')));
+});
+test('3.7 preserves fixed text, styles, merged cells, off-slide objects and package relationships while scaling only named bar', async () => {
+  const c = sandbox(), T = c.ProposalTemplate, original = await JSZip.loadAsync(ratioB64, { base64: true });
+  const result = await T.build(menu('MANPOWER_RATIO', ratioB64), ratioFixture());
+  const before = T.parse(await original.file(ratioSlide).async('string')), after = T.parse(await result.zip.file(ratioSlide).async('string'));
+  // Compare fixed paragraphs by their original positions; replaced token paragraphs are not part of this set.
+  const originalPs = T.nodes(before, 'p'), resultPs = T.nodes(after, 'p');
+  assert.equal(originalPs.length, resultPs.length);
+  originalPs.forEach((p, i) => { if (!T.text(p).includes('[')) assert.equal(serialized(resultPs[i]), serialized(p)); });
+  const bar = namedShape(c, after, ratioBarName), ref = namedShape(c, before, '기준비율막대_30퍼센트');
+  const h = +ratioBox(T, bar).ext.getAttribute('cy');
+  assert.equal(h, Math.round(+ratioBox(T, ref).ext.getAttribute('cy') * 2 / 3));
+  const oldBar = namedShape(c, before, ratioBarName);
+  assert.equal(+ratioBox(T, bar).off.getAttribute('y') + h, +ratioBox(T, oldBar).off.getAttribute('y') + +ratioBox(T, oldBar).ext.getAttribute('cy'));
+  // Restore only documented geometry edits; remaining XML must match apart from token text.
+  for (const name of [ratioBarName, ratioLabelName]) {
+    const a = namedShape(c, after, name), b = namedShape(c, before, name);
+    T.nodes(a, 'xfrm')[0].parentNode.replaceChild(after.importNode(T.nodes(b, 'xfrm')[0], true), T.nodes(a, 'xfrm')[0]);
+  }
+  assert.equal(withoutText(c, serialized(after)), withoutText(c, serialized(before)));
+  for (const path of Object.keys(original.files).filter(p => !original.files[p].dir && !/^ppt\/(slides|slideLayouts|slideMasters)\/[^/]+\.xml$/.test(p))) {
+    assert.deepEqual(await result.zip.file(path).async('uint8array'), await original.file(path).async('uint8array'), path);
+  }
+  const treeB = before.getElementsByTagNameNS(P, 'spTree')[0], treeA = after.getElementsByTagNameNS(P, 'spTree')[0];
+  const offSlide = Array.from(treeB.childNodes).filter(s => T.nodes(s, 'off').some(n => +n.getAttribute('x') >= 9906000));
+  for (const s of offSlide) assert.equal(serialized(treeA.childNodes[Array.from(treeB.childNodes).indexOf(s)]), serialized(s));
+});
+test('3.7 blank slots, split tokens, decimals and zero expert MD are handled without percent duplication', async () => {
+  const c = sandbox(), T = c.ProposalTemplate;
+  const z = await JSZip.loadAsync(ratioB64, { base64: true });
+  z.file('ppt/slideLayouts/slideLayout99.xml', slide(shape(para('[P', 'B]% / [A1] / [단계4]'))));
+  const d = ratioFixture(1, 0); d.stages[0].감리원.people[0].audit = '2.5';
+  const r = await T.build(menu('MANPOWER_RATIO', await z.generateAsync({ type: 'base64' })), d);
+  const doc = T.parse(await r.zip.file(ratioSlide).async('string')), rows = T.nodes(doc, 'tr');
+  assert.equal(T.text(T.nodes(rows[1], 'tc')[1]), '4.5');
+  assert.equal(T.text(T.nodes(rows[2], 'tc')[0]), '');
+  assert.equal(+ratioBox(T, namedShape(c, doc, ratioBarName)).ext.getAttribute('cy'), 0);
+  assert.equal(docText(c, await r.zip.file('ppt/slideLayouts/slideLayout99.xml').async('string')), '0% / 4.5 / ');
+  assert(!T.text(doc).includes('%%')); assert(!r.warnings.some(w => w.includes('미치환')));
+});
+test('3.7 invalid, missing, raw-incomplete or zero total MD never yields a verified ratio or stale sample bar', async () => {
+  const c = sandbox(), T = c.ProposalTemplate;
+  for (const value of [null, undefined, '', -1, 'bad', Infinity]) {
+    const d = ratioFixture(1); d.stages[0].감리원.people[0].audit = value;
+    const r = await T.build(menu('MANPOWER_RATIO', ratioB64), d), doc = T.parse(await r.zip.file(ratioSlide).async('string'));
+    assert(T.text(doc).includes('검토 필요')); assert(T.text(doc).includes('미확인'));
+    assert.equal(T.nodes(namedShape(c, doc, ratioBarName), 'cNvPr', P)[0].getAttribute('hidden'), '1');
+    assert(!r.warnings.some(w => w.includes('미치환')));
+  }
+  for (const mode of ['empty', 'zero', 'raw-incomplete']) {
+    const d = ratioFixture(1, 0);
+    if (mode === 'empty') d.stages = [];
+    else if (mode === 'zero') d.stages[0].감리원.people = [];
+    else d.stages[0].감리원.people[0].mdComplete = false;
+    const r = await T.build(menu('MANPOWER_RATIO', ratioB64), d);
+    assert(docText(c, await r.zip.file(ratioSlide).async('string')).includes('검토 필요'));
+  }
+});
+test('3.7 compares unrounded ratio against template limit; out-of-axis bars hide rather than misrepresent values', async () => {
+  const c = sandbox(), T = c.ProposalTemplate;
+  for (const [amount, verdict, hidden] of [[30, '30% 이내', false], [30.01, '30% 초과', true], [75, '30% 초과', true]]) {
+    const r = await T.build(menu('MANPOWER_RATIO', ratioB64), ratioFixture(1, amount));
+    const doc = T.parse(await r.zip.file(ratioSlide).async('string'));
+    assert(T.text(doc).includes(verdict));
+    assert.equal(T.nodes(namedShape(c, doc, ratioBarName), 'cNvPr', P)[0].getAttribute('hidden') === '1', hidden);
+    assert(T.text(namedShape(c, doc, ratioLabelName)).includes(String(amount)));
+  }
+});
+test('3.7 expands beyond four stages preserving subtotal, merged ratio column, fonts and table footprint', async () => {
+  const c = sandbox(), T = c.ProposalTemplate, d = ratioFixture(6);
+  const original = await JSZip.loadAsync(ratioB64, { base64: true });
+  const before = T.parse(await original.file(ratioSlide).async('string'));
+  const r = await T.build(menu('MANPOWER_RATIO', ratioB64), d), doc = T.parse(await r.zip.file(ratioSlide).async('string'));
+  const rows = T.nodes(doc, 'tr'); assert.equal(rows.length, 8);
+  assert.equal(T.text(T.nodes(rows[6], 'tc')[0]), '추가단계6');
+  assert.equal(T.text(T.nodes(rows[7], 'tc')[3]), '600');
+  assert.equal(T.nodes(rows[1], 'tc')[4].getAttribute('rowSpan'), '7');
+  for (const row of rows.slice(2)) assert.equal(T.nodes(row, 'tc')[4].getAttribute('vMerge'), '1');
+  assert.equal(rows.reduce((s, r) => s + +r.getAttribute('h'), 0), T.nodes(before, 'tr').reduce((s, r) => s + +r.getAttribute('h'), 0));
+  const styles = r => T.nodes(r, 'rPr').map(serialized);
+  for (const row of rows.slice(4, 7)) assert.deepEqual(Array.from(styles(row)), Array.from(styles(T.nodes(before, 'tr')[4])));
+  assert(!r.warnings.some(w => w.includes('미치환')));
+});
+test('3.7 optional tokens never overwrite fixed verdicts or unmarked graphics; unsupported tokens still warn', async () => {
+  const c = sandbox(), T = c.ProposalTemplate, original = await JSZip.loadAsync(ratioB64, { base64: true });
+  const doc = T.parse(await original.file(ratioSlide).async('string'));
+  T.replace(doc, token => ['[판정]', '[배치기준요약]', '[배치기준검토문구]', '[비율검토문구]'].includes(token) ? '고정 문구' : undefined);
+  T.replace(namedShape(c, doc, ratioLabelName), token => token === '[PB]' ? '25' : undefined);
+  original.file(ratioSlide, serialized(doc));
+  const r = await T.build(menu('MANPOWER_RATIO', await original.generateAsync({ type: 'base64' })), ratioFixture());
+  const out = T.parse(await r.zip.file(ratioSlide).async('string'));
+  assert.equal(serialized(namedShape(c, out, ratioBarName)), serialized(namedShape(c, doc, ratioBarName)));
+  assert.equal(serialized(namedShape(c, out, ratioLabelName)), serialized(namedShape(c, doc, ratioLabelName)));
+  assert(T.text(out).includes('고정 문구')); assert(!r.warnings.some(w => w.includes('미치환')));
+  const simple = await T.build(menu('MANPOWER_RATIO', await template(shape(para('고정 충족 / [미지원] / [P', 'B]%')))), ratioFixture());
+  assert.equal(docText(c, await simple.zip.file(ratioSlide).async('string')), '고정 충족 / [미지원] / 20%');
+  assert(simple.warnings.some(w => w.includes('[미지원]')));
+  assert(simple.warnings.some(w => w.includes('상한을 확인하지 못해')));
+  await assert.rejects(T.build(menu('MANPOWER_RATIO'), ratioFixture()), /양식을 등록/);
+});
+test('3.7 uses registered numeric limit and DEFAULT template without assuming universal 30 percent compliance', async () => {
+  const c = sandbox(), T = c.ProposalTemplate, z = await JSZip.loadAsync(ratioB64, { base64: true });
+  const doc = T.parse(await z.file(ratioSlide).async('string'));
+  const header = T.nodes(T.nodes(doc, 'tr')[0], 'tc')[4];
+  for (const t of T.nodes(header, 't')) t.textContent = t.textContent.replace('30%', '20%');
+  z.file(ratioSlide, serialized(doc));
+  const m = menu('MANPOWER_RATIO', await z.generateAsync({ type: 'base64' }));
+  m.templates.unshift({ variant_code: 'OTHER', pptx_b64_key: ratioB64 });
+  const r = await T.build(m, ratioFixture(1, 25));
+  assert(docText(c, await r.zip.file(ratioSlide).async('string')).includes('20% 초과'));
+  const border = await T.build(menu('MANPOWER_RATIO', ratioB64), ratioFixture(1, 30.004));
+  assert(docText(c, await border.zip.file(ratioSlide).async('string')).includes('30% 초과'));
+});
+test('3.7 merges through the existing composer with text and all media relationships preserved', async () => {
+  const c = sandbox(), T = c.ProposalTemplate;
+  const built = await c.generateMenuPpt(menu('MANPOWER_RATIO', ratioB64), c.buildProjectViewModel(ratioFixture()));
+  const base = await JSZip.loadAsync(await template(shape(para('앞 장표'))), { base64: true });
+  const merged = await c.mergePresentationZips([{ zip: base }, built]);
+  const paths = await T.slidePaths(merged); assert.equal(paths.length, 2);
+  const doc = T.parse(await merged.file(paths[1]).async('string'));
+  assert(T.text(doc).includes('80MD (20%)')); assert(T.text(doc).includes('상주감리'));
+  assert(!/\[(?:A|B|C|PA|PB|단계)\d*\]/.test(T.text(doc)));
+  const relsPath = paths[1].replace('/slides/', '/slides/_rels/') + '.rels';
+  const rels = T.parse(await merged.file(relsPath).async('string'));
+  const images = Array.from(rels.getElementsByTagNameNS(R, 'Relationship')).filter(n => n.getAttribute('Type').endsWith('/image'));
+  assert(images.length > 0);
+  const sourceImages = await Promise.all(Object.keys(built.zip.files).filter(p => p.startsWith('ppt/media/') && !built.zip.files[p].dir).map(p => built.zip.file(p).async('nodebuffer')));
+  for (const rel of images) {
+    const path = new URL(rel.getAttribute('Target'), 'https://example.test/' + paths[1]).pathname.slice(1);
+    assert(merged.file(path), path);
+    const image = await merged.file(path).async('nodebuffer');
+    assert(sourceImages.some(source => source.equals(image)));
+  }
+});
 const complianceB64 = readFileSync(new URL('../public/static/compliance-template.pptx', import.meta.url)).toString('base64');
 function complianceSandbox(values = {}) {
   return sandbox({ document: { getElementById: id => ({ value: values[id] || '' }) } });
