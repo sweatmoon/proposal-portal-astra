@@ -51,7 +51,7 @@ const complianceB64 = readFileSync(new URL('../public/static/compliance-template
 function complianceSandbox(values = {}) {
   return sandbox({ document: { getElementById: id => ({ value: values[id] || '' }) } });
 }
-const complianceChoices = { 'proposal-md-scope': 'all', 'proposal-day-scope': 'per-stage', 'proposal-compliance-pm': '가' };
+const complianceChoices = { 'proposal-compliance-pm': '가' };
 function complianceFixture() {
   const d = data(); d.requestMD = 10;
   d.personGradeMap.가 = { group: '감리원팀', grade: '수석감리원', residency: '상근', fulltimeKnown: true, certNo: 'A-01' };
@@ -97,22 +97,38 @@ test('3.6 does not infer PM or verified residency and career from director/legac
   result = c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d, { compliancePM: '미배정인력' }), menu('COMPLIANCE'));
   assert(result.map['[총괄감리원]'].includes('미지정'));
 });
-test('3.6 days require explicit per-stage or total interpretation and exclude auxiliary stages', () => {
-  const c = sandbox(), d = complianceFixture(); d.requestStageCount = 2; d.requestAuditDays = 4;
-  d.stages.push({ ...d.stages[0], stage: '종료' }, { ...d.stages[0], stage: '검수지원', days: 100 });
-  const calc = dayScope => c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d, { dayScope }), menu('COMPLIANCE'));
-  assert.equal(calc('').map['[방법일수판정]'], '검토 필요');
-  assert.equal(calc('per-stage').map['[방법일수판정]'], '미충족');
-  assert.equal(calc('total').map['[방법일수판정]'], '충족');
+test('3.6 automatically requires every base stage to meet stored days, never a sum or stale total choice', () => {
+  const c = sandbox(), d = complianceFixture(); d.requestStageCount = 3; d.requestAuditDays = 5;
+  d.stages[0].days = 5;
+  d.stages.push({ ...d.stages[0], stage: '구현', days: 4 }, { ...d.stages[0], stage: '종료', days: 6 },
+    { ...d.stages[0], stage: '검수지원', days: 2 }, { ...d.stages[0], stage: '추가제안', days: 1 });
+  const calc = dayScope => c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d, { dayScope, extraStages: ['추가제안'] }), menu('COMPLIANCE'));
+  for (const legacy of ['', 'per-stage', 'total']) assert.equal(calc(legacy).map['[방법일수판정]'], '미충족');
   assert(calc('total').map['[일수비교기준]'].endsWith('4일'));
-  assert(calc('total').map['[단계별감리일정]'].includes('검수지원'));
-  d.stages[0].endDate = '2020-01-01';
-  assert.equal(calc('total').map['[방법일수판정]'], '검토 필요');
+  assert(calc('').map['[단계별감리일정]'].includes('검수지원'));
+  d.stages[1].days = 5;
+  assert.equal(calc('').map['[방법일수판정]'], '충족');
+  d.requestAuditDays = '6'; assert.equal(calc('').map['[방법일수판정]'], '미충족');
+  d.requestAuditDays = 5; d.stages[0].endDate = '2020-01-01';
+  assert.equal(calc('').map['[방법일수판정]'], '검토 필요');
 });
-test('3.6 computes ratios from the selected MD scope and rejects missing/negative/non-numeric/raw-null MD', () => {
+test('3.6 missing/invalid days remain review, known zero or short stage fails even if another stage is unknown', () => {
+  const c = sandbox(), d = complianceFixture(); d.requestStageCount = 2; d.requestAuditDays = 5;
+  d.stages[0].days = 5; d.stages.push({ ...d.stages[0], stage: '종료' });
+  const calc = () => c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d), menu('COMPLIANCE'));
+  for (const value of [null, undefined, '', -1, 'bad']) {
+    d.stages[1].days = value;
+    assert.equal(calc().map['[방법일수판정]'], '검토 필요');
+  }
+  d.stages[0].days = 4; d.stages[1].days = null;
+  assert.equal(calc().map['[방법일수판정]'], '미충족');
+  d.stages[1].days = 0; assert.equal(calc().map['[방법일수판정]'], '미충족');
+  d.requestAuditDays = null; assert.equal(calc().map['[방법일수판정]'], '검토 필요');
+});
+test('3.6 automatically compares total MD and rejects missing/negative/non-numeric/raw-null MD', () => {
   const c = sandbox(), d = complianceFixture();
   const calc = opt => c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d, opt), menu('COMPLIANCE'));
-  assert.equal(calc({}).map['[공수판정]'], '검토 필요');
+  assert.equal(calc({}).map['[공수판정]'], '충족');
   assert.equal(calc({ mdScope: 'all' }).map['[공수판정]'], '충족');
   assert(calc({ mdScope: 'all' }).map['[공수비교내역]'].includes('100%'));
   d.requestMD = '20'; assert.equal(calc({ mdScope: 'all' }).map['[공수판정]'], '미충족');
@@ -202,7 +218,7 @@ async function renderRequirements(values, members = [], phases = []) {
   assert.equal(section.getAttribute('aria-labelledby'), 'audit-requirements-heading');
   return { html, section, values: section.querySelectorAll('dd').map(el => el.text.trim()) };
 }
-test('3.6 SSR exposes explicit scopes/PM choices and preserves unknown raw metadata without DB writes', async () => {
+test('3.6 SSR removes scope choices, retains PM selection and preserves unknown raw metadata without DB writes', async () => {
   const name = '가&나', result = await renderRequirements({}, [
     { person_name: name, member_group: '감리팀', is_fulltime: null },
     { person_name: '상근인력', member_group: '감리팀', is_fulltime: true },
@@ -216,7 +232,12 @@ test('3.6 SSR exposes explicit scopes/PM choices and preserves unknown raw metad
   const pmSelect = result.html.querySelector('#proposal-compliance-pm');
   assert.equal(pmSelect.querySelectorAll('option')[1].getAttribute('value'), name);
   assert.equal(pmSelect.querySelector('option').getAttribute('value'), '');
-  assert.equal(result.html.querySelector('#proposal-day-scope option').getAttribute('value'), '');
+  assert.equal(result.html.querySelector('#proposal-day-scope'), null);
+  assert.equal(result.html.querySelector('#proposal-md-scope'), null);
+  const basis = result.html.querySelector('#proposal-comparison-basis');
+  assert(basis.text.includes('감리원·전문가·테스터'));
+  assert(basis.text.includes('각 기본 일반단계'));
+  assert(basis.text.includes('미입력'));
   assert(result.html.querySelector('a[href="/static/compliance-template.pptx"]'));
   const script = result.html.querySelectorAll('script').find(s => s.text.includes('var parsedData ='));
   const c = vm.createContext({}); vm.runInContext(script.text, c);
@@ -236,6 +257,12 @@ test('proposal detail renders stored demand stages, days and MD together', async
   assert.deepEqual(result.section.querySelectorAll('dt').map(el => el.text.trim()), ['요구 단계', '요구 감리 일수', '요구 투입 공수']);
   assert.deepEqual(result.values, ['3 단계', '5 일', '151 MD']);
   assert(result.html.text.includes('제안투입공수')); assert(!result.section.text.includes('126'));
+  const basis = result.html.querySelector('#proposal-comparison-basis');
+  assert(basis.text.includes('151 MD')); assert(basis.text.includes('5 일'));
+  const other = await renderRequirements({ required_phases: 2, required_audit_days: 7, required_md: 200 });
+  const otherBasis = other.html.querySelector('#proposal-comparison-basis');
+  assert(otherBasis.text.includes('200 MD')); assert(otherBasis.text.includes('7 일'));
+  assert(!otherBasis.text.includes('151 MD'));
 });
 test('proposal demand display distinguishes missing values from zeros and numeric strings', async () => {
   assert.deepEqual((await renderRequirements({ required_phases: null, required_audit_days: null, required_md: null })).values, ['미입력', '미입력', '미입력']);
@@ -263,17 +290,38 @@ test('100 required / 10 proposed is unmet, never fulfilled by default', () => {
   let checks = c.ProposalTemplate.checks(c.ProposalTemplate.context(data(), { mdScope: 'all' }));
   assert.equal(checks[2].status, '미충족'); assert.equal(checks[3].status, '검토 필요');
   checks = c.ProposalTemplate.checks(c.ProposalTemplate.context(data()));
-  assert.equal(checks[2].status, '검토 필요');
+  assert.equal(checks[2].status, '미충족');
 });
 test('unknown requirements and empty staffing cannot be fulfilled', () => {
   const c = sandbox(), d = data(); d.requestMD = null; d.requestStageCount = null; d.requestAuditDays = null; d.stages = []; d.portalOrder = [];
   assert(c.ProposalTemplate.checks(c.ProposalTemplate.context(d, { mdScope: 'all' })).every(x => x.status === '검토 필요'));
 });
-test('additional stages and experts follow the explicitly selected MD basis', () => {
-  const c = sandbox(), d = data(); d.requestMD = 15;
-  d.stages.push({ ...d.stages[0], stage: '추가' });
-  assert.equal(c.ProposalTemplate.checks(c.ProposalTemplate.context(d, { extraStages: ['추가'], mdScope: 'baseline-auditors' }))[2].status, '미충족');
-  assert.equal(c.ProposalTemplate.checks(c.ProposalTemplate.context(d, { extraStages: ['추가'], mdScope: 'auditors' }))[2].status, '충족');
+test('all roles and additional stages count toward 151 MD without choices; stored thresholds are not hardcoded', async () => {
+  const c = complianceSandbox({ 'proposal-md-scope': 'baseline-auditors', 'proposal-day-scope': 'total' });
+  const d = complianceFixture(); d.requestMD = 151; d.requestAuditDays = 5; d.stages[0].days = 5;
+  d.stages[0].감리원.people = [{ name: '가', pre: 0, audit: 100, post: 0 }];
+  d.portalOrder.push({ name: '전', group: '전문가' }, { name: '테', group: '테스터' });
+  d.personGradeMap.전 = { group: '전문가' }; d.personGradeMap.테 = { group: '테스터' };
+  d.stages[0].전문가.people = [{ name: '전', pre: 0, audit: 20, post: 0 }, { name: '테', pre: 0, audit: 11, post: 0 }];
+  d.stages.push({ ...d.stages[0], stage: '추가', days: 1, 감리원: { people: [{ name: '가', pre: 0, audit: 20, post: 0 }] }, 전문가: { people: [] } });
+  c.getExtraSet = () => new Set(['추가']);
+  for (const legacy of ['', 'baseline-auditors', 'auditors', 'all']) {
+    const ctx = c.ProposalTemplate.context(d, { extraStages: ['추가'], mdScope: legacy });
+    assert.equal(ctx.total.all, 151);
+    assert.equal(c.ProposalTemplate.checks(ctx)[2].status, '충족');
+    const result = c.ProposalTemplate.complianceData(ctx, menu('COMPLIANCE'));
+    assert.equal(result.map['[공수판정]'], '충족'); assert(result.map['[공수비교내역]'].includes('100%'));
+    assert.equal(result.map['[방법일수판정]'], '충족');
+  }
+  const built = await c.ProposalTemplate.build(menu('COMPLIANCE', complianceB64), d);
+  const shown = visibleComplianceText(c, await built.zip.file('ppt/slides/slide1.xml').async('string'));
+  assert(shown.includes('비교: 전체 인력 151 MD / 요구 대비 100%'));
+  assert(shown.includes('기본 일반단계별 최소 5일'));
+  assert(!shown.includes('비교 범위 미확정'));
+  d.requestMD = 152;
+  assert.equal(c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d), menu('COMPLIANCE')).map['[공수판정]'], '미충족');
+  d.requestMD = null;
+  assert.equal(c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d), menu('COMPLIANCE')).map['[공수판정]'], '검토 필요');
 });
 test('role normalization agrees with server data', () => {
   const c = sandbox(), d = data(); d.portalOrder.push({ name: '다', group: '전문가', expertSubGroup: '핵심기술' });

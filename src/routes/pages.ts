@@ -1011,21 +1011,12 @@ app.get('/proposals/:id', async (c) => {
       <p style="font-size:13px;color:#666;margin:0 0 16px">활성화된 본문 목차 순서로 생성합니다. 누락·미치환·검토 항목을 확인한 뒤 초안을 다운로드하세요.</p>
       <div id="autoModalAlertBox" role="status" style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:7px;font-size:13px;font-weight:600"></div>
       <section id="proposal-generation-report" aria-live="polite" hidden style="margin-bottom:12px;padding:12px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;font-size:12px"></section>
-      <label for="proposal-md-scope" style="display:block;font-size:13px;margin-bottom:12px">RFP 최소 공수 비교 범위 (담당자 확인)
-        <select id="proposal-md-scope" style="display:block;width:100%;padding:7px;margin-top:4px">
-          <option value="">미확정 — 충족 여부는 검토 필요</option>
-          <option value="baseline-auditors">기본 단계 감리원만 (추가 단계·전문가·테스터 제외)</option>
-          <option value="auditors">전체 감리원 (추가 단계 포함)</option>
-          <option value="all">전체 인력 (추가 단계·전문가·테스터 포함)</option>
-        </select>
-      </label>
-      <label for="proposal-day-scope" style="display:block;font-size:13px;margin-bottom:12px">3.6 RFP 최소 일수 해석 (기본 일반단계 기준)
-        <select id="proposal-day-scope" style="display:block;width:100%;padding:7px;margin-top:4px">
-          <option value="">미확정 — 검토 필요</option>
-          <option value="per-stage">각 단계별 최소 일수</option>
-          <option value="total">기본 단계 일수의 전체 합계</option>
-        </select>
-      </label>
+      <section id="proposal-comparison-basis" aria-labelledby="proposal-comparison-heading" style="font-size:13px;margin-bottom:12px;padding:12px;background:#f7f8fa;border-radius:8px">
+        <h4 id="proposal-comparison-heading" style="margin:0 0 6px">감리 요구사항 자동 비교 기준</h4>
+        <p style="margin:4px 0">요구 공수 <b>${fmtRequirement(project.required_md, 'MD')}</b>: 감리원·전문가·테스터의 전체 배정 공수 합계로 비교합니다. 추가 단계 공수도 포함합니다.</p>
+        <p style="margin:4px 0">요구 감리 일수 <b>${fmtRequirement(project.required_audit_days, '일')}</b>: 각 기본 일반단계가 요구 일수 이상인지 개별 비교합니다. 단계 일수를 합산하지 않습니다.</p>
+        <p style="margin:4px 0;color:#666;font-size:12px">일수 비교에서 추가 선택 단계와 상시·상주·검수지원은 제외합니다. 저장된 요구값이나 배정값이 없으면 검토 필요로 표시합니다.</p>
+      </section>
       <label for="proposal-compliance-pm" style="display:block;font-size:13px;margin-bottom:12px">3.6 수행 총괄 감리원(PM) 확인
         <select id="proposal-compliance-pm" style="display:block;width:100%;padding:7px;margin-top:4px">
           <option value="">미지정 — 저장된 총괄 값을 자동 적용하지 않음</option>

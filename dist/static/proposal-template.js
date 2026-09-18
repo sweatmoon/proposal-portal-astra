@@ -47,8 +47,6 @@ var ProposalTemplate = (() => {
   function options() {
     return {
       extraStages: typeof getExtraSet === 'function' ? [...getExtraSet()] : [],
-      mdScope: typeof document !== 'undefined' ? document.getElementById('proposal-md-scope')?.value || '' : '',
-      dayScope: typeof document !== 'undefined' ? document.getElementById('proposal-day-scope')?.value || '' : '',
       compliancePM: typeof document !== 'undefined' ? document.getElementById('proposal-compliance-pm')?.value || '' : '',
     };
   }
@@ -85,48 +83,47 @@ var ProposalTemplate = (() => {
   function checks(ctx) {
     const pd = ctx.pd;
     const compare = (required, actual) => number(required) === null || Number(required) <= 0 || actual === null ? '검토 필요' : actual >= Number(required) ? '충족' : '미충족';
-    const stageCount = ctx.base.length || null;
-    const days = ctx.base.length && ctx.base.every(s => number(s.days) !== null && Number(s.days) > 0)
-      ? ctx.base.reduce((sum, s) => sum + Number(s.days), 0) : null;
-    const scopes = { 'baseline-auditors': ctx.total.baseline, auditors: ctx.total.baseline + ctx.total.additional, all: ctx.total.all };
-    const scopesText = { 'baseline-auditors': '기본 단계 감리원', auditors: '전체 감리원', all: '전체 인력' };
-    const actualMD = Object.hasOwn(scopes, ctx.opt.mdScope) ? scopes[ctx.opt.mdScope] : null;
-    let mdStatus = compare(pd.requestMD, actualMD);
-    if (ctx.warnings.length) mdStatus = '검토 필요';
+    const { regular, days, dayStatus, actualMD, mdReliable } = requirementValues(ctx);
+    const stageCount = regular.length || null;
+    const mdStatus = mdReliable ? compare(pd.requestMD, actualMD) : '검토 필요';
     return [
-      { label: '감리 단계', required: number(pd.requestStageCount) > 0 ? `${pd.requestStageCount}단계 이상` : 'RFP 단계 수 미입력', actual: `${stageCount ?? '미확인'}단계 (추가 선택 단계 제외)`, status: compare(pd.requestStageCount, stageCount) },
-      { label: '현장감리 일수', required: number(pd.requestAuditDays) > 0 ? `${pd.requestAuditDays}일 이상` : 'RFP 최소 일수 미입력', actual: `${days ?? '미확인'}일 (기본 단계 일수 합계)`, status: compare(pd.requestAuditDays, days) },
-      { label: '투입 공수', required: number(pd.requestMD) > 0 ? `${pd.requestMD} MD 이상` : 'RFP 요구공수 미입력', actual: actualMD === null ? `전체 ${ctx.total.all} MD / 비교 범위 미확정` : `${actualMD} MD / ${scopesText[ctx.opt.mdScope]}`, status: mdStatus },
+      { label: '감리 단계', required: number(pd.requestStageCount) > 0 ? `${pd.requestStageCount}단계 이상` : 'RFP 단계 수 미입력', actual: `${stageCount ?? '미확인'}단계 (추가 선택·보조 단계 제외)`, status: compare(pd.requestStageCount, stageCount) },
+      { label: '현장감리 일수', required: number(pd.requestAuditDays) > 0 ? `${pd.requestAuditDays}일 이상` : 'RFP 최소 일수 미입력', actual: `${days ?? '미확인'}일 (기본 일반단계별 최소)`, status: dayStatus },
+      { label: '투입 공수', required: number(pd.requestMD) > 0 ? `${pd.requestMD} MD 이상` : 'RFP 요구공수 미입력', actual: `${actualMD} MD / 전체 인력 (감리원·전문가·테스터)`, status: mdStatus },
       { label: '인력 자격·구성', required: 'RFP 자격·경력·상근 요건 확인', actual: `${ctx.members.length}명 / 항목별 증빙을 담당자가 확인해야 합니다.`, status: '검토 필요' },
     ];
+  }
+  const validAssignment = p => p.mdComplete !== false && ['pre', 'audit', 'post'].every(k => number(p[k]) !== null && Number(p[k]) >= 0);
+  // 사용자 확정 기준: 전체 인력 MD 합계, 기본 일반단계 각각의 최소 일수.
+  // 사업별 요구값을 그대로 사용하고 구형 선택값/DOM으로 비교 범위를 바꾸지 않는다.
+  function requirementValues(ctx) {
+    const regular = ctx.base.filter(s => !/상시|상주|검수지원/.test(s.stage));
+    const validDays = regular.length > 0 && regular.every(s => number(s.days) !== null && Number(s.days) >= 0);
+    const days = validDays ? Math.min(...regular.map(s => Number(s.days))) : null;
+    const required = number(ctx.pd.requestAuditDays);
+    const below = regular.some(s => number(s.days) !== null && Number(s.days) >= 0 && Number(s.days) < required);
+    const dayStatus = required === null || required <= 0 ? '검토 필요'
+      : below ? '미충족' : days === null ? '검토 필요' : '충족';
+    const assigned = ctx.stages.flatMap(s => [...s.auditors, ...s.experts]);
+    const mdReliable = assigned.length > 0 && assigned.every(validAssignment) && !ctx.warnings.length;
+    return { regular, days, dayStatus, assigned, mdReliable, actualMD: ctx.total.all };
   }
   // 3.6은 RFP 원문을 추론하지 않는다. 숫자 비교와 증빙 확인을 분리한다.
   function complianceData(ctx, menu) {
     const pd = ctx.pd, warnings = [...ctx.warnings];
-    const validMD = p => p.mdComplete !== false && ['pre', 'audit', 'post'].every(k => number(p[k]) !== null && Number(p[k]) >= 0);
-    const assigned = ctx.stages.flatMap(s => [...s.auditors, ...s.experts]);
-    const mdReliable = assigned.length > 0 && assigned.every(validMD) && !ctx.warnings.length;
+    const { regular, days: dayValue, dayStatus, assigned, mdReliable, actualMD } = requirementValues(ctx);
     if (!mdReliable) warnings.push('공수: 배정 없음·원본 누락·배정 오류를 확인하세요. 표시 합계는 잠정값입니다.');
     const compare = (required, actual) => number(required) === null || Number(required) <= 0 || actual === null
       ? '검토 필요' : actual >= Number(required) ? '충족' : '미충족';
     const aggregate = statuses => statuses.includes('미충족') ? '미충족' : statuses.every(s => s === '충족') ? '충족' : '검토 필요';
     const display = v => number(v) !== null && Number(v) >= 0 ? Number(v) : '미입력';
     const round = v => Math.round(v * 100) / 100;
-    // 상시/상주/검수지원은 일반 단계 최소 개수에 임의로 포함하지 않는다.
-    const regular = ctx.base.filter(s => !/상시|상주|검수지원/.test(s.stage));
     const stageStatus = compare(pd.requestStageCount, regular.length || null);
-    const validDays = regular.length > 0 && regular.every(s => number(s.days) !== null && Number(s.days) > 0);
-    const dayValue = validDays && ctx.opt.dayScope === 'total' ? regular.reduce((sum, s) => sum + Number(s.days), 0)
-      : validDays && ctx.opt.dayScope === 'per-stage' ? Math.min(...regular.map(s => Number(s.days))) : null;
-    const dayStatus = compare(pd.requestAuditDays, dayValue);
     const datesValid = ctx.stages.length > 0 && ctx.stages.every(s => s.start && s.end && s.start <= s.end);
     if (!datesValid) warnings.push('일정: 시작/종료일 누락 또는 역전이 있습니다.');
-    const scopes = { 'baseline-auditors': ctx.total.baseline, auditors: ctx.total.baseline + ctx.total.additional, all: ctx.total.all };
-    const scopeLabels = { 'baseline-auditors': '기본 감리원', auditors: '전체 감리원', all: '전체 인력' };
-    const actualMD = Object.hasOwn(scopes, ctx.opt.mdScope) ? scopes[ctx.opt.mdScope] : null;
     const mdStatus = mdReliable ? compare(pd.requestMD, actualMD) : '검토 필요';
-    const activeNames = new Set(assigned.filter(p => validMD(p) && md(p) > 0).map(p => p.name));
-    const auditorNames = unique(ctx.stages.flatMap(s => s.auditors.filter(p => validMD(p) && md(p) > 0).map(p => p.name)));
+    const activeNames = new Set(assigned.filter(p => validAssignment(p) && md(p) > 0).map(p => p.name));
+    const auditorNames = unique(ctx.stages.flatMap(s => s.auditors.filter(p => validAssignment(p) && md(p) > 0).map(p => p.name)));
     const auditors = auditorNames.map(name => ctx.members.find(m => m.name === name) || { name });
     const residency = m => m.fulltimeKnown === false ? '미확인' : ['상근', '비상근'].includes(m.residency) ? m.residency : '미확인';
     const fulltime = auditors.filter(m => residency(m) === '상근').length;
@@ -149,17 +146,17 @@ var ProposalTemplate = (() => {
     statuses.forEach((s, i) => { if (s !== '충족') warnings.push(`${labels[i]}: ${s}`); });
     warnings.push('3.6의 자격·상근·경험·교육 요구 문구는 양식 기준입니다. 해당 사업 RFP와 증빙을 대조하세요.');
     warnings.push('총괄 수행 건수·실제 감리 투입 기간·교육계획은 확인 자료가 없어 자동 확정하지 않습니다.');
-    warnings.push('단계·일수 충족은 선택한 비교 기준의 숫자 검토이며, RFP 단계 명칭·감리 방법의 최종 확인이 필요합니다.');
+    warnings.push('단계·일수 충족은 기본 일반단계별 최소 일수의 숫자 검토이며, RFP 단계 명칭·감리 방법의 최종 확인이 필요합니다.');
     const map = { ...common(ctx, menu),
       '[요구단계]': display(pd.requestStageCount), '[요구감리일수]': display(pd.requestAuditDays), '[요구투입공수]': display(pd.requestMD),
       '[준수요약]': statuses.includes('미충족') ? '미충족 항목 확인 필요' : '요청사항 검토 필요',
       '[추가제안요약]': '실제 배정 기준 제안 내역',
       '[단계구분]': `기본 ${regular.length}단계 / 추가 선택 ${ctx.stages.filter(s => (ctx.opt.extraStages || []).includes(s.stage)).length}단계`,
       '[단계별감리일정]': ctx.stages.map(s => `- ${s.stage || '단계 미입력'}: ${fmtDate(s.start) || '미확인'} ~ ${fmtDate(s.end) || '미확인'} (${display(s.days)}일)`).join('\n') || '감리 일정 미입력',
-      '[일수비교기준]': `일수 기준: ${ctx.opt.dayScope === 'total' ? '기본 일반단계 합계' : ctx.opt.dayScope === 'per-stage' ? '기본 일반단계별 최소' : '미확정'}${dayValue === null ? '' : ` ${round(dayValue)}일`}`,
+      '[일수비교기준]': `일수 기준: 기본 일반단계별 최소${dayValue === null ? ' / 일수 미확인' : ` ${round(dayValue)}일`}`,
       '[공수합계]': ctx.total.all, '[기본감리공수]': ctx.total.baseline, '[추가공수]': ctx.total.additional,
       '[전문가공수]': ctx.total.experts, '[테스트공수]': ctx.total.testers,
-      '[공수비교내역]': actualMD === null ? 'RFP 공수 비교 범위 미확정' : `비교: ${scopeLabels[ctx.opt.mdScope]} ${actualMD} MD${mdReliable && number(pd.requestMD) > 0 ? ` / 요구 대비 ${round(actualMD / Number(pd.requestMD) * 100)}%` : ' / 검토 필요'}`,
+      '[공수비교내역]': `비교: 전체 인력 ${actualMD} MD${mdReliable && number(pd.requestMD) > 0 ? ` / 요구 대비 ${round(actualMD / Number(pd.requestMD) * 100)}%` : ' / 검토 필요'}`,
       '[총괄감리원]': pm?.name || '미지정 — 담당자 확인',
       '[총괄자격]': pm ? `${pm.grade || '등급 미확인'} / ${residency(pm)} / 자격번호 ${pm.certNo || '미입력'}` : '생성 화면에서 수행 PM을 선택하세요.',
       '[총괄경력]': '총괄 수행 건수·실제 감리 투입 기간: 증빙 확인 필요',
