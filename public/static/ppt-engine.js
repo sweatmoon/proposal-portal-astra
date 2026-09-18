@@ -681,7 +681,7 @@ async function generateMenuPpt(menu, vm) {
     // ── 주관기관 요청사항 준수 여부 (요약표) ──────────────────────
     case 'SUMMARY_TABLE':         // 구버전 alias
     case 'COMPLIANCE':
-      result = await downloadSummaryTablePptx(null, { returnZip: true });
+      result = await ProposalTemplate.build(menu, vm);
       break;
 
     default:

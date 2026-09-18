@@ -47,15 +47,149 @@ function data() {
 }
 const docText = (c, xml) => c.ProposalTemplate.text(c.ProposalTemplate.parse(xml));
 
+const complianceB64 = readFileSync(new URL('../public/static/compliance-template.pptx', import.meta.url)).toString('base64');
+function complianceSandbox(values = {}) {
+  return sandbox({ document: { getElementById: id => ({ value: values[id] || '' }) } });
+}
+const complianceChoices = { 'proposal-md-scope': 'all', 'proposal-day-scope': 'per-stage', 'proposal-compliance-pm': '가' };
+function complianceFixture() {
+  const d = data(); d.requestMD = 10;
+  d.personGradeMap.가 = { group: '감리원팀', grade: '수석감리원', residency: '상근', fulltimeKnown: true, certNo: 'A-01' };
+  d.personGradeMap.나 = { group: '감리원팀', grade: '수석감리원', residency: '비상근', fulltimeKnown: false };
+  d.pmName = '저장된제안총괄';
+  return d;
+}
+function visibleComplianceText(c, xml) {
+  const doc = c.ProposalTemplate.parse(xml), tree = doc.getElementsByTagNameNS(P, 'spTree')[0];
+  return Array.from(tree.childNodes).filter(n => n.nodeType === 1).slice(2, 7).map(c.ProposalTemplate.text).join('');
+}
+function withoutText(c, xml) {
+  const doc = c.ProposalTemplate.parse(xml);
+  for (const t of c.ProposalTemplate.nodes(doc, 't')) { t.textContent = ''; t.removeAttribute('xml:space'); }
+  return new XMLSerializer().serializeToString(doc);
+}
+test('3.6 uses uploaded one-slide design; replaces every visible token and preserves XML styling, relationships and off-slide references', async () => {
+  const c = complianceSandbox(complianceChoices), original = await JSZip.loadAsync(complianceB64, { base64: true });
+  const result = await c.ProposalTemplate.build(menu('COMPLIANCE', complianceB64), complianceFixture());
+  assert.equal(result.slideCount, 1);
+  const path = 'ppt/slides/slide1.xml', before = await original.file(path).async('string'), after = await result.zip.file(path).async('string');
+  const shown = visibleComplianceText(c, after);
+  assert(!/\[[^\]]+\]/.test(shown)); assert(shown.includes('기본 1단계'));
+  assert(shown.includes('전체 배정 공수: 10 MD')); assert(shown.includes('수석감리원 / 상근 / 자격번호 A-01'));
+  assert(!shown.includes('이승학')); assert(!shown.includes('100% 충족')); assert(!shown.includes('221'));
+  assert.equal(withoutText(c, after), withoutText(c, before));
+  const treeBefore = c.ProposalTemplate.parse(before).getElementsByTagNameNS(P, 'spTree')[0];
+  const treeAfter = c.ProposalTemplate.parse(after).getElementsByTagNameNS(P, 'spTree')[0];
+  const ser = n => new XMLSerializer().serializeToString(n);
+  assert.deepEqual(Array.from(treeAfter.childNodes).slice(7).map(ser), Array.from(treeBefore.childNodes).slice(7).map(ser));
+  for (const path of Object.keys(original.files).filter(p => !original.files[p].dir && !/^ppt\/(slides|slideLayouts|slideMasters)\/[^/]+\.xml$/.test(p))) {
+    assert.deepEqual(await result.zip.file(path).async('uint8array'), await original.file(path).async('uint8array'), path);
+  }
+  assert(!result.warnings.some(w => w.includes('미치환')));
+});
+test('3.6 does not infer PM or verified residency and career from director/legacy labels', () => {
+  const c = sandbox(), d = complianceFixture();
+  let result = c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d), menu('COMPLIANCE'));
+  assert(result.map['[총괄감리원]'].includes('미지정')); assert(!result.map['[총괄감리원]'].includes(d.pmName));
+  assert(result.map['[감리원구성]'].includes('미확인 1명')); assert(!result.map['[감리원구성]'].includes('50%'));
+  assert.equal(result.map['[총괄판정]'], '검토 필요'); assert.equal(result.map['[감리원판정]'], '검토 필요');
+  assert.equal(result.map['[공통판정]'], '검토 필요'); assert(result.map['[총괄경력]'].includes('증빙 확인 필요'));
+  result = c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d, { compliancePM: '미배정인력' }), menu('COMPLIANCE'));
+  assert(result.map['[총괄감리원]'].includes('미지정'));
+});
+test('3.6 days require explicit per-stage or total interpretation and exclude auxiliary stages', () => {
+  const c = sandbox(), d = complianceFixture(); d.requestStageCount = 2; d.requestAuditDays = 4;
+  d.stages.push({ ...d.stages[0], stage: '종료' }, { ...d.stages[0], stage: '검수지원', days: 100 });
+  const calc = dayScope => c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d, { dayScope }), menu('COMPLIANCE'));
+  assert.equal(calc('').map['[방법일수판정]'], '검토 필요');
+  assert.equal(calc('per-stage').map['[방법일수판정]'], '미충족');
+  assert.equal(calc('total').map['[방법일수판정]'], '충족');
+  assert(calc('total').map['[일수비교기준]'].endsWith('4일'));
+  assert(calc('total').map['[단계별감리일정]'].includes('검수지원'));
+  d.stages[0].endDate = '2020-01-01';
+  assert.equal(calc('total').map['[방법일수판정]'], '검토 필요');
+});
+test('3.6 computes ratios from the selected MD scope and rejects missing/negative/non-numeric/raw-null MD', () => {
+  const c = sandbox(), d = complianceFixture();
+  const calc = opt => c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d, opt), menu('COMPLIANCE'));
+  assert.equal(calc({}).map['[공수판정]'], '검토 필요');
+  assert.equal(calc({ mdScope: 'all' }).map['[공수판정]'], '충족');
+  assert(calc({ mdScope: 'all' }).map['[공수비교내역]'].includes('100%'));
+  d.requestMD = '20'; assert.equal(calc({ mdScope: 'all' }).map['[공수판정]'], '미충족');
+  for (const invalid of [null, -1, 'bad', '']) {
+    d.stages[0].감리원.people[0].pre = invalid;
+    assert.equal(calc({ mdScope: 'all' }).map['[공수판정]'], '검토 필요');
+  }
+  d.stages[0].감리원.people[0].pre = 0; d.stages[0].감리원.people[0].mdComplete = false;
+  assert.equal(calc({ mdScope: 'all' }).map['[공수판정]'], '검토 필요');
+  d.stages = []; assert.equal(calc({ mdScope: 'all' }).map['[공수판정]'], '검토 필요');
+});
+test('3.6 deduplicates actually assigned staff and separates expert categories without inventing experience', () => {
+  const c = sandbox(), d = complianceFixture(); d.personGradeMap.나.fulltimeKnown = true;
+  for (const [name, group, expertSubGroup] of [['핵', '전문가', '핵심기술'], ['필', '전문가', '필수기술'], ['보', '전문가', '보안진단'], ['테', '테스터', ''], ['기타', '전문가', ''], ['미배정', '전문가', '핵심기술']]) {
+    d.portalOrder.push({ name, group }); d.personGradeMap[name] = { group, expertSubGroup }; d.personFieldMap[name] = name + '&분야';
+    if (name !== '미배정') d.stages[0].전문가.people.push({ name, pre: 0, audit: 1, post: 0 });
+  }
+  d.stages.push({ ...d.stages[0], stage: '종료' });
+  const { map } = c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d, { mdScope: 'all' }), menu('COMPLIANCE'));
+  assert(map['[감리원구성]'].includes('감리원 2명')); assert(map['[감리원구성]'].includes('50%'));
+  for (const label of ['핵심 기술 1명', '필수 기술 1명', '보안 진단 1명', '테스트 1명', '기타/미분류 1명']) assert(map['[전문가구성]'].includes(label));
+  assert(!map['[전문가구성]'].includes('미배정')); assert.equal(map['[전문가공수]'], 8); assert.equal(map['[테스트공수]'], 2);
+  assert.equal(map['[공통판정]'], '검토 필요');
+});
+test('3.6 rejects absent or incomplete registered template without fallback', async () => {
+  const c = sandbox();
+  await assert.rejects(c.ProposalTemplate.build(menu('COMPLIANCE'), data()), /DEFAULT/);
+  await assert.rejects(c.ProposalTemplate.build(menu('COMPLIANCE', await template(shape(para('[요구 단계] 충족')))), data()), /완성 양식이 아닙니다/);
+});
+test('COMPLIANCE and SUMMARY_TABLE dispatch registered template and preserve content after foreign merge', async () => {
+  const c = complianceSandbox(complianceChoices);
+  for (const code of ['COMPLIANCE', 'SUMMARY_TABLE']) {
+    const result = await c.generateMenuPpt(menu(code, complianceB64), c.buildProjectViewModel(complianceFixture()));
+    assert.equal(result.slideCount, 1);
+    const first = { zip: await JSZip.loadAsync(await template(shape(para('첫 장'))), { base64: true }), mergeStrategy: 'FOREIGN_TEMPLATE' };
+    const merged = await c.mergePresentationZips([first, result]);
+    const paths = await c.ProposalTemplate.slidePaths(merged); assert.equal(paths.length, 2);
+    assert(visibleComplianceText(c, await merged.file(paths[1]).async('string')).includes('전체 배정 공수: 10 MD'));
+    assert(merged.file('ppt/slides/_rels/' + paths[1].split('/').pop() + '.rels'));
+  }
+});
+test('3.6 retains long schedules, warns about overflow and never adds slides or shrinks text', async () => {
+  const c = complianceSandbox(complianceChoices), d = complianceFixture();
+  d.stages = Array.from({ length: 25 }, (_, i) => ({ ...d.stages[0], stage: '단계' + (i + 1) }));
+  const r = await c.ProposalTemplate.build(menu('COMPLIANCE', complianceB64), d);
+  const original = await JSZip.loadAsync(complianceB64, { base64: true });
+  const after = await r.zip.file('ppt/slides/slide1.xml').async('string');
+  assert(visibleComplianceText(c, after).includes('단계25')); assert.equal(r.slideCount, 1);
+  assert(r.warnings.some(w => w.includes('높이 초과')));
+  assert.equal(withoutText(c, after), withoutText(c, await original.file('ppt/slides/slide1.xml').async('string')));
+});
+const summaryFunctionSource = readFileSync(new URL('../public/static/proposal-detail.js', import.meta.url), 'utf8').split('async function downloadSummaryTablePptx')[1].split('// ── 전체 합본 PPT')[0];
+test('standalone 3.6 reloads registry, returns same template result and downloads despite warnings', async () => {
+  const c = complianceSandbox(complianceChoices); let clicked = 0, calls = 0;
+  c.parsedData = complianceFixture(); c.setBtnState = () => {}; c.setTimeout = fn => fn();
+  c.URL = { createObjectURL: () => 'blob:test', revokeObjectURL() {} };
+  c.fetch = async url => { assert.equal(url, '/api/ppt-menus?category=proposal'); calls++; return { json: async () => ({ ok: true, data: [menu('COMPLIANCE', complianceB64)] }) }; };
+  c.document.createElement = () => ({ click() { clicked++; }, remove() {} }); c.document.body = { appendChild() {} };
+  vm.runInContext('renderProposalReport = () => { reportCalls++; }', Object.assign(c, { reportCalls: 0 }));
+  vm.runInContext('async function downloadSummaryTablePptx' + summaryFunctionSource, c);
+  const result = await c.downloadSummaryTablePptx(null, { returnZip: true });
+  assert.equal(result.slideCount, 1); assert(result.warnings.length > 0);
+  await c.downloadSummaryTablePptx(null); assert.equal(clicked, 1); assert.equal(c.reportCalls, 1); assert.equal(calls, 2);
+});
+
 const tsModuleUrl = source => 'data:text/javascript;base64,' + Buffer.from(ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText).toString('base64');
 const pageSource = readFileSync(new URL('../src/routes/pages.ts', import.meta.url), 'utf8');
 const layoutModule = tsModuleUrl(readFileSync(new URL('../src/views/layout.ts', import.meta.url), 'utf8'));
-async function renderRequirements(values) {
+async function renderRequirements(values, members = [], phases = []) {
   const project = { id: 1, project_name: '요구사항 시험 사업', ...values };
   const dbModule = tsModuleUrl(`export async function query(sql) {
-    if (!/^\\s*SELECT\\b/i.test(sql)) throw new Error('Read-only test'); return [];
+    if (!/^\\s*SELECT\\b/i.test(sql)) throw new Error('Read-only test');
+    if (sql.includes('FROM proposal_members')) return ${JSON.stringify(members)};
+    if (sql.includes('FROM audit_phases')) return ${JSON.stringify(phases)};
+    return [];
   } export async function queryOne() { return ${JSON.stringify(project)}; }`);
   const source = pageSource.replace("'hono'", JSON.stringify(import.meta.resolve('hono')))
     .replace("'../db/client.js'", JSON.stringify(dbModule))
@@ -68,6 +202,35 @@ async function renderRequirements(values) {
   assert.equal(section.getAttribute('aria-labelledby'), 'audit-requirements-heading');
   return { html, section, values: section.querySelectorAll('dd').map(el => el.text.trim()) };
 }
+test('3.6 SSR exposes explicit scopes/PM choices and preserves unknown raw metadata without DB writes', async () => {
+  const name = '가&나', result = await renderRequirements({}, [
+    { person_name: name, member_group: '감리팀', is_fulltime: null },
+    { person_name: '상근인력', member_group: '감리팀', is_fulltime: true },
+    { person_name: '비상근인력', member_group: '감리팀', is_fulltime: false },
+    { person_name: '정수상근', member_group: '감리팀', is_fulltime: 1 },
+    { person_name: '정수비상근', member_group: '감리팀', is_fulltime: 0 },
+  ], [{ phase_name: '설계', phase_days: 5, assignments: [
+    { person_name: name, pre_survey_md: null, audit_md: 5, action_confirm_md: 0 },
+    { person_name: '상근인력', pre_survey_md: 0, audit_md: 5, action_confirm_md: 0 },
+  ] }]);
+  const pmSelect = result.html.querySelector('#proposal-compliance-pm');
+  assert.equal(pmSelect.querySelectorAll('option')[1].getAttribute('value'), name);
+  assert.equal(pmSelect.querySelector('option').getAttribute('value'), '');
+  assert.equal(result.html.querySelector('#proposal-day-scope option').getAttribute('value'), '');
+  assert(result.html.querySelector('a[href="/static/compliance-template.pptx"]'));
+  const script = result.html.querySelectorAll('script').find(s => s.text.includes('var parsedData ='));
+  const c = vm.createContext({}); vm.runInContext(script.text, c);
+  assert.equal(c.parsedData.personGradeMap[name].fulltimeKnown, false);
+  assert.equal(c.parsedData.personGradeMap['상근인력'].fulltimeKnown, true);
+  assert.equal(c.parsedData.personGradeMap['비상근인력'].fulltimeKnown, true);
+  assert.equal(c.parsedData.personGradeMap['정수상근'].fulltimeKnown, true);
+  assert.equal(c.parsedData.personGradeMap['정수상근'].residency, '상근');
+  assert.equal(c.parsedData.personGradeMap['정수비상근'].fulltimeKnown, true);
+  assert.equal(c.parsedData.personGradeMap['정수비상근'].residency, '비상근');
+  assert.equal(c.parsedData.stages[0].감리원.people[0].pre, 0);
+  assert.equal(c.parsedData.stages[0].감리원.people[0].mdComplete, false);
+  assert.equal(c.parsedData.stages[0].감리원.people[1].mdComplete, true);
+});
 test('proposal detail renders stored demand stages, days and MD together', async () => {
   const result = await renderRequirements({ required_phases: 3, required_audit_days: 5, required_md: 151, proposed_md: 126 });
   assert.deepEqual(result.section.querySelectorAll('dt').map(el => el.text.trim()), ['요구 단계', '요구 감리 일수', '요구 투입 공수']);

@@ -2806,30 +2806,25 @@ async function downloadPhotoAssignPptx(btn, opts) {
 // ── 요약표 PPT ──────────────────────────────────────────────
 async function downloadSummaryTablePptx(btn, opts) {
   opts = opts || {}
-  if (typeof PptxGenJS === 'undefined') throw new Error('PPT 라이브러리를 불러오지 못했습니다.')
   setBtnState(btn, true)
   try {
-    const ctx = ProposalTemplate.context(parsedData, ProposalTemplate.options())
-    const checks = ProposalTemplate.checks(ctx)
-    const pres = new PptxGenJS(); pres.layout = 'LAYOUT_WIDE'
-    const slide = pres.addSlide()
-    slide.addText('주관기관 요청사항 준수 여부 — 입력값 기준 검토', { x: 0.5, y: 0.35, w: 12, h: 0.5, fontFace: 'KoPub돋움체 Bold', fontSize: 19 })
-    const header = ['요청 구분', '제안요청 내용 (RFP)', '판정', '제안 내역 / 확인 사항']
-      .map(text => ({ text, options: { bold: true, fill: 'D2F0FF', color: '222222' } }))
-    const rows = [header, ...checks.map(c => [c.label, c.required,
-      { text: c.status, options: { bold: true, color: c.status === '미충족' ? 'B91C1C' : c.status === '검토 필요' ? '92400E' : '166534' } }, c.actual])]
-    slide.addTable(rows, { x: 0.5, y: 1.15, w: 12.3, colW: [1.8, 3.0, 1.2, 6.3],
-      fontFace: 'KoPub돋움체 Medium', fontSize: 12, border: { pt: 0.5, color: 'BFBFBF' },
-      margin: 0.12, rowH: 0.75, valign: 'mid', autoPage: true, autoPageRepeatHeader: true })
-    slide.addText('충족은 선택한 범위의 숫자 비교 결과입니다. RFP 해석·증빙·인력 자격은 담당자 최종 확인이 필요합니다.',
-      { x: 0.5, y: 6.8, w: 12.3, h: 0.35, fontSize: 10, color: '92400E' })
-    const warnings = [...ctx.warnings, ...checks.filter(c => c.status !== '충족').map(c => `${c.label}: ${c.status} (${c.required})`)]
-    if (opts.returnZip) {
-      const zip = await JSZip.loadAsync(await pres.write({ outputType: 'arraybuffer' }))
-      return { zip, warnings, mergeStrategy: 'FOREIGN_TEMPLATE' }
+    let menu = opts.menu
+    if (!menu) {
+      const registry = await PptMenuRegistry.load(true)
+      menu = registry.byCode.COMPLIANCE || registry.byCode.SUMMARY_TABLE
     }
-    await pres.writeFile({ fileName: '검토용_요약표_' + (parsedData.projectTitle || '').slice(0, 10) + '.pptx' })
-    showAutoAlert('검토용 요약표를 생성했습니다. RFP 비교 범위와 판정 근거를 확인하세요.', false)
+    if (!menu) throw new Error('3.6 준수 여부 목차가 등록되어 있지 않습니다.')
+    const result = await ProposalTemplate.build(menu, opts.vm || parsedData)
+    if (opts.returnZip) return result
+    renderProposalReport({ status: '검토 필요', entries: [], warnings: result.warnings })
+    const blob = await result.zip.generateAsync({ type: 'blob' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = '3.6_주관기관_요청사항_준수여부.pptx'
+    document.body.appendChild(link); link.click(); link.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 10000)
+    showAutoAlert('등록 양식으로 3.6 초안을 생성했습니다. 생성 보고서와 증빙 확인 항목을 검토하세요.', false)
   } catch (e) {
     showAutoAlert('요약표 생성 실패: ' + e.message, false)
     if (opts.returnZip) throw e

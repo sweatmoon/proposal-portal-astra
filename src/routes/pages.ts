@@ -429,7 +429,7 @@ app.get('/proposals/:id', async (c) => {
   // ── DB → parsedData 포맷 변환 ────────────────────────────────
   // proposal_members → personFieldMap / personGradeMap / portalOrder
   const personFieldMap: Record<string, string> = {}
-  const personGradeMap: Record<string, { grade: string; group: string; expertSubGroup: string; residency: string; certNo: string }> = {}
+  const personGradeMap: Record<string, { grade: string; group: string; expertSubGroup: string; residency: string; fulltimeKnown: boolean; certNo: string }> = {}
   const portalOrder: { name: string; group: string; expertSubGroup: string }[] = []
 
   members.forEach(m => {
@@ -451,6 +451,7 @@ app.get('/proposals/:id', async (c) => {
       group,
       expertSubGroup,
       residency:      m.is_fulltime ? '상근' : '비상근',
+      fulltimeKnown:  typeof m.is_fulltime === 'boolean' || m.is_fulltime === 0 || m.is_fulltime === 1,
       certNo:         String(m.auditor_cert_no ?? ''),
     }
     if (!portalOrder.find(p => p.name === name)) {
@@ -479,6 +480,9 @@ app.get('/proposals/:id', async (c) => {
         pre:   Number(a.pre_survey_md ?? 0),
         audit: Number(a.audit_md ?? 0),
         post:  Number(a.action_confirm_md ?? 0),
+        // 기존 숫자 값은 유지하되, 3.6 판정에서는 null→0 변환을 확정값으로 오인하지 않는다.
+        mdComplete: ['pre_survey_md', 'audit_md', 'action_confirm_md'].every(key =>
+          a[key] != null && String(a[key]).trim() !== '' && Number.isFinite(Number(a[key])) && Number(a[key]) >= 0),
         field: personFieldMap[String(a.person_name ?? '')] ?? String(a.domain ?? ''),
       }))
 
@@ -1015,6 +1019,25 @@ app.get('/proposals/:id', async (c) => {
           <option value="all">전체 인력 (추가 단계·전문가·테스터 포함)</option>
         </select>
       </label>
+      <label for="proposal-day-scope" style="display:block;font-size:13px;margin-bottom:12px">3.6 RFP 최소 일수 해석 (기본 일반단계 기준)
+        <select id="proposal-day-scope" style="display:block;width:100%;padding:7px;margin-top:4px">
+          <option value="">미확정 — 검토 필요</option>
+          <option value="per-stage">각 단계별 최소 일수</option>
+          <option value="total">기본 단계 일수의 전체 합계</option>
+        </select>
+      </label>
+      <label for="proposal-compliance-pm" style="display:block;font-size:13px;margin-bottom:12px">3.6 수행 총괄 감리원(PM) 확인
+        <select id="proposal-compliance-pm" style="display:block;width:100%;padding:7px;margin-top:4px">
+          <option value="">미지정 — 저장된 총괄 값을 자동 적용하지 않음</option>
+          ${portalOrder.filter(p => p.group === '감리원팀' && !/TBD|미정/i.test(p.name)).map(p => {
+            const safe = p.name.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+            return `<option value="${safe}">${safe}</option>`
+          }).join('')}
+        </select>
+      </label>
+      <p style="font-size:12px;color:#666">PM은 실제 공수가 배정된 감리원만 반영합니다. 자격·경력·교육은 별도 증빙 검토가 필요합니다.
+        <a href="/static/compliance-template.pptx" download="3.6_주관기관_요청사항_준수여부_플레이스홀더.pptx">3.6 완성 양식 다운로드</a> 후 목차 템플릿(DEFAULT)에 등록하세요.
+      </p>
       <div style="margin-bottom:16px;background:#f7f8fa;border-radius:8px;padding:12px">
         <b style="font-size:13px;color:#333">추가 제안 단계</b>
         <div style="font-size:12px;color:#666;margin-top:4px">RFP 최소 요건 이상으로 추가 제안한 단계를 선택하세요 (요약표에 반영됩니다)</div>
