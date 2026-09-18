@@ -105,10 +105,70 @@ test('registered schedule template fills year rollover, fields and dates', async
   assert.match(txt, /2026\.12\.10/); assert.match(txt, /2027년/); assert.match(txt, /11월12월1월2월3월/);
   assert(!txt.includes('[단계'));
 });
-test('stage capacity overflow is rejected rather than silently truncated', async () => {
-  const c = sandbox(), d = data(); d.stages = Array.from({ length: 5 }, (_, i) => ({ ...d.stages[0], stage: `단계${i}` }));
-  const b64 = await template(shape(para('[단계1]')));
-  await assert.rejects(c.ProposalTemplate.build(menu('SCHEDULE_PLAN', b64), { _raw: d }), /초과/);
+const sizedTable = (rows, widths, x = 500000, y = 1900000, h = 4000000) => `<p:graphicFrame><p:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${widths.reduce((a,b)=>a+b,0)}" cy="${h}"/></p:xfrm><a:graphic><a:graphicData><a:tbl><a:tblPr/><a:tblGrid>${widths.map(w=>`<a:gridCol w="${w}"/>`).join('')}</a:tblGrid>${rows.map(r=>r.replace('<a:tr>', '<a:tr h="240000">')).join('')}</a:tbl></a:graphicData></a:graphic></p:graphicFrame>`;
+function manyStages(count = 12) {
+  const d = data(); d.targetStartDate = '2026-01-01'; d.targetEndDate = '2027-03-31';
+  d.stages = Array.from({ length: count }, (_, i) => ({ ...d.stages[0], stage: `검증단계-${i+1}`,
+    startDate: `2026-${String(i%12+1).padStart(2,'0')}-10`, endDate: `2026-${String(i%12+1).padStart(2,'0')}-11` }));
+  return d;
+}
+test('all stages and extra expert fields fit one plan slide with resized rows and month columns', async () => {
+  const c = sandbox(), d = manyStages();
+  for (let i=0;i<7;i++) { const name=`전문가${i}`; d.portalOrder.push({name, group:'전문가',expertSubGroup:'핵심기술'}); d.personFieldMap[name]=`분야-${i+1}`; }
+  const b64 = await template(sizedTable([row(['단계감리팀','[단계1]','']), row(['','[단계2]','']), row(['핵심기술','[분야1]',''])], [800000,1600000,6400000],500000,2900000)
+    + sizedTable([row(['추진일정','2026년','년']), row(['','[n]월','[n+1]월']), row(['[대상사업]','',''])], [2400000,3200000,3200000],500000,1700000));
+  const r = await c.ProposalTemplate.build(menu('SCHEDULE_PLAN', b64), { _raw: d });
+  assert.equal(r.slideCount, 1); assert.equal((await c.ProposalTemplate.slidePaths(r.zip)).length,1);
+  const doc = c.ProposalTemplate.parse(await r.zip.file('ppt/slides/slide1.xml').async('string')), txt=c.ProposalTemplate.text(doc);
+  for(const s of d.stages) assert(txt.includes(s.stage));
+  for(let i=1;i<=7;i++) assert(txt.includes(`분야-${i}`));
+  assert(!/\[단계|\[분야|\[n/.test(txt));
+  const tables=c.ProposalTemplate.nodes(doc,'tbl'), stageRows=c.ProposalTemplate.nodes(tables[0],'tr');
+  assert.equal(stageRows.length,19);
+  assert(stageRows.reduce((s,r)=>s+Number(r.getAttribute('h')),0)<=720000);
+  assert.equal(c.ProposalTemplate.nodes(tables[1],'gridCol').length,16);
+  const shapes=c.ProposalTemplate.nodes(doc,'cNvPr',P).map(n=>n.getAttribute('id'));
+  assert.equal(new Set(shapes).size,shapes.length);
+  assert(txt.includes('2027년'));
+});
+test('detail duplicates complete merged blocks for regular, multiple resident and acceptance stages in one slide', async () => {
+  const c=sandbox(), d=manyStages(8);
+  d.stages.push(...['상주감리-A','상시감리-B','검수지원-A','검수지원-B'].map(stage=>({...d.stages[0],stage})));
+  const first=row(['[단계1]','감리시행','현장감리','[단계1시작일] ~ [단계1종료일]','(0)일 / (0)MD']).replace('<a:tc>','<a:tc rowSpan="2">');
+  const sub=row(['','소계','','','(0)일 / (0)MD']).replace('<a:tc>','<a:tc vMerge="1">');
+  const b64=await template(sizedTable([row(['단계','활동','절차','일정','MD']),first,sub,row(['상주감리','감리시행','상주감리','[단계5시작일]','(0)일 / (0)MD']),row(['검수지원','감리시행','검수지원','종료','(0)일 / (0)MD']),row(['단계 감리팀 투입 공수 합계','','','','총 0MD'])],[800000,800000,1500000,1500000,1400000]));
+  const r=await c.ProposalTemplate.build(menu('DETAIL_SCHEDULE',b64),{_raw:d});
+  const doc=c.ProposalTemplate.parse(await r.zip.file('ppt/slides/slide1.xml').async('string')), txt=c.ProposalTemplate.text(doc);
+  assert.equal(r.slideCount,1);assert.equal((await c.ProposalTemplate.slidePaths(r.zip)).length,1);
+  for(const s of d.stages) assert(txt.includes(s.stage));
+  assert(txt.includes('총 120MD'));
+  assert(!txt.includes('[단계'));
+  const rows=c.ProposalTemplate.nodes(doc,'tr');assert.equal(rows.length,22);
+  assert(rows.reduce((s,r)=>s+Number(r.getAttribute('h')),0)<=1440000);
+  const cells=c.ProposalTemplate.nodes(doc,'tc');
+  assert.equal(cells.filter(c=>c.getAttribute('rowSpan')==='2').length,8);
+  assert.equal(cells.filter(c=>c.getAttribute('vMerge')==='1').length,8);
+});
+test('title/client-only procedure templates never inherit unrelated MD or personnel warnings', async () => {
+  const c=sandbox(), d=data();d.proposedMD=999;d.stages[0].감리원.people[0].pre=-1;d.portalOrder=[];
+  const b64=await template(shape(para('[제','목] [주관','기관]')));
+  for(const code of ['AUDIT_PROCEDURE','ACTION_CONFIRM_PROCEDURE']) {
+    const r=await c.ProposalTemplate.build(menu(code,b64),{_raw:d});
+    assert.equal(r.warnings.length,0);
+    assert(docText(c,await r.zip.file('ppt/slides/slide1.xml').async('string')).includes('A&B <기관>'));
+  }
+});
+test('MD warnings remain on templates actually using MD data', async () => {
+  const c=sandbox(),d=data();d.proposedMD=999;
+  const b64=await template(table([row(['[단계1]','감리시행','현장감리','[단계1시작일]','(0)일 / (0)MD'])]));
+  const r=await c.ProposalTemplate.build(menu('DETAIL_SCHEDULE',b64),{_raw:d});
+  assert(r.warnings.some(w=>w.includes('사업 제안공수')));
+});
+test('missing client remains unresolved independently of unrelated MD mismatch', async () => {
+  const c=sandbox(),d=data();d.proposedMD=999;d.clientOrg='';
+  const r=await c.ProposalTemplate.build(menu('AUDIT_PROCEDURE',await template(shape(para('[제목] [주관기관]')))),{_raw:d});
+  assert(r.warnings.some(w=>w.includes('[주관기관]')));
+  assert(!r.warnings.some(w=>w.includes('공수')));
 });
 test('detail blocks remove absent stages and separate resident/acceptance MD', async () => {
   const c = sandbox(), d = data();

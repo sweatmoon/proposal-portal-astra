@@ -110,6 +110,10 @@ var ProposalTemplate = (() => {
     if (!ts.length) return;
     ts[0].textContent = String(value);
     ts.slice(1).forEach(t => { t.textContent = ''; });
+    // 전체 셀/도형을 교체할 때 원본의 빈 문단·줄바꿈이 행 높이를 늘리지 않게 한다.
+    const keep = ancestor(ts[0], 'p');
+    for (const para of nodes(root, 'p')) if (para !== keep) para.parentNode.removeChild(para);
+    for (const br of nodes(root, 'br')) br.parentNode.removeChild(br);
   }
   function ancestor(el, name) {
     while (el && el.localName !== name) el = el.parentNode;
@@ -145,7 +149,7 @@ var ProposalTemplate = (() => {
     const validStarts = ctx.stages.map(s => s.start).filter(Boolean), validEnds = ctx.stages.map(s => s.end).filter(Boolean);
     map['[감리기간]'] = validStarts.length === ctx.stages.length && validEnds.length === ctx.stages.length && ctx.stages.length
       ? `${fmtDate(new Date(Math.min(...validStarts)))} ~ ${fmtDate(new Date(Math.max(...validEnds)))}` : undefined;
-    Object.assign(map, { '[단계구분]': ctx.base.map(s => s.stage).join(' / '), '[기본감리공수]': ctx.total.baseline,
+    Object.assign(map, { '[단계구분]': `기본 ${ctx.base.length}단계`, '[기본감리공수]': ctx.total.baseline,
       '[추가공수]': ctx.total.additional, '[전문가공수]': ctx.total.experts, '[테스트공수]': ctx.total.testers, '[공수합계]': ctx.total.all });
     const groups = [ctx.members.filter(m => m.group === '전문가' && !/필수|보안/.test(m.expertSubGroup)),
       ctx.members.filter(m => /필수/.test(m.expertSubGroup)), ctx.members.filter(m => /보안/.test(m.expertSubGroup))];
@@ -203,7 +207,7 @@ var ProposalTemplate = (() => {
         const maxLine = Math.max(1, ...content.flatMap(t => t.split('\n')).map(t => [...t].reduce((n, ch) => n + (/[\x00-\x7f]/.test(ch) ? 0.55 : 1), 0)));
         const lineCount = Math.max(1, content.reduce((n, t) => n + t.split('\n').length, 0));
         // sz 단위는 1/100pt, EMU는 12700/pt. 단일 장을 위해 최소 글자 크기로 중단하지 않는다.
-        const cap = Math.max(1, Math.floor(Math.min((cellH - margin * 2) / (127 * 1.15 * lineCount), cellW ? (cellW - margin * 2) / (127 * maxLine) : Infinity)));
+        const cap = Math.max(1, Math.floor(Math.min((cellH - margin * 2) / (127 * 1.65 * lineCount), cellW ? (cellW - margin * 2) / (127 * maxLine) : Infinity)));
         for (const run of nodes(cell, 'r')) {
           if (!children(run, 'rPr').length) run.insertBefore(cell.ownerDocument.createElementNS(A, 'a:rPr'), run.firstChild);
         }
@@ -213,10 +217,11 @@ var ProposalTemplate = (() => {
         }
         for (const space of [...nodes(cell, 'spcPts'), ...nodes(cell, 'spcPct')]) {
           const line = space.parentNode.localName === 'lnSpc';
-          space.setAttribute('val', line && space.localName === 'spcPct' ? 100000 : Math.round((+space.getAttribute('val') || 0) * ratio));
+          space.setAttribute('val', line ? (space.localName === 'spcPct' ? 100000 : Math.round((+space.getAttribute('val') || 0) * ratio)) : 0);
         }
         for (const body of nodes(cell, 'bodyPr')) {
           body.setAttribute('wrap', 'square');
+          for (const attr of ['tIns', 'bIns', 'lIns', 'rIns']) body.setAttribute(attr, '0');
           for (const auto of [...children(body, 'spAutoFit'), ...children(body, 'normAutofit')]) body.removeChild(auto);
           if (!children(body, 'noAutofit').length) body.appendChild(cell.ownerDocument.createElementNS(A, 'a:noAutofit'));
         }
@@ -224,10 +229,145 @@ var ProposalTemplate = (() => {
     });
     const frame = ancestor(table, 'graphicFrame'), box = frame && geometry(frame);
     if (box) box.ext.setAttribute('cy', tableHeight(table));
-    // 複製した Office 拡張 ID は再採番する（行/列の編集時の重複防止）。
+    // 복제한 Office 확장 ID를 재부여해 행/열 편집 시 중복을 방지한다.
     let id = 1;
     for (const el of Array.from(table.getElementsByTagName('*'))) if (['rowId', 'colId', 'cellId'].includes(el.localName)) el.setAttribute('val', id++);
     if (minFont < 700) warnings.push('전체 단계를 한 장에 맞추기 위해 표 글자 크기를 7pt 미만으로 조정했습니다. 확대하여 확인하세요.');
+  }
+  function removeOverlays(doc, area, keep) {
+    const tree = nodes(doc, 'spTree', P)[0];
+    if (!tree) return;
+    for (const shape of Array.from(tree.childNodes)) {
+      if (shape === keep || !['sp', 'cxnSp', 'pic', 'grpSp'].includes(shape.localName)) continue;
+      const b = geometry(shape);
+      if (b && b.x + b.w / 2 >= area.x && b.x + b.w / 2 <= area.x + area.w
+        && b.y + b.h / 2 >= area.y && b.y + b.h / 2 <= area.y + area.h
+        && b.w <= area.w * 1.05 && b.h <= area.h * 1.05) tree.removeChild(shape);
+    }
+  }
+  function unmerge(cell) {
+    for (const attr of ['rowSpan', 'gridSpan', 'hMerge', 'vMerge']) cell.removeAttribute(attr);
+  }
+  function stageRange(stages) {
+    const valid = stages.filter(s => s.start && s.end && s.end >= s.start);
+    return valid.length ? { start: new Date(Math.min(...valid.map(s => s.start))), end: new Date(Math.max(...valid.map(s => s.end))) } : null;
+  }
+  function planCalendar(ctx) {
+    const dates = [date(ctx.pd.targetStartDate), date(ctx.pd.targetEndDate), ...ctx.stages.flatMap(s => [s.start, s.end])].filter(Boolean);
+    if (!dates.length) return null;
+    const first = new Date(Math.min(...dates)), last = new Date(Math.max(...dates));
+    const count = (last.getUTCFullYear() - first.getUTCFullYear()) * 12 + last.getUTCMonth() - first.getUTCMonth() + 1;
+    const start = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), 1));
+    const end = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + count, 1));
+    return { start, end, count };
+  }
+  // 각 막대는 편집 가능한 도형. 행 높이에 따라 글자 크기와 날짜 위치도 함께 조정한다.
+  function drawPlanRange(doc, box, range, calendar, label, color = '2A6DA0') {
+    const tree = nodes(doc, 'spTree', P)[0];
+    if (!tree || !calendar) return;
+    let id = Math.max(0, ...nodes(doc, 'cNvPr', P).map(n => +n.getAttribute('id') || 0));
+    function shape(name, x, y, w, h, value, fill, font) {
+      const escaped = String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const xml = `<p:sp xmlns:p="${P}" xmlns:a="${A}"><p:nvSpPr><p:cNvPr id="${++id}" name="${name}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${Math.max(1, Math.round(w))}" cy="${Math.max(1, Math.round(h))}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>${fill ? `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>` : '<a:noFill/>'}<a:ln><a:noFill/></a:ln></p:spPr><p:txBody><a:bodyPr wrap="none" lIns="0" rIns="0" tIns="0" bIns="0" anchor="ctr"><a:noAutofit/></a:bodyPr><a:lstStyle/><a:p><a:pPr algn="ctr"/><a:r><a:rPr lang="ko-KR" sz="${font}"><a:solidFill><a:srgbClr val="333333"/></a:solidFill><a:latin typeface="맑은 고딕"/><a:ea typeface="맑은 고딕"/></a:rPr><a:t>${escaped}</a:t></a:r></a:p></p:txBody></p:sp>`;
+      tree.appendChild(doc.importNode(parse(xml).documentElement, true));
+    }
+    let mid = box.x + box.w / 2;
+    if (range) {
+      const span = calendar.end - calendar.start;
+      const x = box.x + box.w * Math.max(0, (range.start - calendar.start) / span);
+      const right = box.x + box.w * Math.min(1, (range.end.getTime() + 86400000 - calendar.start) / span);
+      const w = Math.max(1, right - x); mid = x + w / 2;
+      shape('일정 막대', x, box.y + box.h * 0.12, w, box.h * 0.23, '', color, 100);
+    }
+    const font = Math.max(1, Math.min(850, Math.floor(box.h * 0.55 / (127 * 1.15))));
+    const labelWidth = Math.min(box.w, Math.max(1, [...label].length * font * 127 * 0.63));
+    shape('일정 날짜', Math.max(box.x, Math.min(mid - labelWidth / 2, box.x + box.w - labelWidth)), box.y + box.h * 0.4, labelWidth, box.h * 0.58, label, null, font);
+  }
+  function updatePlanTable(doc, ctx, warnings) {
+    const table = nodes(doc, 'tbl').find(t => children(t, 'tr').some(r => children(r, 'tc').length === 3 && /\[단계1\]/.test(text(r))));
+    if (!table) return; // 간단한 토큰-only 양식은 기존 공통 치환을 사용한다.
+    const original = children(table, 'tr'), originalHeight = tableHeight(table), frame = ancestor(table, 'graphicFrame');
+    const box = frame && geometry(frame), prototype = original.find(r => text(r).includes('[단계1]'));
+    const calendar = planCalendar(ctx), records = [];
+    const group = (items, source, label, describe, rangeOf) => {
+      items.forEach((item, i) => {
+        const row = source.cloneNode(true), cells = children(row, 'tc');
+        cells.forEach(unmerge);
+        setText(cells[0], i === 0 ? label : '');
+        if (i === 0 && items.length > 1) cells[0].setAttribute('rowSpan', items.length);
+        else if (i) cells[0].setAttribute('vMerge', '1');
+        setText(cells[1], describe(item)); setText(cells[2], '');
+        records.push({ row, range: rangeOf(item), isStage: label === '단계 감리팀' });
+      });
+    };
+    group(ctx.stages, prototype, '단계 감리팀', s => s.stage, s => s.start && s.end && s.end >= s.start ? s : null);
+    const expertGroups = [ctx.members.filter(m => m.group === '전문가' && !/필수|보안/.test(m.expertSubGroup)),
+      ctx.members.filter(m => /필수/.test(m.expertSubGroup)), ctx.members.filter(m => /보안/.test(m.expertSubGroup))];
+    expertGroups.forEach((members, i) => {
+      const fields = unique(members.map(m => m.field || '분야 확인 필요'));
+      const source = original.find(r => text(r).includes(`[분야${[1, 5, 7][i]}]`)) || prototype;
+      group(fields, source, ['핵심기술 점검팀', '필수기술 점검팀', '보안 진단팀'][i], f => f, field => {
+        const names = new Set(members.filter(m => (m.field || '분야 확인 필요') === field).map(m => m.name));
+        return stageRange(ctx.stages.filter(s => s.experts.some(p => names.has(p.name) && md(p) > 0)));
+      });
+    });
+    const testers = new Set(ctx.members.filter(m => m.group === '테스터').map(m => m.name));
+    if (testers.size) group(['기능 테스트'], prototype, '테스트팀', x => x,
+      () => stageRange(ctx.stages.filter(s => s.experts.some(p => testers.has(p.name) && md(p) > 0))));
+    for (const row of original) table.removeChild(row);
+    records.forEach(r => table.appendChild(r.row));
+    fitTable(table, originalHeight, warnings);
+    if (box) {
+      removeOverlays(doc, box, frame);
+      const widths = nodes(table, 'gridCol').map(c => +c.getAttribute('w'));
+      let y = box.y;
+      for (const rec of records) {
+        const h = +rec.row.getAttribute('h'), label = rec.range ? `${fmtDate(rec.range.start)} ~ ${fmtDate(rec.range.end)}` : '일정 확인 필요';
+        if (calendar) drawPlanRange(doc, { x: box.x + widths[0] + widths[1], y, w: widths[2], h }, rec.range, calendar, label);
+        else setText(children(rec.row, 'tc')[2], label);
+        if (rec.isStage && !rec.range) warnings.push('일정 계획에 날짜가 없거나 시작일·종료일 순서가 잘못된 단계가 있습니다. 해당 행에 확인 필요로 표시했습니다.');
+        y += h;
+      }
+    }
+    // 전체 기간의 월 열을 복제하되 표 너비는 고정하여 한 장 안에 유지한다.
+    if (calendar) for (const header of nodes(doc, 'tbl')) {
+      if (!text(header).includes('[n]')) continue;
+      const rows = children(header, 'tr'), grid = nodes(header, 'tblGrid')[0];
+      if (rows.length < 2 || !grid) continue;
+      const cols = children(grid, 'gridCol'); if (cols.length < 2) continue;
+      const width = cols.slice(1).reduce((s, c) => s + +c.getAttribute('w'), 0), first = cols[0], col = cols[1];
+      cols.slice(1).forEach(c => grid.removeChild(c));
+      let remaining = width;
+      for (let i = 0; i < calendar.count; i++) { const c = col.cloneNode(true), w = i === calendar.count - 1 ? remaining : Math.floor(width / calendar.count); c.setAttribute('w', w); remaining -= w; grid.appendChild(c); }
+      rows.forEach((row, ri) => {
+        const cells = children(row, 'tc'), sample = cells[1];
+        if (!sample) return;
+        cells.slice(1).forEach(c => row.removeChild(c));
+        for (let i = 0; i < calendar.count; i++) {
+          const c = sample.cloneNode(true); unmerge(c);
+          const d = new Date(Date.UTC(calendar.start.getUTCFullYear(), calendar.start.getUTCMonth() + i, 1));
+          setText(c, ri === 0 ? `${d.getUTCFullYear()}년` : ri === 1 ? `${d.getUTCMonth() + 1}월` : '');
+          row.appendChild(c);
+        }
+      });
+      // 같은 연도끼리 병합하고, 연도가 바뀌는 곳에서만 끊는다.
+      const yearCells = children(rows[0], 'tc');
+      for (let i = 1; i < yearCells.length;) {
+        let end = i + 1; while (end < yearCells.length && text(yearCells[end]) === text(yearCells[i])) end++;
+        if (end - i > 1) yearCells[i].setAttribute('gridSpan', end - i);
+        for (let j = i + 1; j < end; j++) { setText(yearCells[j], ''); yearCells[j].setAttribute('hMerge', '1'); }
+        i = end;
+      }
+      fitTable(header, tableHeight(header), warnings);
+      const hFrame = ancestor(header, 'graphicFrame'), hBox = hFrame && geometry(hFrame);
+      if (hBox && rows[2]) {
+        const area = { x: hBox.x + +first.getAttribute('w'), y: hBox.y + +rows[0].getAttribute('h') + +rows[1].getAttribute('h'), w: width, h: +rows[2].getAttribute('h') };
+        removeOverlays(doc, area, hFrame);
+        const start = date(ctx.pd.targetStartDate), end = date(ctx.pd.targetEndDate);
+        drawPlanRange(doc, area, start && end && end >= start ? { start, end } : null, calendar,
+          start && end && end >= start ? `${fmtDate(start)} ~ ${fmtDate(end)}` : '대상사업 기간 확인 필요', '7190AC');
+      }
+    }
   }
   function stageValue(stage, token) {
     if (/^\[단계\d+\]$/.test(token)) return stage.stage;
@@ -331,18 +471,25 @@ var ProposalTemplate = (() => {
       return path;
     });
   }
+  function templateWarnings(doc, ctx, menu) {
+    // 사업 전체 경고를 모든 장표에 전파하지 않는다. 실제 소비하는 데이터만 검증한다.
+    const content = text(doc).replace(/\s+/g, '');
+    const usesMD = /\[[^\[\]]*(?:공수|MD)[^\[\]]*\]/i.test(content)
+      || (menu.menu_code === 'DETAIL_SCHEDULE' && nodes(doc, 'tbl').some(t => /\[단계\d+\]/.test(text(t)) && /\(0\).*MD/.test(text(t))));
+    const usesPersonnel = /\[이름\d*\]/.test(content) || menu.menu_code === 'ACTION_CONFIRM_STAFF';
+    return ctx.warnings.filter(w => w.includes('제안 인력 목록') ? usesPersonnel : usesMD);
+  }
   async function build(menu, vm) {
     const template = (menu.templates || []).find(t => t.pptx_b64_key && t.variant_code === 'DEFAULT') || (menu.templates || []).find(t => t.pptx_b64_key);
     if (!template) throw new Error('업로드된 본문 템플릿이 없습니다.');
     const zip = await JSZip.loadAsync(template.pptx_b64_key, { base64: true });
     const ctx = context(vm._raw || vm, options());
-    const warnings = [...ctx.warnings], map = common(ctx, menu);
-    let stageSlots;
+    const warnings = [], map = common(ctx, menu);
     const schedule = ['SCHEDULE_PLAN', 'DETAIL_SCHEDULE'].includes(menu.menu_code);
     if (schedule) {
       if (!ctx.stages.length) throw new Error('감리 단계 데이터가 없습니다.');
-      const data = scheduleMap(ctx, menu); Object.assign(map, data.map); stageSlots = data.stages;
-      warnings.push('일정 템플릿의 고정 도식·화살표·수행기한 문구는 유지됩니다. 실제 일정과의 일치 여부를 검토하세요.');
+      const data = scheduleMap(ctx, menu); Object.assign(map, data.map);
+      if (menu.menu_code === 'DETAIL_SCHEDULE') warnings.push('세부 일정의 고정 수행기한·수행방안 문구는 담당자 확인이 필요합니다.');
       if (menu.menu_code === 'DETAIL_SCHEDULE') warnings.push('예비조사 날짜는 템플릿의 시작일 -7일(달력일) 표기를 적용했습니다.');
     }
     const pres = parse(await zip.file('ppt/presentation.xml').async('string'));
@@ -352,25 +499,32 @@ var ProposalTemplate = (() => {
     for (const path of slides) {
       const doc = parse(await zip.file(path).async('string'));
       if (size) stripOutside(doc, +size.getAttribute('cx'), +size.getAttribute('cy'));
-      if (menu.menu_code === 'DETAIL_SCHEDULE') updateDetailTables(doc, ctx, stageSlots, warnings);
+      warnings.push(...templateWarnings(doc, ctx, menu));
+      if (menu.menu_code === 'DETAIL_SCHEDULE') updateDetailTables(doc, ctx, warnings);
       if (menu.menu_code === 'SCHEDULE_PLAN') {
+        updatePlanTable(doc, ctx, warnings);
         // [n]월이 있는 표에서만 연도 헤더 갱신. 나머지 고정 문구는 추정해서 변경하지 않음.
         for (const table of nodes(doc, 'tbl')) {
           if (!text(table).includes('[n]')) continue;
           const row = children(table, 'tr')[0], start = date(ctx.pd.targetStartDate);
           if (row && start) children(row, 'tc').slice(1).forEach((cell, i) => setText(cell, `${start.getUTCFullYear() + Math.floor((start.getUTCMonth() + i) / 12)}년`));
         }
-        const start = date(ctx.pd.targetStartDate), end = date(ctx.pd.targetEndDate);
-        if (start && end && (end.getUTCFullYear() - start.getUTCFullYear()) * 12 + end.getUTCMonth() - start.getUTCMonth() >= 5) warnings.push('대상사업 기간이 현재 일정 도식의 5개월 범위를 초과합니다. 도식 확장이 필요합니다.');
+
       }
       const resolve = menu.menu_code === 'ACTION_CONFIRM_STAFF' ? actionResolver(doc, ctx, map) : token => map[token];
       const unresolved = replace(doc, resolve);
+      // 합계표 등의 토큰 치환 후 길어진 텍스트도 원래 표 영역 안에 맞춘다.
+      if (schedule) for (const table of nodes(doc, 'tbl')) {
+        const frame = ancestor(table, 'graphicFrame'), box = frame && geometry(frame);
+        fitTable(table, box?.h || tableHeight(table), warnings);
+      }
       if (unresolved.length) warnings.push(`${path.split('/').pop()} 미치환: ${unresolved.join(', ')}`);
       zip.file(path, new XMLSerializer().serializeToString(doc));
     }
     // 레이아웃/마스터에 공통 변수가 있는 양식도 처리하되 인력 슬롯 토큰은 건드리지 않음.
     for (const path of Object.keys(zip.files).filter(p => /^ppt\/(slideLayouts|slideMasters)\/[^/]+\.xml$/.test(p))) {
       const doc = parse(await zip.file(path).async('string'));
+      warnings.push(...templateWarnings(doc, ctx, menu));
       const unresolved = replace(doc, token => common(ctx, menu)[token]);
       if (unresolved.length) warnings.push(`${path.split('/').pop()} 미치환: ${unresolved.join(', ')}`);
       zip.file(path, new XMLSerializer().serializeToString(doc));
