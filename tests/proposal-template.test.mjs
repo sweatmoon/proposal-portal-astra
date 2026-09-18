@@ -4,6 +4,8 @@ import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { DOMParser, XMLSerializer } from '@xmldom/xmldom';
 import JSZip from 'jszip';
+import ts from 'typescript';
+import { parse as parseHtml } from 'node-html-parser';
 
 const A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
 const P = 'http://schemas.openxmlformats.org/presentationml/2006/main';
@@ -44,6 +46,39 @@ function data() {
   };
 }
 const docText = (c, xml) => c.ProposalTemplate.text(c.ProposalTemplate.parse(xml));
+
+const tsModuleUrl = source => 'data:text/javascript;base64,' + Buffer.from(ts.transpileModule(source, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText).toString('base64');
+const pageSource = readFileSync(new URL('../src/routes/pages.ts', import.meta.url), 'utf8');
+const layoutModule = tsModuleUrl(readFileSync(new URL('../src/views/layout.ts', import.meta.url), 'utf8'));
+async function renderRequirements(values) {
+  const project = { id: 1, project_name: '요구사항 시험 사업', ...values };
+  const dbModule = tsModuleUrl(`export async function query(sql) {
+    if (!/^\\s*SELECT\\b/i.test(sql)) throw new Error('Read-only test'); return [];
+  } export async function queryOne() { return ${JSON.stringify(project)}; }`);
+  const source = pageSource.replace("'hono'", JSON.stringify(import.meta.resolve('hono')))
+    .replace("'../db/client.js'", JSON.stringify(dbModule))
+    .replace("'../views/layout.js'", JSON.stringify(layoutModule));
+  const { default: app } = await import(tsModuleUrl(source));
+  const response = await app.request('/proposals/1');
+  assert.equal(response.status, 200);
+  const html = parseHtml(await response.text());
+  const section = html.querySelector('#audit-requirements'); assert(section);
+  assert.equal(section.getAttribute('aria-labelledby'), 'audit-requirements-heading');
+  return { html, section, values: section.querySelectorAll('dd').map(el => el.text.trim()) };
+}
+test('proposal detail renders stored demand stages, days and MD together', async () => {
+  const result = await renderRequirements({ required_phases: 3, required_audit_days: 5, required_md: 151, proposed_md: 126 });
+  assert.deepEqual(result.section.querySelectorAll('dt').map(el => el.text.trim()), ['요구 단계', '요구 감리 일수', '요구 투입 공수']);
+  assert.deepEqual(result.values, ['3 단계', '5 일', '151 MD']);
+  assert(result.html.text.includes('제안투입공수')); assert(!result.section.text.includes('126'));
+});
+test('proposal demand display distinguishes missing values from zeros and numeric strings', async () => {
+  assert.deepEqual((await renderRequirements({ required_phases: null, required_audit_days: null, required_md: null })).values, ['미입력', '미입력', '미입력']);
+  assert.deepEqual((await renderRequirements({ required_phases: 0, required_audit_days: '0', required_md: '151.5' })).values, ['0 단계', '0 일', '151.5 MD']);
+  assert.deepEqual((await renderRequirements({ required_phases: '', required_audit_days: -1, required_md: '<img src=x>' })).values, ['미입력', '미입력', '미입력']);
+});
 
 test('split runs, duplicate tokens, surrounding text and XML escaping survive', () => {
   const c = sandbox(), doc = c.ProposalTemplate.parse(slide(shape(para('앞 [주관', '기관] 뒤 [주관기관] 끝'))));

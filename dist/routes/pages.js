@@ -687,6 +687,12 @@ app.get('/proposals/:id', async (c) => {
     </tr>`).join('');
     // TOC
     const tocItems = toc.map(t => `<li class="text-sm text-slate-600 flex gap-2"><span class="text-slate-400 w-5 text-right flex-shrink-0">${t.item_order}.</span>${t.item_name}</li>`).join('');
+    const fmtRequirement = (value, unit) => {
+        if (value == null || String(value).trim() === '')
+            return '미입력';
+        const numeric = Number(value);
+        return Number.isFinite(numeric) && numeric >= 0 ? `${numeric} ${unit}` : '미입력';
+    };
     const infoRow = (label, value, span = false) => `<tr>
       <th class="px-4 py-2.5 text-left text-xs font-medium text-slate-500 bg-slate-50 w-28 whitespace-nowrap">${label}</th>
       <td class="px-4 py-2.5 text-sm text-slate-800 ${span ? 'colspan=\"3\"' : ''}">${value}</td>
@@ -732,6 +738,24 @@ app.get('/proposals/:id', async (c) => {
           </table>
         </div>
 
+        <!-- HTML에서 파싱해 저장한 감리 요구사항 (실제 배정과 별도) -->
+        <section id="audit-requirements" aria-labelledby="audit-requirements-heading" class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <h2 id="audit-requirements-heading" class="px-5 py-3 bg-slate-700 text-white font-semibold text-sm flex items-center gap-2">
+            <i class="fas fa-clipboard-list" aria-hidden="true"></i> 감리 요구사항
+          </h2>
+          <dl class="grid grid-cols-1 sm:grid-cols-3">
+            ${[
+        ['요구 단계', project.required_phases, '단계'],
+        ['요구 감리 일수', project.required_audit_days, '일'],
+        ['요구 투입 공수', project.required_md, 'MD'],
+    ].map(([label, value, unit]) => `
+              <div class="px-4 py-3 border-b sm:border-b-0 sm:border-r border-slate-100 last:border-0">
+                <dt class="text-xs text-slate-500 mb-1">${label}</dt>
+                <dd class="text-sm font-semibold text-slate-800">${fmtRequirement(value, unit)}</dd>
+              </div>`).join('')}
+          </dl>
+        </section>
+
         <!-- 금액 정보 -->
         <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
           <div class="px-5 py-3 bg-indigo-700 text-white font-semibold text-sm flex items-center gap-2">
@@ -745,7 +769,6 @@ app.get('/proposals/:id', async (c) => {
         ['입찰금액(VAT제외)', fmtMoney(project.bid_amount_excl_vat)],
         ['투찰률', project.bid_rate != null ? `<span class="font-semibold">${Math.round(Number(project.bid_rate) * 100)}%</span>` : '-'],
         ['1MD단가(VAT제외)', fmtMoney(project.md_unit_price_excl)],
-        ['요구투입공수', `<span class="font-semibold">${project.required_md ?? '-'} MD</span>`],
         ['제안투입공수', `<span class="font-semibold text-indigo-700">${project.proposed_md ?? '-'} MD</span>`],
         ['제안수당', project.proposal_allowance ? `${fmtMoney(project.proposal_allowance)} (${project.proposal_allowance_rate != null ? Number(project.proposal_allowance_rate).toFixed(2) + '%' : ''})` : '-'],
     ].map(([k, v]) => `
