@@ -2061,6 +2061,11 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
     const shapeEls = Array.from(spTree.childNodes).filter(n => n.nodeType === 1 &&
       (n.localName === 'sp' || n.localName === 'cxnSp' || n.localName === 'pic' || n.localName === 'grpSp'))
 
+    // 장표 밖의 예시 객체는 슬롯 분류와 빈 슬롯 삭제에서 제외한다.
+    const slideSizeDoc = new DOMParser().parseFromString(await tplZip.file('ppt/presentation.xml').async('string'), 'application/xml');
+    const slideSize = slideSizeDoc.getElementsByTagNameNS(P_NS, 'sldSz')[0];
+    const width = +slideSize.getAttribute('cx'), height = +slideSize.getAttribute('cy');
+    const inSlide = b => b && b.x >= 0 && b.y >= 0 && b.x < width && b.y < height;
     // ── sp 좌표 캐시 (shapeXfrm 기반) ──
     const xfrmOf = new Map()
     shapeEls.forEach(el => {
@@ -2078,7 +2083,7 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
     const slotShapes = Array.from({ length: N }, () => [])
     shapeEls.forEach(el => {
       const xf = xfrmOf.get(el)
-      if (!xf || !bounds) return
+      if (!inSlide(xf) || !bounds) return
       const col = bounds.colBounds.filter(b => xf.x >= b).length  // 좌측 x 기준
       const row = bounds.rowBounds.filter(b => xf.y >= b).length  // 상단 y 기준
       const cols = bounds.colBounds.length + 1
@@ -2086,10 +2091,9 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       if (si >= 0 && si < N) slotShapes[si].push(el)
     })
 
-    // ── 슬롯별 pic 요소 별도 분류 ──
-    // slotShapes 귀속 방식(shapeXfrm P_NS 기반)으로 pic이 누락될 수 있으므로
-    // spTree 전체를 재귀 탐색해 pic만 따로 좌표 분류
-    // slotPicEl[si] = 해당 슬롯의 pic DOM 요소 (사진 교체용)
+    // 이름 플레이스홀더 옆의 증명사진만 교체 대상으로 확정한다.
+    // 그룹 내부 좌표는 장표 좌표와 다르므로 추정하지 않는다.
+    // 후보가 없거나 여러 개면 다른 슬롯/작업용 그림으로 보충하지 않는다.
     function getAllPics(root) {
       const pics = []
       function walk(node) {
@@ -2102,81 +2106,19 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       walk(root)
       return pics
     }
-    // pic의 좌표는 p:spPr > a:xfrm > a:off (P_NS 또는 localName 탐색)
-    function getPicXfrm(picEl) {
-      // p:spPr: P_NS 우선, 없으면 localName fallback
-      let spPr = picEl.getElementsByTagNameNS(P_NS, 'spPr')[0]
-      if (!spPr) {
-        for (const c of Array.from(picEl.childNodes)) {
-          if (c.nodeType === 1 && c.localName === 'spPr') { spPr = c; break }
-        }
-      }
-      if (!spPr) return null
-      let xfrm = spPr.getElementsByTagNameNS(A_NS, 'xfrm')[0]
-      if (!xfrm) {
-        for (const c of Array.from(spPr.childNodes)) {
-          if (c.nodeType === 1 && c.localName === 'xfrm') { xfrm = c; break }
-        }
-      }
-      if (!xfrm) return null
-      let off = xfrm.getElementsByTagNameNS(A_NS, 'off')[0]
-      if (!off) {
-        for (const c of Array.from(xfrm.childNodes)) {
-          if (c.nodeType === 1 && c.localName === 'off') { off = c; break }
-        }
-      }
-      if (!off) return null
-      return { x: +off.getAttribute('x'), y: +off.getAttribute('y') }
-    }
-    const slotPicEl = Array.from({ length: N }, () => null)
-    if (bounds) {
-      const allPics = getAllPics(spTree)
-      const cols3 = bounds.colBounds.length + 1
-
-      // pic들을 좌표로 정렬 (row-major: y 오름차순 → x 오름차순)
-      // SLOT_BOUNDARIES 경계값이 정확하지 않아도 상대 순서는 보장됨
-      const picsWithXf = allPics
-        .map(picEl => ({ picEl, xf: getPicXfrm(picEl) }))
-        .filter(({ xf }) => !!xf)
-
-      // ① 좌표 기반 분류 (로그용)
-      picsWithXf.forEach(({ picEl, xf }) => {
-        const col = bounds.colBounds.filter(b => xf.x >= b).length
-        const row = bounds.rowBounds.filter(b => xf.y >= b).length
-        const si = row * cols3 + col
-        console.log(`[PhotoPptx] pic 분류: si=${si} x=${xf.x} y=${xf.y} (size=${size})`)
-        if (si >= 0 && si < N && !slotPicEl[si]) slotPicEl[si] = picEl
-      })
-
-      // ② 좌표 기반 분류 실패 → y/x 정렬로 순서 보충
-      // (경계값 오차나 중복 si로 누락된 슬롯 처리)
-      const nullSlots = []
-      for (let si = 0; si < N; si++) { if (!slotPicEl[si]) nullSlots.push(si) }
-      if (nullSlots.length > 0) {
-        // 아직 slotPicEl에 할당 안 된 pic만 추출, y→x 정렬
-        const unassigned = picsWithXf
-          .filter(({ picEl }) => !slotPicEl.includes(picEl))
-          .sort((a, b) => a.xf.y !== b.xf.y ? a.xf.y - b.xf.y : a.xf.x - b.xf.x)
-        unassigned.forEach(({ picEl, xf }, idx) => {
-          if (idx < nullSlots.length) {
-            slotPicEl[nullSlots[idx]] = picEl
-            console.log(`[PhotoPptx] pic y/x 정렬 fallback: si=${nullSlots[idx]} x=${xf.x} y=${xf.y}`)
-          }
-        })
-      }
-
-      // ③ 좌표 없는 pic도 남은 슬롯에 순서대로 보충
-      const noPicSlots = []
-      for (let si = 0; si < N; si++) { if (!slotPicEl[si]) noPicSlots.push(si) }
-      if (noPicSlots.length > 0) {
-        const noXfPics = allPics.filter(p => !picsWithXf.find(pw => pw.picEl === p) && !slotPicEl.includes(p))
-        noXfPics.forEach((picEl, idx) => {
-          if (idx < noPicSlots.length) {
-            slotPicEl[noPicSlots[idx]] = picEl
-            console.log(`[PhotoPptx] pic 좌표없음 fallback: si=${noPicSlots[idx]}`)
-          }
-        })
-      }
+    // 등록된 2/4/6/9인 양식의 이름-사진 간격 허용 범위(EMU).
+    const slotPicEl = Array.from({ length: N }, () => null);
+    for (let si = 0; si < N; si++) {
+      const anchors = slotShapes[si].filter(e => e.localName === 'sp' && Array.from(e.getElementsByTagNameNS(A_NS, 't')).map(t => t.textContent).join('').replace(/\s+/g, '').includes('[이름]'));
+      if (anchors.length !== 1) continue;
+      const b = shapeXfrm(anchors[0]);
+      const candidates = getAllPics(spTree).filter(pic => {
+        if (pic.parentNode !== spTree) return false;
+        const q = shapeXfrm(pic);
+        return inSlide(q) && q.x + q.w <= width && q.y + q.h <= height
+          && q.x + q.w <= b.x + 50000 && b.x - q.x - q.w < 300000 && Math.abs(q.y - b.y) < 200000;
+      });
+      if (candidates.length === 1) slotPicEl[si] = candidates[0];
     }
 
     // ── 라벨 매칭 헬퍼 ──
@@ -2401,7 +2343,7 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
       // → 9인/4인/6인 템플릿의 고유 placeholder(ISMSP 로고 등)를 홍길동으로 대체
       const photoForSlot = person.photoArrayBuffer || defaultPhotoBuffer
       if (photoForSlot) {
-        const picEl = slotPicEl[si] || slotShapes[si].find(el => el.localName === 'pic') || null
+        const picEl = slotPicEl[si] || null
         if (picEl) {
           function findByLocalName(root, localName) {
             if (!root || !root.childNodes) return null
@@ -2431,7 +2373,7 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
               page._picRidPicMap.push({ origRid, newRid: newPhotoRid, picEl })
 
               // DOM에서 직접 embed 교체 시도 (setAttributeNS + setAttribute 둘 다)
-              try { blip.setAttributeNS(R_NS, 'embed', newPhotoRid) } catch(_) {}
+              try { blip.setAttributeNS(R_NS, 'r:embed', newPhotoRid) } catch(_) {}
               try {
                 // setAttribute로도 덮어쓰기 (DOMParser가 namespace를 flat하게 파싱한 경우)
                 if (blip.getAttribute('r:embed')) blip.setAttribute('r:embed', newPhotoRid)
@@ -2543,68 +2485,9 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
     // ④ XMLSerializer로 직렬화
     let slideXmlStr = new XMLSerializer().serializeToString(xmlDoc)
 
-    // DOM embed 교체가 실제로 반영됐는지 확인하고, 실패한 경우 직접 교체
-    // picRidPicMap의 각 항목: { origRid, newRid, picEl }
-    // picEl을 별도 직렬화 → blip 부분의 embed 값 확인 → slideXmlStr에서 해당 부분 교체
-    for (const { origRid, newRid, picEl } of picRidPicMap) {
-      if (!picEl) continue
-      // picEl을 직렬화해서 embed 값이 이미 newRid로 교체됐는지 확인
-      const picXmlFrag = new XMLSerializer().serializeToString(picEl)
-      const embedMatch = picXmlFrag.match(/:embed="([^"]+)"/)
-      const currentEmbed = embedMatch ? embedMatch[1] : null
-
-      if (currentEmbed === newRid) {
-        // DOM 교체 성공 — slideXmlStr에도 반영되어 있음 (단, 직렬화가 같은 결과면)
-        // 하지만 picEl 직렬화와 xmlDoc 직렬화의 namespace prefix가 다를 수 있으므로
-        // slideXmlStr에서 실제 _photo_si* 가 있는지 확인
-        if (!slideXmlStr.includes(`"${newRid}"`)) {
-          // slideXmlStr에 newRid가 없음 → DOM 교체 값이 다른 prefix로 나옴
-          // picXmlFrag에서 blip 조각 찾아 slideXmlStr에서 교체
-          console.warn(`[PhotoPptx] DOM 교체 됐으나 slideXml에 없음: ${newRid}, picXml에서 교체 시도`)
-          // picXmlFrag에서 embed가 있는 blip 조각 추출
-          const blipIdx = picXmlFrag.indexOf(':embed=')
-          if (blipIdx !== -1) {
-            // slideXmlStr에서 origRid → newRid 전체 교체 (정확하지 않지만 최후 수단)
-            const escapedOrig = origRid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-            slideXmlStr = slideXmlStr.replace(
-              new RegExp(`:embed="${escapedOrig}"`),
-              `:embed="${newRid}"`
-            )
-          }
-        } else {
-          console.log(`[PhotoPptx] ④ embed 교체 확인: ${newRid} slideXml에 있음`)
-        }
-      } else if (currentEmbed === origRid) {
-        // DOM 교체 실패 — slideXmlStr에서 직접 교체 필요
-        // picXmlFrag에서 해당 embed 패턴을 찾아 slideXmlStr에서 교체
-        console.warn(`[PhotoPptx] DOM embed 교체 실패(${origRid} 그대로), slideXml에서 직접 교체`)
-        const escapedOrig = origRid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-        // picXmlFrag 전체를 slideXmlStr에서 찾아서 embed만 교체
-        const escapedFrag = picXmlFrag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').slice(0, 80)
-        // 단순 replace: origRid → newRid (첫 번째 occurance)
-        let replaced = false
-        slideXmlStr = slideXmlStr.replace(
-          new RegExp(`:embed="${escapedOrig}"`),
-          () => { replaced = true; return `:embed="${newRid}"` }
-        )
-        console.log(`[PhotoPptx] ④ slideXml 직접 교체: ${origRid}→${newRid} replaced=${replaced}`)
-      } else {
-        console.warn(`[PhotoPptx] ④ embed 확인 불가: currentEmbed=${currentEmbed} origRid=${origRid} newRid=${newRid}`)
-        // 최후 수단: origRid → newRid replace
-        const escapedOrig = origRid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-        slideXmlStr = slideXmlStr.replace(
-          new RegExp(`:embed="${escapedOrig}"`),
-          `:embed="${newRid}"`
-        )
-      }
-    }
-
     // ⑤ 모든 rId → rIdMap으로 최종 교체 (_photo_si* → finalRid, 원본 rId → 재번호매김)
     slideXmlStr = slideXmlStr.replace(/\br:(embed|link|id)="([^"]+)"/g, (full, attr, oldId) =>
       rIdMap[oldId] ? `r:${attr}="${rIdMap[oldId]}"` : full
-    )
-    slideXmlStr = slideXmlStr.replace(/:embed="([^"]+)"/g, (full, oldId) =>
-      rIdMap[oldId] ? `:embed="${rIdMap[oldId]}"` : full
     )
     baseZip.file(`ppt/slides/${fname}`, slideXmlStr)
     baseZip.file(`ppt/slides/_rels/${fname}.rels`, remappedRelsXml)

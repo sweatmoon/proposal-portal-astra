@@ -391,6 +391,98 @@ test('history rejects missing source relationships instead of inventing a layout
   await assert.rejects(c.buildHistoryPptx({ returnZip: true, templateB64: await zip.generateAsync({ type: 'base64' }) }), /슬라이드 연결 정보/);
 });
 
+const photoSource = detailSource.slice(detailSource.indexOf('const PHOTO_LAYOUT_META ='), detailSource.indexOf('// ── downloadPhotoAssignPptx'));
+const photoMarker = label => Buffer.concat([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64'), Buffer.from(label)]);
+const photoPicture = (id, x, y, rid) => `<p:pic><p:nvPicPr><p:cNvPr id="${id}" name="picture-${id}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="400000" cy="500000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>`;
+async function photoFixture(size) {
+  const columns = size < 6 ? [600000, 5400000] : [600000, 3450000, 6300000];
+  const rows = size === 2 ? [1500000] : size === 9 ? [1500000, 3300000, 5000000] : [1500000, 4000000];
+  let body = '', slot = 0;
+  for (const y of rows) for (const x of columns) {
+    slot++;
+    body += photoPicture(100 + slot, x + 100000, y + 50000, 'rId2');
+    body += `<p:sp><p:nvSpPr><p:cNvPr id="${200 + slot}" name="name-${slot}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${x + 650000}" y="${y}"/><a:ext cx="1600000" cy="240000"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/>${para('[이름]')}</p:txBody></p:sp>`;
+  }
+  // Shared rId2 outside the slide must remain the original placeholder.
+  // rId3/rId4 deliberately overlap renumbered IDs to catch a second remap pass.
+  body += photoPicture(900, 11000000, 1800000, 'rId2') + photoPicture(901, 11000000, 2500000, 'rId3') + photoPicture(902, 1000000, 7600000, 'rId4');
+  const zip = await JSZip.loadAsync(await template(body), { base64: true });
+  zip.file('ppt/slides/_rels/slide1.xml.rels', `<Relationships xmlns="${R}"><Relationship Id="rId1" Type="${OR}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/><Relationship Id="rId2" Type="${OR}/image" Target="../media/image1.png"/><Relationship Id="rId3" Type="${OR}/image" Target="../media/image2.png"/><Relationship Id="rId4" Type="${OR}/image" Target="../media/image3.png"/></Relationships>`);
+  zip.file('ppt/slideLayouts/slideLayout1.xml', `<p:sldLayout xmlns:p="${P}"><p:cSld><p:spTree/></p:cSld></p:sldLayout>`);
+  for (let i = 1; i <= 3; i++) zip.file(`ppt/media/image${i}.png`, photoMarker(`original-${size}-${i}`));
+  zip.file('[Content_Types].xml', (await zip.file('[Content_Types].xml').async('string')).replace('</Types>', '<Default Extension="png" ContentType="image/png"/></Types>'));
+  return zip;
+}
+const photoTemplates = async () => Object.fromEntries(await Promise.all([2, 4, 6, 9].map(async size => [size, await photoFixture(size)])));
+function photoContext() {
+  const c = sandbox({ Uint8Array, ArrayBuffer, console: { log() {}, warn() {}, error() {} } });
+  vm.runInContext(photoSource, c); return c;
+}
+async function photoBytes(c, zip, path, pictureId) {
+  const T = c.ProposalTemplate, doc = T.parse(await zip.file(path).async('string'));
+  const pic = T.nodes(doc, 'pic', P).find(p => T.nodes(p, 'cNvPr', P)[0]?.getAttribute('id') === String(pictureId));
+  if (!pic) return null;
+  const rid = T.nodes(pic, 'blip')[0].getAttributeNS(OR, 'embed');
+  const rels = T.parse(await zip.file(path.replace('ppt/slides/', 'ppt/slides/_rels/') + '.rels').async('string'));
+  const rel = T.nodes(rels, 'Relationship', R).find(r => r.getAttribute('Id') === rid);
+  assert(rel, `missing relationship for picture ${pictureId}: ${rid}`);
+  const target = new URL(rel.getAttribute('Target'), 'https://ppt.test/' + path).pathname.slice(1);
+  assert(zip.file(target), `missing image ${target}`);
+  return zip.file(target).async('nodebuffer');
+}
+for (const size of [2, 4, 6, 9]) {
+  test(`${size}-person photos keep slot identity, placeholders and off-slide pictures before/after merge`, async () => {
+    const c = photoContext(), T = c.ProposalTemplate;
+    const pages = ['full', 'partial', 'missing'].map((kind, pageIndex) => {
+      const count = kind === 'partial' ? size - 1 : size;
+      return { sheetSize: size, slotPeople: Object.fromEntries(Array.from({ length: count }, (_, i) => [i + 1, {
+        name: kind === 'missing' && i === 1 ? 'TBD1' : `시험${pageIndex}_${i + 1}`, field: '검증', profile: {},
+        ...(kind === 'missing' && i < 2 ? {} : { photoArrayBuffer: new Uint8Array(photoMarker(`${size}-${pageIndex}-${i + 1}`)) }),
+      }])) };
+    });
+    const zip = await c.buildPhotoPptxFromTemplate(pages, await photoTemplates());
+    const check = async (zip, paths) => {
+      assert.equal(paths.length, 3);
+      for (let i = 0; i < paths.length; i++) {
+        const doc = T.parse(await zip.file(paths[i]).async('string'));
+        for (let slot = 1; slot <= size; slot++) {
+          const person = pages[i].slotPeople[slot];
+          const actual = await photoBytes(c, zip, paths[i], 100 + slot);
+          const name = T.nodes(doc, 'sp', P).find(s => T.nodes(s, 'cNvPr', P)[0]?.getAttribute('id') === String(200 + slot));
+          if (!person) { assert.equal(actual, null); assert.equal(name, undefined); continue; }
+          assert.deepEqual(actual, person.photoArrayBuffer ? Buffer.from(person.photoArrayBuffer) : photoMarker('original-2-1'));
+          assert.equal(T.text(name), person.name);
+        }
+        for (const [id, media] of [[900, 1], [901, 2], [902, 3]]) assert.deepEqual(await photoBytes(c, zip, paths[i], id), photoMarker(`original-${size}-${media}`));
+      }
+    };
+    await check(zip, await T.slidePaths(zip));
+    const base = await JSZip.loadAsync(await template(shape(para('앞 장표'))), { base64: true });
+    const merged = await c.mergePresentationZips([{ zip: base }, { zip, mergeStrategy: 'FOREIGN_TEMPLATE' }]);
+    await check(merged, (await T.slidePaths(merged)).slice(1));
+  });
+  test(`${size}-person photo selection never falls back to loose pictures when a portrait is missing or ambiguous`, async () => {
+    for (const mode of ['reordered', 'missing', 'ambiguous']) {
+      const c = photoContext(), T = c.ProposalTemplate, templates = await photoTemplates();
+      const doc = T.parse(await templates[size].file('ppt/slides/slide1.xml').async('string'));
+      const pics = T.nodes(doc, 'pic', P), get = id => pics.find(p => T.nodes(p, 'cNvPr', P)[0].getAttribute('id') === String(id));
+      const first = get(101), tree = first.parentNode;
+      if (mode === 'reordered') for (const id of [900, 901, 902]) tree.insertBefore(get(id), tree.firstChild);
+      if (mode === 'missing') tree.removeChild(first);
+      if (mode === 'ambiguous') { const duplicate = first.cloneNode(true); T.nodes(duplicate, 'cNvPr', P)[0].setAttribute('id', '999'); tree.appendChild(duplicate); }
+      templates[size].file('ppt/slides/slide1.xml', new XMLSerializer().serializeToString(doc));
+      const people = Object.fromEntries(Array.from({ length: size }, (_, i) => [i + 1, { name: `시험${i}`, profile: {}, photoArrayBuffer: new Uint8Array(photoMarker(`person-${i}`)) }]));
+      const zip = await c.buildPhotoPptxFromTemplate([{ sheetSize: size, slotPeople: people }], templates);
+      const path = (await T.slidePaths(zip))[0];
+      if (mode === 'reordered') assert.deepEqual(await photoBytes(c, zip, path, 101), photoMarker('person-0'));
+      if (mode === 'missing') assert.equal(await photoBytes(c, zip, path, 101), null);
+      if (mode === 'ambiguous') for (const id of [101, 999]) assert.deepEqual(await photoBytes(c, zip, path, id), photoMarker(`original-${size}-1`));
+      for (let s = 2; s <= size; s++) assert.deepEqual(await photoBytes(c, zip, path, 100 + s), photoMarker(`person-${s - 1}`));
+      for (const [id, media] of [[900, 1], [901, 2], [902, 3]]) assert.deepEqual(await photoBytes(c, zip, path, id), photoMarker(`original-${size}-${media}`));
+    }
+  });
+}
+
 test('registry retries after failed requests instead of caching rejected promise', async () => {
   let calls = 0;
   const c = sandbox({ fetch: async url => { assert.match(url, /category=proposal/); if (++calls === 1) throw new Error('temporary'); return { json: async () => ({ ok: true, data: [] }) }; } });
