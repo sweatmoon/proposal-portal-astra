@@ -530,7 +530,11 @@ test('3.6 SSR removes scope choices, retains PM selection and preserves unknown 
   assert(basis.text.includes('감리원·전문가·테스터'));
   assert(basis.text.includes('각 기본 일반단계'));
   assert(basis.text.includes('미입력'));
-  assert(result.html.querySelector('a[href="/static/compliance-template.pptx"]'));
+  assert(result.html.querySelector('a[href="/static/compliance-proposal-template.pptx"]'));
+  assert(result.html.text.includes('인력 DB에서 자동 조회'));
+  assert.equal(result.html.querySelector('#proposal-compliance-pm-notes'), null);
+  assert(result.html.querySelector('#proposal-compliance-auditor-notes'));
+  assert(result.html.querySelector('#proposal-compliance-education'));
   const script = result.html.querySelectorAll('script').find(s => s.text.includes('var parsedData ='));
   const c = vm.createContext({}); vm.runInContext(script.text, c);
   assert.equal(c.parsedData.personGradeMap[name].fulltimeKnown, false);

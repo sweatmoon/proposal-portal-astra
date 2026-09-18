@@ -48,6 +48,8 @@ var ProposalTemplate = (() => {
     return {
       extraStages: typeof getExtraSet === 'function' ? [...getExtraSet()] : [],
       compliancePM: typeof document !== 'undefined' ? document.getElementById('proposal-compliance-pm')?.value || '' : '',
+      complianceAuditorNotes: typeof document !== 'undefined' ? document.getElementById('proposal-compliance-auditor-notes')?.value || '' : '',
+      complianceEducation: typeof document !== 'undefined' ? document.getElementById('proposal-compliance-education')?.value || '' : '',
     };
   }
   function context(pd, opt = {}) {
@@ -145,7 +147,7 @@ var ProposalTemplate = (() => {
     const labels = ['감리 방법·일수', '투입 공수', '총괄 감리원 전문성', '감리원 자격·상근', '전문가 경험·교육'];
     statuses.forEach((s, i) => { if (s !== '충족') warnings.push(`${labels[i]}: ${s}`); });
     warnings.push('3.6의 자격·상근·경험·교육 요구 문구는 양식 기준입니다. 해당 사업 RFP와 증빙을 대조하세요.');
-    warnings.push('총괄 수행 건수·실제 감리 투입 기간·교육계획은 확인 자료가 없어 자동 확정하지 않습니다.');
+    warnings.push('총괄 수행 건수·전체 감리 건수는 인력 DB 이력 행 기준입니다. 감리 경력은 인력정보 화면과 같은 최초 감리 연월 기준이며 실제 현장 투입 기간의 합계는 아닙니다. 교육계획과 RFP 경력 요건은 별도 확인하세요.');
     warnings.push('단계·일수 충족은 기본 일반단계별 최소 일수의 숫자 검토이며, RFP 단계 명칭·감리 방법의 최종 확인이 필요합니다.');
     const map = { ...common(ctx, menu),
       '[요구단계]': display(pd.requestStageCount), '[요구감리일수]': display(pd.requestAuditDays), '[요구투입공수]': display(pd.requestMD),
@@ -159,14 +161,64 @@ var ProposalTemplate = (() => {
       '[공수비교내역]': `비교: 전체 인력 ${actualMD} MD${mdReliable && number(pd.requestMD) > 0 ? ` / 요구 대비 ${round(actualMD / Number(pd.requestMD) * 100)}%` : ' / 검토 필요'}`,
       '[총괄감리원]': pm?.name || '미지정 — 담당자 확인',
       '[총괄자격]': pm ? `${pm.grade || '등급 미확인'} / ${residency(pm)} / 자격번호 ${pm.certNo || '미입력'}` : '생성 화면에서 수행 PM을 선택하세요.',
-      '[총괄경력]': '총괄 수행 건수·실제 감리 투입 기간: 증빙 확인 필요',
-      '[총괄검토사항]': '소속 법인·상근·수석 및 경력 요건 대조 필요',
+      '[총괄경력]': '', // 아래에서 선택한 PM의 DB 요약으로 채운다.
+      '[총괄검토사항]': '',
       '[감리원구성]': `배정 감리원 ${auditors.length}명 / 수석 표기 ${senior}명\n상근 ${fulltime}명 (${ratio})${unknownResidency ? ` / 미확인 ${unknownResidency}명` : ''}`,
       '[감리원분야]': `배정 분야: ${fieldList(auditors) || '미입력'}`,
-      '[감리원검토사항]': '등록·등급·상근 및 유사사업 경력 증빙 확인 필요',
+      '[감리원검토사항]': '',
       '[전문가구성]': groups.filter(([, members]) => members.length).map(([label, members]) => `${label} ${members.length}명 (${fieldList(members)})`).join('\n') || '전문가·테스터 배정 없음',
-      '[교육계획]': '미입력 — 담당자 확인 필요',
+      '[교육계획]': '',
     };
+    // 완성본 기반 제안 문구: 계산/증빙 검토 안내는 보고서에만 두고, 확인된 값만 간결하게 표현한다.
+    const cleanNote = value => String(value || '').replace(/\r\n?/g, '\n').trim();
+    const profile = pm && ctx.pmProfile?.name === pm.name ? ctx.pmProfile : null;
+    const pmHistory = profile ? `총괄 수행 ${profile.directorCount}건, 감리 경력 ${profile.career || '—'} / ${profile.auditCount}건` : '';
+    const highlights = profile ? cleanNote(profile.highlights).split('\n').filter(Boolean) : [];
+    const pmNotes = [pmHistory, ...highlights.slice(0, 2).map(line => line.replace(/^[-•·]\s*/, ''))].filter(Boolean).map(line => `- ${line}`).join('\n');
+    if (highlights.length > 2) warnings.push('3.6 총괄 주요이력은 DB 등록 순서의 앞 두 항목을 표시했습니다. 전체 내용은 인력정보에서 확인하세요.');
+    if (profile && !profile.career) warnings.push('3.6 총괄 감리 시작 연월이 없어 감리 경력을 표시하지 못했습니다.');
+    if (profile?.missingRoleCount) warnings.push(`3.6 총괄 이력 중 역할 미입력 ${profile.missingRoleCount}건이 있습니다. 총괄 수행 건수는 역할이 확인된 이력만 집계했습니다.`);
+    const auditorNotes = cleanNote(ctx.opt.complianceAuditorNotes);
+    const education = cleanNote(ctx.opt.complianceEducation);
+    const additional = ctx.stages.filter(s => !regular.includes(s)).map(s => s.stage || '단계 미입력');
+    const validMD = assigned.length > 0 && assigned.every(validAssignment);
+    const amount = value => validMD ? round(value) : '—';
+    const percent = validMD && number(pd.requestMD) > 0 ? `${round(actualMD / Number(pd.requestMD) * 100)}%` : '—';
+    const counts = ctx.stages.map(s => ({ stage: s.stage, count: unique(s.auditors.filter(p => validAssignment(p) && md(p) > 0).map(p => p.name)).length }));
+    const sameCount = counts.length && counts.every(s => s.count === counts[0].count);
+    const staffing = !validMD ? '' : sameCount
+      ? `(단계별 감리원 ${counts[0].count}명)`
+      : `(${counts.map(s => `${s.stage} ${s.count}명`).join(' / ')})`;
+    const allSenior = auditors.length > 0 && senior === auditors.length;
+    const confirmedRatio = auditors.length && !unknownResidency ? round(fulltime / auditors.length * 100) : null;
+    const staffSummary = !auditors.length ? '단계 감리원 —'
+      : confirmedRatio === 100 && allSenior ? `단계 감리원 ${auditors.length}명 : 100% 상근 수석 감리원`
+      : `단계 감리원 ${auditors.length}명${confirmedRatio !== null ? ` : 상근 ${fulltime}명 (${confirmedRatio}%)` : ''}${senior ? ` / 수석 ${senior}명` : ''}`;
+    const expertCopy = groups.filter(([, members]) => members.length).map(([label, members]) => {
+      const fields = unique(members.map(m => m.field).filter(Boolean)).join(', ');
+      const intro = label === '테스트' ? '3자 테스트를 위한 기능 테스트 전문가'
+        : label === '기타/미분류' ? '기타 전문가' : `${label} 전문가`;
+      return `${intro} ${members.length}명 투입${fields ? ` ( ${fields} )` : ''}`;
+    }).join('\n');
+    if (!pm) warnings.push('3.6 수행 PM 미지정: 제안 본문의 PM 정보는 비워 두었습니다.');
+    if (pm && !profile) warnings.push('3.6 총괄 감리 이력 DB 요약을 가져오지 못했습니다. 본문에 예시 실적이나 0건을 대신 넣지 않았습니다.');
+    if (unknownResidency) warnings.push(`3.6 감리원 ${unknownResidency}명의 상근 여부를 확인할 수 없어 상근 비율 문구를 생략했습니다.`);
+    if (auditorNotes || education) warnings.push('3.6 담당자 입력 문구를 그대로 반영했습니다. 경험·교육계획의 근거 확인은 담당자 책임이며 자동 검증한 내용이 아닙니다.');
+    map['[총괄경력]'] = pmHistory;
+    map['[교육계획]'] = education;
+    Object.assign(map, {
+      '[제안감리구성]': regular.length ? `${regular.length}단계 감리` : '감리 일정',
+      '[제안추가감리]': additional.length ? ` + ${additional.join('·')}` : '',
+      '[제안감리일정]': ctx.stages.map(s => `- ${s.stage || '단계 미입력'} : ${fmtDate(s.start) || '—'} ~ ${fmtDate(s.end) || '—'} (현장감리 ${number(s.days) !== null && Number(s.days) >= 0 ? Number(s.days) : '—'}일)`).join('\n'),
+      '[제안총공수]': amount(actualMD), '[제안투입비율]': percent,
+      '[제안감리원공수]': amount(ctx.total.baseline + ctx.total.additional), '[제안감리원배치]': staffing,
+      '[제안전문가공수]': amount(ctx.total.experts), '[제안테스트공수]': amount(ctx.total.testers),
+      '[제안PM소개]': pm ? `${pm.name}${pm.grade ? ` ${pm.grade}` : ''}${residency(pm) !== '미확인' ? ` (${residency(pm)})` : ''}` : '—',
+      '[제안PM경력]': pmNotes,
+      '[제안감리원구성]': staffSummary,
+      '[제안감리원경험]': auditorNotes || (auditors.length ? '사업별 담당 분야에 맞춰 감리원 배치' : ''),
+      '[제안전문가구성]': [expertCopy, education].filter(Boolean).join('\n'),
+    });
     ['방법일수판정', '공수판정', '총괄판정', '감리원판정', '공통판정'].forEach((key, i) => { map[`[${key}]`] = statuses[i]; });
     return { map, warnings: unique(warnings), statuses };
   }
@@ -823,6 +875,50 @@ var ProposalTemplate = (() => {
       }));
     }
   }
+  async function loadCompliancePM(ctx) {
+    const name = ctx.opt.compliancePM;
+    if (!name || !ctx.stages.some(s => s.auditors.some(p => p.name === name && validAssignment(p) && md(p) > 0))) return [];
+    const personnelId = Number(ctx.pd.personnelIdMap?.[name]), projectId = Number(ctx.pd.proposalId);
+    if (!Number.isSafeInteger(personnelId) || personnelId <= 0 || !Number.isSafeInteger(projectId) || projectId <= 0)
+      return ['3.6 총괄 감리원의 인력 DB 연결 ID 또는 사업 ID가 없습니다. 이름으로 다른 인물을 추정하지 않습니다.'];
+    try {
+      const signal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(12000) : undefined;
+      const response = await fetch(`/api/personnel/${personnelId}/compliance-profile?projectId=${projectId}`, { cache: 'no-store', signal });
+      if (!response.ok) throw new Error('profile_unavailable');
+      const result = await response.json(), p = result?.data;
+      if (!result.ok || !p || p.personnelId !== personnelId || p.projectId !== projectId || p.name !== name
+        || !Number.isSafeInteger(p.auditCount) || p.auditCount < 0
+        || !Number.isSafeInteger(p.directorCount) || p.directorCount < 0 || p.directorCount > p.auditCount
+        || !(p.career === null || typeof p.career === 'string') || typeof p.highlights !== 'string') throw new Error('profile_invalid');
+      ctx.pmProfile = p; // 생성 시작 시 선택한 PM의 응답만 사용. 전역/이름 캐시로 이전 인력을 재사용하지 않는다.
+      return [];
+    } catch {
+      return ['3.6 총괄 감리 이력 조회 실패: 인력 DB 연결 및 응답을 확인하세요. 다른 인력의 실적이나 0건으로 대체하지 않습니다.'];
+    }
+  }
+  function replaceComplianceCopy(root, map) {
+    // 새 제안 문구 토큰이 들어 있는 런만 OOXML 줄바꿈으로 확장한다.
+    // 고정 문단과 기존 양식은 건드리지 않으며, 런의 글꼴·색상·강조를 복제한다.
+    const paragraphs = nodes(root, 'p').filter(p => /\[제안[^\]]+\]/.test(text(p).replace(/\s+/g, '')));
+    const unresolved = replace(root, token => map[token]);
+    for (const para of paragraphs) for (const run of children(para, 'r')) {
+      const value = text(run);
+      if (!value.includes('\n')) continue;
+      const parts = value.split('\n');
+      parts.forEach((part, i) => {
+        if (i) {
+          const br = para.ownerDocument.createElementNS(A, 'a:br'), props = children(run, 'rPr')[0];
+          if (props) br.appendChild(props.cloneNode(true));
+          para.insertBefore(br, run);
+        }
+        const copy = run.cloneNode(true), ts = nodes(copy, 't');
+        ts.forEach((t, j) => { t.textContent = j ? '' : part; t.setAttribute('xml:space', 'preserve'); });
+        para.insertBefore(copy, run);
+      });
+      para.removeChild(run);
+    }
+    return unresolved;
+  }
   async function buildCompliance(menu, vm) {
     const template = (menu.templates || []).find(t => t.pptx_b64_key && t.variant_code === 'DEFAULT') || (menu.templates || []).find(t => t.pptx_b64_key);
     if (!template) throw new Error('3.6 목차에 PPT 양식을 DEFAULT 템플릿으로 등록하세요. 별도 표로 대체하지 않습니다.');
@@ -844,16 +940,21 @@ var ProposalTemplate = (() => {
     // 등록 양식의 토큰은 모두 선택 사항이다. 존재하는 토큰만 치환한다.
     // 토큰 없는 고정 문구·판정 셀·도형은 사용자의 의도이므로 추정하여 변경하지 않는다.
     // 실제로 존재하지만 지원하지 않는 토큰만 아래 replace()에서 미치환 경고로 남긴다.
-    const { map, warnings } = complianceData(context(vm._raw || vm, options()), menu);
+    const layouts = await Promise.all(Object.keys(zip.files).filter(p => /^ppt\/(slideLayouts|slideMasters)\/[^/]+\.xml$/.test(p))
+      .map(async path => ({ path, doc: parse(await zip.file(path).async('string')) })));
+    const ctx = context(vm._raw || vm, options());
+    const needsHistory = [...visible, ...layouts.map(l => l.doc)].some(s => /\[(?:제안PM경력|총괄경력)\]/.test(text(s).replace(/\s+/g, '')));
+    const profileWarnings = needsHistory ? await loadCompliancePM(ctx) : [];
+    const { map, warnings } = complianceData(ctx, menu);
+    warnings.push(...profileWarnings);
     for (const shape of visible) {
-      const unresolved = replace(shape, token => map[token]);
+      const unresolved = replaceComplianceCopy(shape, map);
       if (unresolved.length) warnings.push(`3.6 미치환: ${unresolved.join(', ')}`);
       complianceOverflow(shape, warnings);
     }
     zip.file(slides[0], new XMLSerializer().serializeToString(doc));
-    for (const path of Object.keys(zip.files).filter(p => /^ppt\/(slideLayouts|slideMasters)\/[^/]+\.xml$/.test(p))) {
-      const layout = parse(await zip.file(path).async('string'));
-      const unresolved = replace(layout, token => map[token]);
+    for (const { path, doc: layout } of layouts) {
+      const unresolved = replaceComplianceCopy(layout, map);
       if (unresolved.length) warnings.push(`${path.split('/').pop()} 미치환: ${unresolved.join(', ')}`);
       zip.file(path, new XMLSerializer().serializeToString(layout));
     }

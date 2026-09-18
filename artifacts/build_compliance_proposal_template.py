@@ -1,6 +1,6 @@
 """Tokenize the user-supplied 3.6 finished slide without reauthoring its design.
 Usage: python artifacts/build_compliance_proposal_template.py SOURCE.pptx OUTPUT.pptx
-Preserves media/relationships and geometry; tokenizes slide text and the example master project title.
+Only slide1.xml changes. Masters, layouts, media and relationships are copied verbatim.
 """
 from copy import deepcopy
 from pathlib import Path
@@ -90,17 +90,6 @@ def build(source, output):
                 fill = ln.find(f'{{{A}}}solidFill')
                 ln.replace(fill, E.Element(f'{{{A}}}noFill'))
         changes = {'ppt/slides/slide1.xml': E.tostring(doc, xml_declaration=True, encoding='UTF-8', standalone=True)}
-        example_title = 'NPU기반지능형영상감시체계시범구축(해군)사업위탁감리'
-        for name in z.namelist():
-            if not name.endswith('.xml') or not name.startswith(('ppt/slideMasters/', 'ppt/slideLayouts/')):
-                continue
-            master = E.fromstring(z.read(name)); changed = False
-            for p in master.xpath('//a:p', namespaces=NS):
-                value = ''.join(p.xpath('.//a:t/text()', namespaces=NS))
-                if ''.join(value.split()) == example_title:
-                    rewrite(p, [('[감리사업명]', runs(p)[0])]); changed = True
-            if changed:
-                changes[name] = E.tostring(master, xml_declaration=True, encoding='UTF-8', standalone=True)
         with ZipFile(output, 'w') as out:
             for item in z.infolist():
                 out.writestr(item, changes.get(item.filename, z.read(item.filename)))
