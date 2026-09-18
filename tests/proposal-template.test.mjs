@@ -378,6 +378,44 @@ test('fixed template common fields preserve content and show missing data', asyn
   assert.match(text, /A&B <기관>/); assert.match(text, /1.1 시험 제목/); assert.match(text, /\[사업미정\]/);
   assert(r.warnings.some(w => w.includes('미치환')));
 });
+test('required audit days common and schedule maps use stored project values including numeric strings and zero', () => {
+  const c = sandbox(), T = c.ProposalTemplate, d = data();
+  for (const value of [5, 7, ' 8 ', 2.5, '3.5', 0, '0']) {
+    d.requestAuditDays = value;
+    const ctx = T.context(d), m = menu('DETAIL_SCHEDULE');
+    assert.equal(T.common(ctx, m)['[요구감리일수]'], Number(value));
+    assert.equal(T.scheduleMap(ctx, m).map['[요구감리일수]'], Number(value));
+  }
+});
+test('required audit days replace spaced and split runs without duplicating units or changing fixed text and formatting', async () => {
+  const c = sandbox(), d = data(); d.requestAuditDays = 5; // Actual stage days remain 2.
+  const body = shape(para('요구 [요구감리일수]일 / [요구 감리 일수]일 / [요구감리', '일수]일 / 고정 9일'));
+  const original = await JSZip.loadAsync(await template(body), { base64: true });
+  for (const part of ['slideLayouts/slideLayout1.xml', 'slideMasters/slideMaster1.xml']) {
+    original.file(`ppt/${part}`, slide(shape(para('[요구감리', '일수]일'))));
+  }
+  const b64 = await original.generateAsync({ type: 'base64' });
+  for (const code of ['DETAIL_SCHEDULE', 'SCHEDULE_PLAN', 'AUDIT_PROCEDURE']) {
+    const result = await c.ProposalTemplate.build(menu(code, b64), { _raw: d });
+    const path = 'ppt/slides/slide1.xml', after = await result.zip.file(path).async('string');
+    assert.equal(docText(c, after), '요구 5일 / 5일 / 5일 / 고정 9일');
+    assert.equal(withoutText(c, after), withoutText(c, await original.file(path).async('string')));
+    assert(!result.warnings.some(w => w.includes('미치환')));
+    for (const part of ['slideLayouts/slideLayout1.xml', 'slideMasters/slideMaster1.xml']) {
+      assert.equal(docText(c, await result.zip.file(`ppt/${part}`).async('string')), '5일');
+    }
+  }
+});
+test('missing or invalid required audit days stay unresolved instead of becoming zero or actual stage days', async () => {
+  const c = sandbox(), d = data(), b64 = await template(shape(para('[요구감리일수]일 / [미지원토큰] / 고정 5일')));
+  for (const value of [null, undefined, '', '   ', -1, '-2', 'bad', '5일', Infinity, NaN]) {
+    d.requestAuditDays = value;
+    const result = await c.ProposalTemplate.build(menu('DETAIL_SCHEDULE', b64), { _raw: d });
+    assert.equal(docText(c, await result.zip.file('ppt/slides/slide1.xml').async('string')), '[요구감리일수]일 / [미지원토큰] / 고정 5일');
+    assert(result.warnings.some(w => w.includes('미치환') && w.includes('[요구감리일수]')));
+    assert(result.warnings.some(w => w.includes('미치환') && w.includes('[미지원토큰]')));
+  }
+});
 test('registered schedule template fills year rollover, fields and dates', async () => {
   const c = sandbox(), b64 = await template(shape(para('[단계1] [단계1시작일] [단계1종료일] [단계2] [대상사업]')) + table([row(['기간', '2026년', '년', '년', '년', '년']), row(['대상', '[n]월', '[n+1]월', '[n+2]월', '[n+3]월', '[n+4]월'])]));
   const r = await c.ProposalTemplate.build(menu('SCHEDULE_PLAN', b64), { _raw: data() });

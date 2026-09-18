@@ -222,6 +222,7 @@ var ProposalTemplate = (() => {
     return el;
   }
   function common(ctx, menu) {
+    const requiredDays = number(ctx.pd.requestAuditDays);
     return {
       '[제목]': [menu.menu_number, menu.menu_name].filter(Boolean).join(' '),
       '[감리사업명]': ctx.pd.projectTitle || undefined,
@@ -230,6 +231,8 @@ var ProposalTemplate = (() => {
       '[대상사업명]': ctx.pd.targetProjectName || undefined,
       '[대상사업시작일]': fmtPeriod(ctx.pd.targetStartDate) || undefined,
       '[대상사업종료일]': fmtPeriod(ctx.pd.targetEndDate) || undefined,
+      // 저장된 요구값만 숫자로 치환한다. 단위는 양식에 두고 실제 단계 일수로 대체하지 않는다.
+      '[요구감리일수]': requiredDays !== null && requiredDays >= 0 ? requiredDays : undefined,
     };
   }
   // 회사 양식의 단계5 날짜는 상주감리 칸에 위치한다. 검수지원은 별도 고정 행이다.
