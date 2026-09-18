@@ -1329,6 +1329,11 @@ async function buildHistoryPptx(opts) {
   if (!allSlideFiles.length) throw new Error('템플릿에 슬라이드가 없습니다.')
   const tplSlideFile = allSlideFiles[0]
   const tplSlideXml  = await tplZip.file(tplSlideFile).async('string')
+  // 삭제 전에 관계 XML 전체를 확보한다. rId는 슬라이드별 로컬 식별자이므로
+  // 복제 시 재번호매김하지 않고 이미지·레이아웃·외부 링크·TargetMode를 그대로 보존한다.
+  const tplRelsFile = tplSlideFile.replace('ppt/slides/', 'ppt/slides/_rels/') + '.rels'
+  if (!tplZip.file(tplRelsFile)) throw new Error('실적 템플릿의 슬라이드 연결 정보(.rels)가 없습니다. 원본 PPTX를 확인해 주세요.')
+  const tplRelsXml = await tplZip.file(tplRelsFile).async('string')
 
   // ── 7. 인원을 perPage 단위로 청크 분할 ────────────────────────
   const chunks = []
@@ -1344,9 +1349,13 @@ async function buildHistoryPptx(opts) {
   let presRelsXml = await tplZip.file('ppt/_rels/presentation.xml.rels').async('string')
   let ctXml       = await tplZip.file('[Content_Types].xml').async('string')
 
-  // 기존 슬라이드 관계 모두 제거
+  // 기존 슬라이드 관계만 제거한다. Target의 슬래시나 속성 순서에 의존하지 않는다.
   presXml     = presXml.replace(/<p:sldIdLst>[\s\S]*?<\/p:sldIdLst>/, '<p:sldIdLst></p:sldIdLst>')
-  presRelsXml = presRelsXml.replace(/<Relationship\b[^/]*Type="[^"]*\/slide"[^/]*\/>/g, '')
+  const presRelsDoc = new DOMParser().parseFromString(presRelsXml, 'application/xml')
+  for (const rel of Array.from(presRelsDoc.getElementsByTagNameNS('http://schemas.openxmlformats.org/package/2006/relationships', 'Relationship'))) {
+    if (rel.getAttribute('Type')?.endsWith('/slide')) rel.parentNode.removeChild(rel)
+  }
+  presRelsXml = new XMLSerializer().serializeToString(presRelsDoc)
   ctXml       = ctXml.replace(/<Override[^>]*presentationml\.slide\+xml[^>]*\/>/g, '')
 
   // 기존 슬라이드 파일들 삭제
@@ -1360,46 +1369,6 @@ async function buildHistoryPptx(opts) {
   let maxRid = 0; presRelsXml.replace(/Id="rId(\d+)"/g, (_, n) => { maxRid = Math.max(maxRid, +n) })
   let maxSldId = 255; presXml.replace(/<p:sldId\b[^>]*\bid="(\d+)"/g, (_, n) => { maxSldId = Math.max(maxSldId, +n) })
 
-  // 기존 슬라이드 .rels 파일 파싱 — slideLayout + 이미지 등 모든 관계 보존
-  const tplRelsFile = tplSlideFile.replace('ppt/slides/', 'ppt/slides/_rels/') + '.rels'
-  const tplRelsXml  = tplZip.file(tplRelsFile)
-    ? await tplZip.file(tplRelsFile).async('string')
-    : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
-      + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-      + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout6.xml"/>'
-      + '</Relationships>'
-
-  // 템플릿 rels에서 각 관계(rId → Type+Target) 파싱
-  const tplRelEntries = []
-  tplRelsXml.replace(/<Relationship\s+Id="([^"]+)"\s+Type="([^"]+)"\s+Target="([^"]+)"[^/]*\/>/g,
-    (_, id, type, target) => { tplRelEntries.push({ id, type, target }) })
-
-  // 슬라이드 복제 시 rels rId 재번호매김 헬퍼
-  // 각 슬라이드마다 독립적인 rId 공간을 할당해 presentation.xml.rels와 충돌 방지
-  function buildSlideRels(slideRelOffset) {
-    // slideRelOffset: 이 슬라이드의 rId 시작 오프셋 (전역 maxRid 기준)
-    // 반환: { relsXml, rIdMap } — rIdMap: 원본rId → 새rId
-    const rIdMap = {}
-    let localMax = slideRelOffset
-    const relTags = tplRelEntries.map(e => {
-      const newId = `rId${++localMax}`
-      rIdMap[e.id] = newId
-      return `<Relationship Id="${newId}" Type="${e.type}" Target="${e.target}"/>`
-    })
-    const relsXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
-      + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-      + relTags.join('')
-      + '</Relationships>'
-    return { relsXml, rIdMap, nextMax: localMax }
-  }
-
-  // 슬라이드 XML 내의 r:embed / r:link rId 참조를 rIdMap에 따라 교체
-  function remapRids(slideXml, rIdMap) {
-    return slideXml.replace(/\br:(embed|link|id)="(rId\d+)"/g, (full, attr, oldId) => {
-      return rIdMap[oldId] ? `r:${attr}="${rIdMap[oldId]}"` : full
-    })
-  }
-
   let newRels = '', newSldIds = '', newCt = ''
 
   chunks.forEach((chunk, ci) => {
@@ -1407,21 +1376,16 @@ async function buildHistoryPptx(opts) {
     const fileName = `ppt/slides/slide${slideNum}.xml`
     const relFileName = `ppt/slides/_rels/slide${slideNum}.xml.rels`
 
-    // 이 슬라이드의 내부 rels rId를 현재 maxRid 이후로 재번호매김
-    const { relsXml, rIdMap, nextMax } = buildSlideRels(maxRid)
-    maxRid = nextMax  // 다음 슬라이드는 이어서 할당
-
     // presentation.xml.rels에 이 슬라이드 관계 추가
     const sldRid = ++maxRid
     const sldId = ++maxSldId
 
-    // 치환: [제목] + 인원 데이터 → rId 재매핑
+    // 본문 토큰만 치환한다. 그림 객체와 관계 ID는 원본 그대로 복제한다.
     let slideXml = applyMenuTitle(tplSlideXml, opts.menuTitle || '')
     slideXml = applyPersonData(slideXml, chunk)
-    slideXml = remapRids(slideXml, rIdMap)
 
     tplZip.file(fileName, slideXml)
-    tplZip.file(relFileName, relsXml)
+    tplZip.file(relFileName, tplRelsXml)
 
     newRels   += `<Relationship Id="rId${sldRid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${slideNum}.xml"/>`
     newSldIds += `<p:sldId id="${sldId}" r:id="rId${sldRid}"/>`
@@ -1430,7 +1394,11 @@ async function buildHistoryPptx(opts) {
 
   // presentation.xml 업데이트
   presXml     = presXml.replace('<p:sldIdLst></p:sldIdLst>', `<p:sldIdLst>${newSldIds}</p:sldIdLst>`)
-  presRelsXml = presRelsXml.replace('</Relationships>', newRels + '</Relationships>')
+  const addedRels = new DOMParser().parseFromString(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${newRels}</Relationships>`, 'application/xml')
+  for (const rel of Array.from(addedRels.documentElement.childNodes)) {
+    if (rel.nodeType === 1) presRelsDoc.documentElement.appendChild(presRelsDoc.importNode(rel, true))
+  }
+  presRelsXml = new XMLSerializer().serializeToString(presRelsDoc)
   ctXml       = ctXml.replace('</Types>', newCt + '</Types>')
 
   tplZip.file('ppt/presentation.xml', presXml)

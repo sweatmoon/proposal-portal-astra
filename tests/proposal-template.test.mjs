@@ -322,6 +322,75 @@ test('action table with zero positive-post stages shows no-target state, not pha
   assert.match(c.ProposalTemplate.text(doc),/조치확인 공수가 있는 단계 없음/);
   assert(!/\[단계|\[이름|\[그룹/.test(c.ProposalTemplate.text(doc)));
 });
+const detailSource = readFileSync(new URL('../public/static/proposal-detail.js', import.meta.url), 'utf8');
+const historySource = detailSource.slice(detailSource.indexOf('async function buildHistoryPptx('), detailSource.indexOf('// ── 사진장표 PPT (템플릿 기반)'));
+async function historyFixture(perPage) {
+  const picture = `<p:pic><p:nvPicPr><p:cNvPr id="8" name="우측 예시 그림"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="imageRef"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="10010694" y="200000"/><a:ext cx="600000" cy="600000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>`;
+  const body = shape(para('[제목]')) + Array.from({ length: perPage }, (_, i) => shape(para(`[P${i + 1}_이름]`, `[P${i + 1}_분야]`))).join('')
+    + picture + shape(`<a:p><a:r><a:rPr><a:hlinkClick r:id="externalLink"/></a:rPr><a:t>작업 예시</a:t></a:r></a:p>`);
+  const zip = await JSZip.loadAsync(await template(body), { base64: true });
+  const rels = `<Relationships xmlns="${R}">
+    <Relationship Target="../slideLayouts/slideLayout1.xml" Id="rId1" Type="${OR}/slideLayout"/>
+    <Relationship Type="${OR}/image" Target="../media/reference.png" Id="imageRef"/>
+    <Relationship TargetMode="External" Target="https://example.test/reference?a=1&amp;b=2" Type="${OR}/hyperlink" Id="externalLink"/>
+  </Relationships>`;
+  zip.file('ppt/slides/_rels/slide1.xml.rels', rels);
+  zip.file('ppt/slideLayouts/slideLayout1.xml', `<p:sldLayout xmlns:p="${P}" xmlns:a="${A}"><p:cSld><p:spTree/></p:cSld></p:sldLayout>`);
+  const image = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
+  zip.file('ppt/media/reference.png', image);
+  zip.file('[Content_Types].xml', (await zip.file('[Content_Types].xml').async('string')).replace('</Types>', '<Default Extension="png" ContentType="image/png"/></Types>'));
+  // An unused source slide must not leave stale presentation relationships after cloning.
+  zip.file('ppt/slides/slide9.xml', slide(shape(para('unused source slide'))));
+  zip.file('ppt/slides/_rels/slide9.xml.rels', rels);
+  zip.file('ppt/_rels/presentation.xml.rels', (await zip.file('ppt/_rels/presentation.xml.rels').async('string')).replace('</Relationships>', `<Relationship Target="slides/slide9.xml" Type="${OR}/slide" Id="rId9"/></Relationships>`));
+  return { zip, rels, image, picture };
+}
+for (const [groupFilter, perPage] of [['AUDITOR', 2], ['EXPERT', 4]]) {
+  test(`${groupFilter} history preserves original pictures and links on every cloned and merged slide`, async () => {
+    const fixture = await historyFixture(perPage);
+    const people = Array.from({ length: perPage * 2 + 1 }, (_, i) => ({ name: `인력${i}`, field: `분야${i}`, isAudit: groupFilter === 'AUDITOR' }));
+    const c = sandbox({ Uint8Array, parsedData: { personnelIdMap: {} }, computeAssignRows: () => people,
+      fetch: () => { throw new Error('No network expected'); } });
+    vm.runInContext(historySource, c);
+    const result = await c.buildHistoryPptx({ returnZip: true, groupFilter, perPage, menuTitle: '실적 시험', templateB64: await fixture.zip.generateAsync({ type: 'base64' }) });
+    const paths = await c.ProposalTemplate.slidePaths(result.zip); assert.equal(paths.length, 3);
+    for (let i = 0; i < paths.length; i++) {
+      const xml = await result.zip.file(paths[i]).async('string');
+      const relsPath = paths[i].replace('ppt/slides/', 'ppt/slides/_rels/') + '.rels';
+      assert.equal(await result.zip.file(relsPath).async('string'), fixture.rels);
+      assert(xml.includes(fixture.picture)); assert(xml.includes('r:id="externalLink"'));
+      assert(xml.includes(people[i * perPage].name.split('').join(' ')));
+      assert(!/\[P\d+_/.test(xml)); assert(xml.includes('실적 시험'));
+    }
+    assert.deepEqual(await result.zip.file('ppt/media/reference.png').async('nodebuffer'), fixture.image);
+    assert(!result.zip.file('ppt/slides/slide9.xml'));
+    const presRels = c.ProposalTemplate.parse(await result.zip.file('ppt/_rels/presentation.xml.rels').async('string'));
+    const relationships = c.ProposalTemplate.nodes(presRels, 'Relationship', R);
+    assert.equal(relationships.length, 3); assert.equal(new Set(relationships.map(r => r.getAttribute('Id'))).size, 3);
+    for (const rel of relationships) assert(result.zip.file('ppt/' + rel.getAttribute('Target')));
+    const base = await JSZip.loadAsync(await template(shape(para('앞 장표'))), { base64: true });
+    const merged = await c.mergePresentationZips([{ zip: base }, { zip: result.zip, mergeStrategy: 'FOREIGN_TEMPLATE' }]);
+    const mergedPaths = await c.ProposalTemplate.slidePaths(merged); assert.equal(mergedPaths.length, 4);
+    for (const path of mergedPaths.slice(1)) {
+      const doc = c.ProposalTemplate.parse(await merged.file(path.replace('ppt/slides/', 'ppt/slides/_rels/') + '.rels').async('string'));
+      const rels = c.ProposalTemplate.nodes(doc, 'Relationship', R);
+      const imageRel = rels.find(r => r.getAttribute('Id') === 'imageRef'); assert(imageRel);
+      const imagePath = new URL(imageRel.getAttribute('Target'), 'https://ppt.test/' + path).pathname.slice(1);
+      assert.deepEqual(await merged.file(imagePath).async('nodebuffer'), fixture.image);
+      const link = rels.find(r => r.getAttribute('Id') === 'externalLink'); assert(link);
+      assert.equal(link.getAttribute('TargetMode'), 'External');
+      assert.equal(link.getAttribute('Target'), 'https://example.test/reference?a=1&b=2');
+      assert.match(await merged.file(path).async('string'), /r:embed="imageRef"/);
+    }
+  });
+}
+test('history rejects missing source relationships instead of inventing a layout', async () => {
+  const { zip } = await historyFixture(2); zip.remove('ppt/slides/_rels/slide1.xml.rels');
+  const c = sandbox({ Uint8Array, parsedData: {}, computeAssignRows: () => [{ name: '가', isAudit: true }] });
+  vm.runInContext(historySource, c);
+  await assert.rejects(c.buildHistoryPptx({ returnZip: true, templateB64: await zip.generateAsync({ type: 'base64' }) }), /슬라이드 연결 정보/);
+});
+
 test('registry retries after failed requests instead of caching rejected promise', async () => {
   let calls = 0;
   const c = sandbox({ fetch: async url => { assert.match(url, /category=proposal/); if (++calls === 1) throw new Error('temporary'); return { json: async () => ({ ok: true, data: [] }) }; } });
