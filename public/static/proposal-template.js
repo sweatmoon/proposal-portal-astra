@@ -130,8 +130,7 @@ var ProposalTemplate = (() => {
   function scheduleStages(ctx) {
     const regular = ctx.stages.filter(s => !/상주|상시|검수지원/.test(s.stage));
     const resident = ctx.stages.filter(s => /상주|상시/.test(s.stage));
-    const acceptance = ctx.stages.filter(s => s.stage.includes('검수지원'));
-    if (regular.length > 4 || resident.length > 1 || acceptance.length > 1) throw new Error('현재 일정 템플릿의 일반 4단계·상주/상시 1단계·검수지원 1단계를 초과합니다. 양식 확장이 필요합니다.');
+    // 기존 양식의 부가 문구용 슬롯만 유지한다. 실제 표는 ctx.stages 전체로 재구성한다.
     return [...Array.from({ length: 4 }, (_, i) => regular[i] || null), resident[0] || null];
   }
   function scheduleMap(ctx, menu) {
@@ -154,7 +153,7 @@ var ProposalTemplate = (() => {
     groups.forEach((group, index) => {
       const fields = unique(group.map(m => m.field).filter(Boolean));
       const capacity = [4, 2, 3][index];
-      if (fields.length > capacity && menu.menu_code === 'SCHEDULE_PLAN') throw new Error(`일정 계획의 ${['핵심기술', '필수기술', '보안'][index]} 분야가 템플릿 ${capacity}칸을 초과합니다.`);
+      // 표 본문은 updatePlanTable에서 분야 수만큼 확장한다.
       for (let i = 0; i < capacity; i++) map[`[분야${offset++}]`] = fields[i] || '';
     });
     const start = date(ctx.pd.targetStartDate);
@@ -174,37 +173,120 @@ var ProposalTemplate = (() => {
       if (x >= width || y >= height || x + +ext.getAttribute('cx') <= 0 || y + +ext.getAttribute('cy') <= 0) tree.removeChild(shape);
     }
   }
-  function updateDetailTables(doc, ctx, stages, warnings) {
+  function geometry(root) {
+    const xf = nodes(root, 'xfrm', P)[0] || nodes(root, 'xfrm')[0];
+    const off = xf && children(xf, 'off')[0], ext = xf && children(xf, 'ext')[0];
+    return off && ext ? { x: +off.getAttribute('x'), y: +off.getAttribute('y'),
+      w: +ext.getAttribute('cx'), h: +ext.getAttribute('cy'), ext } : null;
+  }
+  function tableHeight(table) {
+    return children(table, 'tr').reduce((sum, row) => sum + (+row.getAttribute('h') || 1), 0);
+  }
+  // 폰트/문단 간격/셀 여백도 같이 축소해야 PowerPoint가 행을 다시 늘리지 않는다.
+  function fitTable(table, height, warnings) {
+    const rows = children(table, 'tr'), natural = tableHeight(table);
+    const ratio = Math.min(1, height / natural), widths = nodes(table, 'gridCol').map(c => +c.getAttribute('w'));
+    let remaining = Math.round(Math.min(height, natural)), minFont = Infinity;
+    rows.forEach((row, ri) => {
+      const h = ri === rows.length - 1 ? remaining : Math.max(1, Math.round((+row.getAttribute('h') || 1) * ratio));
+      row.setAttribute('h', h); remaining -= h;
+      children(row, 'tc').forEach((cell, ci) => {
+        const span = Math.max(1, +cell.getAttribute('rowSpan') || 1);
+        const cellH = rows.slice(ri, ri + span).reduce((s, r, n) => s + (n ? (+r.getAttribute('h') || 1) * ratio : h), 0);
+        const colSpan = Math.max(1, +cell.getAttribute('gridSpan') || 1);
+        const cellW = widths.slice(ci, ci + colSpan).reduce((s, w) => s + w, 0);
+        const margin = Math.min(12700, h * 0.04);
+        let props = children(cell, 'tcPr')[0];
+        if (!props) { props = cell.ownerDocument.createElementNS(A, 'a:tcPr'); cell.appendChild(props); }
+        for (const attr of ['marT', 'marB', 'marL', 'marR']) props.setAttribute(attr, Math.round(margin));
+        const paras = nodes(cell, 'p'), content = paras.map(p => text(p));
+        const maxLine = Math.max(1, ...content.flatMap(t => t.split('\n')).map(t => [...t].reduce((n, ch) => n + (/[\x00-\x7f]/.test(ch) ? 0.55 : 1), 0)));
+        const lineCount = Math.max(1, content.reduce((n, t) => n + t.split('\n').length, 0));
+        // sz 단위는 1/100pt, EMU는 12700/pt. 단일 장을 위해 최소 글자 크기로 중단하지 않는다.
+        const cap = Math.max(1, Math.floor(Math.min((cellH - margin * 2) / (127 * 1.15 * lineCount), cellW ? (cellW - margin * 2) / (127 * maxLine) : Infinity)));
+        for (const run of nodes(cell, 'r')) {
+          if (!children(run, 'rPr').length) run.insertBefore(cell.ownerDocument.createElementNS(A, 'a:rPr'), run.firstChild);
+        }
+        for (const prop of [...nodes(cell, 'rPr'), ...nodes(cell, 'defRPr'), ...nodes(cell, 'endParaRPr')]) {
+          const sz = Math.max(1, Math.min(cap, Math.round((+prop.getAttribute('sz') || 900) * ratio)));
+          prop.setAttribute('sz', sz); if (text(cell)) minFont = Math.min(minFont, sz);
+        }
+        for (const space of [...nodes(cell, 'spcPts'), ...nodes(cell, 'spcPct')]) {
+          const line = space.parentNode.localName === 'lnSpc';
+          space.setAttribute('val', line && space.localName === 'spcPct' ? 100000 : Math.round((+space.getAttribute('val') || 0) * ratio));
+        }
+        for (const body of nodes(cell, 'bodyPr')) {
+          body.setAttribute('wrap', 'square');
+          for (const auto of [...children(body, 'spAutoFit'), ...children(body, 'normAutofit')]) body.removeChild(auto);
+          if (!children(body, 'noAutofit').length) body.appendChild(cell.ownerDocument.createElementNS(A, 'a:noAutofit'));
+        }
+      });
+    });
+    const frame = ancestor(table, 'graphicFrame'), box = frame && geometry(frame);
+    if (box) box.ext.setAttribute('cy', tableHeight(table));
+    // 複製した Office 拡張 ID は再採番する（行/列の編集時の重複防止）。
+    let id = 1;
+    for (const el of Array.from(table.getElementsByTagName('*'))) if (['rowId', 'colId', 'cellId'].includes(el.localName)) el.setAttribute('val', id++);
+    if (minFont < 700) warnings.push('전체 단계를 한 장에 맞추기 위해 표 글자 크기를 7pt 미만으로 조정했습니다. 확대하여 확인하세요.');
+  }
+  function stageValue(stage, token) {
+    if (/^\[단계\d+\]$/.test(token)) return stage.stage;
+    if (/^\[단계\d+시작일-7\]$/.test(token)) { const d = stage.start && new Date(stage.start); if (d) d.setUTCDate(d.getUTCDate() - 7); return fmtDate(d) || '확인 필요'; }
+    if (/^\[단계\d+시작일\]$/.test(token)) return fmtDate(stage.start) || '확인 필요';
+    if (/^\[단계\d+종료일\]$/.test(token)) return fmtDate(stage.end) || '확인 필요';
+    return undefined;
+  }
+  function updateDetailTables(doc, ctx, warnings) {
     for (const table of nodes(doc, 'tbl')) {
       if (!/\[단계1\]/.test(text(table))) continue;
-      const groups = []; let current = null;
+      const originalHeight = tableHeight(table), groups = [], headers = [], footers = [];
+      let current = null;
       for (const row of children(table, 'tr')) {
-        const cells = children(row, 'tc');
-        if (cells.length !== 5) continue;
-        const first = text(cells[0]), contents = text(row);
-        if (first.includes('투입 공수 합계')) {
-          setText(cells[4], `총 ${ctx.total.baseline + ctx.total.additional}MD`);
-          current = null; continue;
+        const cells = children(row, 'tc'), first = cells[0] && text(cells[0]);
+        if (first?.includes('투입 공수 합계')) { footers.push(row); current = null; continue; }
+        if (/\[단계\d+\]|상주감리|상시감리|검수지원/.test(first || '')) {
+          current = { kind: /검수지원/.test(first) ? 'acceptance' : /상주|상시/.test(first) ? 'resident' : 'regular', rows: [] };
+          groups.push(current);
         }
-        const match = first.match(/\[단계(\d+)\]/);
-        if (match || /상주감리|검수지원/.test(first)) {
-          const stage = match ? stages[Number(match[1]) - 1] : first.includes('검수지원')
-            ? ctx.stages.find(s => s.stage.includes('검수지원')) : stages[4];
-          current = { stage, rows: [] }; groups.push(current);
-          if (stage && !match) setText(cells[0], stage.stage);
-        }
-        if (current) current.rows.push(row);
-        if (!current?.stage || !contents.includes('(0)')) continue;
-        const stage = current.stage;
-        const sum = key => stage.auditors.reduce((v, p) => v + (number(p[key]) ?? 0), 0);
-        let value = sum('audit'), days = number(stage.days);
-        if (contents.includes('예비조사')) { value = sum('pre'); days = value ? null : 0; }
-        else if (contents.includes('시정조치')) { value = sum('post'); days = value ? null : 0; }
-        else if (contents.includes('소계')) { value = stage.auditorMD; days = sum('pre') || sum('post') ? null : days; }
-        setText(cells[4], `(${days ?? '확인 필요'})일 / (${value})MD`);
-        if (days === null) warnings.push('예비조사·조치확인 일수는 MD로 역산하지 않습니다. 확인 필요로 표시된 일수를 검토하세요.');
+        if (current) current.rows.push(row); else headers.push(row);
       }
-      for (const group of groups) if (!group.stage) group.rows.forEach(row => table.removeChild(row));
+      if (!groups.length) continue;
+      const replacements = [];
+      for (const stage of ctx.stages) {
+        const kind = /검수지원/.test(stage.stage) ? 'acceptance' : /상주|상시/.test(stage.stage) ? 'resident' : 'regular';
+        const source = groups.find(g => g.kind === kind) || groups.find(g => g.kind === 'regular') || groups[0];
+        const sum = key => stage.auditors.reduce((v, p) => v + (number(p[key]) ?? 0), 0);
+        source.rows.forEach((original, i) => {
+          const row = original.cloneNode(true), cells = children(row, 'tc'), contents = text(row);
+          replace(row, token => stageValue(stage, token));
+          if (i === 0) setText(cells[0], stage.stage);
+          if (kind !== 'regular' && i === 0 && cells[3]) setText(cells[3], `${fmtDate(stage.start) || '확인 필요'} ~ ${fmtDate(stage.end) || '확인 필요'}`);
+          if (cells[4] && /\(0\)/.test(contents)) {
+            let value = sum('audit'), days = number(stage.days);
+            if (contents.includes('예비조사')) { value = sum('pre'); days = value ? null : 0; }
+            else if (contents.includes('시정조치')) { value = sum('post'); days = value ? null : 0; }
+            else if (contents.includes('소계')) { value = stage.auditorMD; days = sum('pre') || sum('post') ? null : days; }
+            setText(cells[4], `(${days ?? '확인 필요'})일 / (${value})MD`);
+            if (days === null) warnings.push('예비조사·조치확인 일수는 MD로 역산하지 않습니다. 확인 필요로 표시된 일수를 검토하세요.');
+          }
+          replacements.push(row);
+        });
+      }
+      for (const row of footers) { const cells = children(row, 'tc'); if (cells[4]) setText(cells[4], `총 ${ctx.total.baseline + ctx.total.additional}MD`); }
+      for (const row of children(table, 'tr')) table.removeChild(row);
+      for (const row of [...headers, ...replacements, ...footers]) table.appendChild(row);
+      fitTable(table, originalHeight, warnings);
+      // 표 위에 얹혀 있던 샘플 주석/화살표는 확장된 행과 어긋나므로 제거한다.
+      const frame = ancestor(table, 'graphicFrame'), box = frame && geometry(frame);
+      if (box) removeOverlays(doc, box, frame);
+    }
+    for (const shape of nodes(doc, 'sp', P)) {
+      if (/\[단계1\].*\[단계2\]/.test(text(shape))) {
+        setText(shape, ctx.stages.map(s => `${s.stage} (${s.start ? s.start.getUTCMonth() + 1 + '월' : '일정 확인'})`).join(' → '));
+        for (const prop of nodes(shape, 'rPr')) prop.setAttribute('sz', Math.max(1, Math.round((+prop.getAttribute('sz') || 900) * Math.min(1, 4 / ctx.stages.length))));
+      }
+      // '기본 3단계' 같은 고정 단계 수는 실제 선택된 기본 단계 수로 갱신한다.
+      for (const t of nodes(shape, 't')) t.textContent = t.textContent.replace(/기본\s*\d+단계/g, `기본 ${ctx.base.length}단계`);
     }
   }
   function actionResolver(doc, ctx, map) {
