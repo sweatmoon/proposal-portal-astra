@@ -89,10 +89,10 @@ app.get('/:id/compliance-profile', async (c) => {
         return c.json({ ok: false, error: 'invalid_id' }, 400);
     c.header('Cache-Control', 'no-store');
     try {
-        const member = await queryOne('SELECT person_name FROM proposal_members WHERE project_id = $1 AND personnel_id = $2 LIMIT 1', [projectId, personnelId]);
+        const member = await queryOne('SELECT person_name, auditor_cert_no FROM proposal_members WHERE project_id = $1 AND personnel_id = $2 LIMIT 1', [projectId, personnelId]);
         if (!member)
             return c.json({ ok: false, error: 'person_not_in_proposal' }, 404);
-        const person = await queryOne('SELECT name, auditor_start_date, career_expert FROM personnel WHERE id = $1', [personnelId]);
+        const person = await queryOne('SELECT name, auditor_start_date, career_expert, auditor_cert_no FROM personnel WHERE id = $1', [personnelId]);
         if (!person)
             return c.json({ ok: false, error: 'person_not_found' }, 404);
         const history = await query('SELECT audit_yearmonth, role FROM personnel_audit_history WHERE personnel_id = $1 ORDER BY audit_yearmonth ASC', [personnelId]);
@@ -100,6 +100,7 @@ app.get('/:id/compliance-profile', async (c) => {
                 personnelId, projectId, name: member.person_name,
                 ...summarizeComplianceHistory(person, history),
                 highlights: person.career_expert ?? '',
+                certNo: String(person.auditor_cert_no ?? '').trim() || String(member.auditor_cert_no ?? '').trim(),
             } });
     }
     catch {

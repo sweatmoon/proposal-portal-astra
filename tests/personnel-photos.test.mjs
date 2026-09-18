@@ -158,6 +158,18 @@ test('compliance profile API uses linked personnel ID, SELECT-only data and no N
   }
   assert.equal(db.calls.length, count);
 });
+test('compliance profile returns personnel certificate number with linked proposal fallback', async () => {
+  for (const [stored, fallback, expected] of [[' DB-307 ', 'OLD-01', 'DB-307'], [null, ' PROPOSAL-02 ', 'PROPOSAL-02'], ['', null, '']]) {
+    const { mod, db } = await complianceApi({
+      person: { name: '시험PM', auditor_cert_no: stored, auditor_start_date: '2020.07', career_expert: '' },
+      member: { person_name: '시험PM', auditor_cert_no: fallback },
+    });
+    const response = await mod.default.request('/7/compliance-profile?projectId=42');
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).data.certNo, expected);
+    assert(db.calls[0].sql.includes('auditor_cert_no')); assert(db.calls[1].sql.includes('auditor_cert_no'));
+  }
+});
 test('compliance profile distinguishes real zero history from unlinked person and DB failure', async () => {
   const zero = await complianceApi();
   const data = (await (await zero.mod.default.request('/7/compliance-profile?projectId=42')).json()).data;

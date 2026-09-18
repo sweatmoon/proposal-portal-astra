@@ -206,7 +206,18 @@ var ProposalTemplate = (() => {
     if (auditorNotes || education) warnings.push('3.6 담당자 입력 문구를 그대로 반영했습니다. 경험·교육계획의 근거 확인은 담당자 책임이며 자동 검증한 내용이 아닙니다.');
     map['[총괄경력]'] = pmHistory;
     map['[교육계획]'] = education;
+    const keywordValues = Array.isArray(pd.proposalKeywords) ? pd.proposalKeywords : [];
+    const auditAssignments = ctx.stages.flatMap(s => s.auditors);
+    const staffCount = auditAssignments.every(validAssignment) ? auditors.length : undefined;
     Object.assign(map, {
+      // 사용자 수정 3.6: 토큰의 값만 치환하고 주변 직급·상근·기관·경험 문구는 유지한다.
+      '[총괄이름]': pm?.name,
+      '[감리원번호]': (profile?.certNo ?? pm?.certNo)?.trim() || undefined,
+      '[총괄수행건수]': profile?.directorCount,
+      '[총괄인력감리경력]': profile?.career || undefined,
+      '[총괄인력감리건수]': profile?.auditCount,
+      '[단계감리팀수]': staffCount,
+      ...Object.fromEntries([1, 2, 3].map(i => [`[키워드${i}]`, typeof keywordValues[i - 1] === 'string' ? keywordValues[i - 1].trim() || undefined : undefined])),
       '[제안감리구성]': regular.length ? `${regular.length}단계 감리` : '감리 일정',
       '[제안추가감리]': additional.length ? ` + ${additional.join('·')}` : '',
       '[제안감리일정]': ctx.stages.map(s => `- ${s.stage || '단계 미입력'} : ${fmtDate(s.start) || '—'} ~ ${fmtDate(s.end) || '—'} (현장감리 ${number(s.days) !== null && Number(s.days) >= 0 ? Number(s.days) : '—'}일)`).join('\n'),
@@ -889,7 +900,8 @@ var ProposalTemplate = (() => {
       if (!result.ok || !p || p.personnelId !== personnelId || p.projectId !== projectId || p.name !== name
         || !Number.isSafeInteger(p.auditCount) || p.auditCount < 0
         || !Number.isSafeInteger(p.directorCount) || p.directorCount < 0 || p.directorCount > p.auditCount
-        || !(p.career === null || typeof p.career === 'string') || typeof p.highlights !== 'string') throw new Error('profile_invalid');
+        || !(p.career === null || typeof p.career === 'string') || typeof p.highlights !== 'string'
+        || (p.certNo !== undefined && typeof p.certNo !== 'string')) throw new Error('profile_invalid');
       ctx.pmProfile = p; // 생성 시작 시 선택한 PM의 응답만 사용. 전역/이름 캐시로 이전 인력을 재사용하지 않는다.
       return [];
     } catch {
@@ -943,10 +955,12 @@ var ProposalTemplate = (() => {
     const layouts = await Promise.all(Object.keys(zip.files).filter(p => /^ppt\/(slideLayouts|slideMasters)\/[^/]+\.xml$/.test(p))
       .map(async path => ({ path, doc: parse(await zip.file(path).async('string')) })));
     const ctx = context(vm._raw || vm, options());
-    const needsHistory = [...visible, ...layouts.map(l => l.doc)].some(s => /\[(?:제안PM경력|총괄경력)\]/.test(text(s).replace(/\s+/g, '')));
+    const needsHistory = [...visible, ...layouts.map(l => l.doc)].some(s => /\[(?:제안PM경력|총괄경력|총괄수행건수|총괄인력감리경력|총괄인력감리건수|감리원번호)\]/.test(text(s).replace(/\s+/g, '')));
     const profileWarnings = needsHistory ? await loadCompliancePM(ctx) : [];
     const { map, warnings } = complianceData(ctx, menu);
     warnings.push(...profileWarnings);
+    if (visible.some(s => /\[키워드[123]\]/.test(text(s).replace(/\s+/g, ''))))
+      warnings.push('3.6 키워드1~3은 사업에 등록된 키워드 우선순위입니다. 고정 경험 문구에 들어가더라도 해당 인력의 실제 수행 경험을 자동 검증한 것은 아닙니다.');
     for (const shape of visible) {
       const unresolved = replaceComplianceCopy(shape, map);
       if (unresolved.length) warnings.push(`3.6 미치환: ${unresolved.join(', ')}`);

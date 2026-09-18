@@ -391,13 +391,13 @@ app.get('/proposals/:id', async (c) => {
       GROUP BY ph.id ORDER BY ph.phase_order, ph.id
     `, [id]),
         query(`SELECT * FROM proposal_members WHERE project_id = $1 ORDER BY id ASC`, [id]),
-        query(`SELECT * FROM keywords WHERE project_id = $1 ORDER BY sort_order`, [id]),
+        query(`SELECT * FROM keywords WHERE project_id = $1 ORDER BY sort_order, id`, [id]),
         query(`SELECT * FROM proposal_files WHERE project_id = $1 ORDER BY id`, [id]),
         query(`SELECT * FROM proposal_attachments_toc WHERE project_id = $1 ORDER BY item_order`, [id]),
         query(`SELECT id, original_keyword, mapped_keyword FROM keyword_mappings WHERE project_id = $1 ORDER BY id ASC`, [id]),
     ]);
     // 키워드 태그
-    const kwTags = keywords.map(k => `<span class="inline-block px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full text-xs">${k.keyword}</span>`).join(' ');
+    const kwTags = keywords.map(k => `<span class="inline-block px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full text-xs">${String(k.keyword ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>`).join(' ');
     // ── DB → parsedData 포맷 변환 ────────────────────────────────
     // proposal_members → personFieldMap / personGradeMap / portalOrder
     const personFieldMap = {};
@@ -527,6 +527,8 @@ app.get('/proposals/:id', async (c) => {
         requestMD: project.required_md ?? null,
         requestStageCount: project.required_phases ?? null,
         requestAuditDays: project.required_audit_days ?? null,
+        // 사업 키워드 원문·등록 우선순위. 인력 실적 매칭용 변환 문구로 임의 대체하지 않는다.
+        proposalKeywords: keywords.map(k => String(k.keyword ?? '').trim()).filter(Boolean),
         proposedMD: project.proposed_md ?? null,
         targetProjectName: String(project.target_project_name ?? ''),
         targetStartDate: String(project.target_period_start ?? ''),

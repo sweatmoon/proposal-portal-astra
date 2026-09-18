@@ -472,6 +472,74 @@ test('finished 3.6 handles six stages, raw missing MD, escaped DB text and optio
   assert(c.ProposalTemplate.text(mainComplianceTable(c, await missing.zip.file(ratioSlide).async('string'))).includes('총 — MD'));
 });
 
+const userRevisedB64 = readFileSync(new URL('../artifacts/3.6_user_revised_template.pptx', import.meta.url)).toString('base64');
+function userRevisedData() {
+  return { ...pmCopyFixture(), proposalKeywords: ['AI 문항생성', '클라우드', '정보보호', '네번째키워드'] };
+}
+test('user revised 3.6 (3) resolves discrete PM, certificate, staff count and repeated project keyword tokens', async () => {
+  const c = copySandbox({ ...pmProfile, directorCount: 23, auditCount: 203, career: '8년 4개월', certNo: '서울 제307호' }), T = c.ProposalTemplate;
+  const r = await T.build(menu('COMPLIANCE', userRevisedB64), { _raw: userRevisedData() });
+  const table = mainComplianceTable(c, await r.zip.file(ratioSlide).async('string')), txt = T.text(table);
+  assert.equal(c.requests.length, 1); assert.equal(c.requests[0].url, '/api/personnel/7/compliance-profile?projectId=42');
+  for (const phrase of ['총괄 감리원(PM) : 가 수석 감리원 (상근)', '자격번호 서울 제307호', '총괄 수행  23건', '감리 경력 8년 4개월 / 203 건', '단계 감리원 2명', 'AI 문항생성 / 클라우드 / 정보보호', 'AI 문항생성, 클라우드, 정보보호']) assert(txt.includes(phrase), phrase);
+  assert(!txt.includes('141')); assert(!txt.includes('네번째키워드'));
+  assert(!/\[[^\]]+\]/.test(txt)); assert(!r.warnings.some(w => w.includes('미치환')));
+});
+test('user revised 3.6 preserves fixed career claims, all original styles, off-slide objects and media', async () => {
+  const c = copySandbox({ ...pmProfile, certNo: 'DB-7' }), T = c.ProposalTemplate;
+  const source = await JSZip.loadAsync(userRevisedB64, { base64: true });
+  const r = await T.build(menu('COMPLIANCE', userRevisedB64), userRevisedData());
+  const before = await source.file(ratioSlide).async('string'), after = await r.zip.file(ratioSlide).async('string');
+  assert.equal(withoutText(c, after), withoutText(c, before));
+  const txt = T.text(mainComplianceTable(c, after));
+  assert(txt.includes('한국지능정보사회진흥원 사업 감리 총괄로서 사업의 성공 완료 지원'));
+  assert(txt.includes('100% 상근 수석 감리원'));
+  const originalShapes = Array.from(T.parse(before).getElementsByTagNameNS(P, 'spTree')[0].childNodes);
+  const outputShapes = Array.from(T.parse(after).getElementsByTagNameNS(P, 'spTree')[0].childNodes);
+  for (let i = 0; i < originalShapes.length; i++) if (![2, 5].includes(i)) assert.equal(serialized(outputShapes[i]), serialized(originalShapes[i]));
+  for (const path of Object.keys(source.files).filter(p => !source.files[p].dir && !/^ppt\/(slides|slideLayouts|slideMasters)\/[^/]+\.xml$/.test(p))) {
+    assert.deepEqual(await r.zip.file(path).async('uint8array'), await source.file(path).async('uint8array'), path);
+  }
+});
+test('user revised 3.6 keeps missing DB values unresolved and distinguishes actual zero counts', async () => {
+  const c = copySandbox({ ...pmProfile, directorCount: 0, auditCount: 0, career: null, certNo: '' }), T = c.ProposalTemplate;
+  const d = userRevisedData(); d.proposalKeywords = ['하나'];
+  const r = await T.build(menu('COMPLIANCE', userRevisedB64), d);
+  const txt = T.text(mainComplianceTable(c, await r.zip.file(ratioSlide).async('string')));
+  assert(txt.includes('총괄 수행  0건')); assert(txt.includes('/ 0 건'));
+  for (const token of ['[총괄인력감리경력]', '[감리원번호]', '[키워드2]', '[키워드3]']) {
+    assert(txt.includes(token)); assert(r.warnings.some(w => w.includes('미치환') && w.includes(token)));
+  }
+  c.fetch = async () => { throw new Error('offline'); };
+  const failed = await T.build(menu('COMPLIANCE', userRevisedB64), userRevisedData());
+  const failedText = T.text(mainComplianceTable(c, await failed.zip.file(ratioSlide).async('string')));
+  for (const token of ['[총괄수행건수]', '[총괄인력감리경력]', '[총괄인력감리건수]']) assert(failedText.includes(token));
+  assert(failed.warnings.some(w => w.includes('조회 실패')));
+});
+test('user revised 3.6 counts only unique assigned auditors and supports spaced split tokens without touching surrounding units', async () => {
+  const d = userRevisedData(); d.stages.push({ ...d.stages[0], stage: '종료' });
+  d.portalOrder.push({ name: '미배정', group: '감리원팀' }, { name: '전문가', group: '전문가' });
+  d.stages[0].전문가.people.push({ name: '전문가', pre: 0, audit: 2, post: 0 });
+  const c = copySandbox({ ...pmProfile, certNo: '인력DB-01' }), T = c.ProposalTemplate;
+  const b64 = await template(shape(para('[총괄 이름] / [총괄수행', '건수]건 / [총괄인력감리건수]건 / [감리원번호] / [단계감리팀수]명 / [키워드 1]')));
+  const r = await T.build(menu('COMPLIANCE', b64), d);
+  assert.equal(docText(c, await r.zip.file(ratioSlide).async('string')), '가 / 19건 / 141건 / 인력DB-01 / 2명 / AI 문항생성');
+  d.stages[0].감리원.people[0].mdComplete = false;
+  assert.equal(T.complianceData(T.context(d), menu('COMPLIANCE')).map['[단계감리팀수]'], undefined);
+  const fixed = await T.build(menu('COMPLIANCE', await template(shape(para('고정 141건 / 한국지능정보사회진흥원')))), d);
+  assert.equal(docText(c, await fixed.zip.file(ratioSlide).async('string')), '고정 141건 / 한국지능정보사회진흥원');
+});
+test('user revised 3.6 aliases work through dispatcher and merge without unsupported tokens', async () => {
+  const c = copySandbox({ ...pmProfile, certNo: 'DB-7' }), T = c.ProposalTemplate;
+  const r = await c.generateMenuPpt(menu('COMPLIANCE', userRevisedB64), c.buildProjectViewModel(userRevisedData()));
+  const first = { zip: await JSZip.loadAsync(await template(shape(para('앞 장표'))), { base64: true }) };
+  const merged = await c.mergePresentationZips([first, r]), paths = await T.slidePaths(merged);
+  assert.equal(paths.length, 2);
+  const txt = T.text(mainComplianceTable(c, await merged.file(paths[1]).async('string')));
+  assert(txt.includes('자격번호 DB-7')); assert(txt.includes('19건')); assert(txt.includes('141 건')); assert(txt.includes('AI 문항생성'));
+  assert(!/\[[^\]]+\]/.test(txt));
+});
+
 const summaryFunctionSource = readFileSync(new URL('../public/static/proposal-detail.js', import.meta.url), 'utf8').split('async function downloadSummaryTablePptx')[1].split('// ── 전체 합본 PPT')[0];
 test('standalone 3.6 reloads registry, returns same template result and downloads despite warnings', async () => {
   const c = complianceSandbox(complianceChoices); let clicked = 0, calls = 0;
@@ -491,12 +559,16 @@ const tsModuleUrl = source => 'data:text/javascript;base64,' + Buffer.from(ts.tr
 }).outputText).toString('base64');
 const pageSource = readFileSync(new URL('../src/routes/pages.ts', import.meta.url), 'utf8');
 const layoutModule = tsModuleUrl(readFileSync(new URL('../src/views/layout.ts', import.meta.url), 'utf8'));
-async function renderRequirements(values, members = [], phases = []) {
+async function renderRequirements(values, members = [], phases = [], keywords = []) {
   const project = { id: 1, project_name: '요구사항 시험 사업', ...values };
   const dbModule = tsModuleUrl(`export async function query(sql) {
     if (!/^\\s*SELECT\\b/i.test(sql)) throw new Error('Read-only test');
     if (sql.includes('FROM proposal_members')) return ${JSON.stringify(members)};
     if (sql.includes('FROM audit_phases')) return ${JSON.stringify(phases)};
+    if (sql.includes('FROM keywords')) {
+      if (!sql.includes('ORDER BY sort_order, id')) throw new Error('Keyword order must be stable');
+      return ${JSON.stringify(keywords)};
+    }
     return [];
   } export async function queryOne() { return ${JSON.stringify(project)}; }`);
   const source = pageSource.replace("'hono'", JSON.stringify(import.meta.resolve('hono')))
@@ -547,6 +619,19 @@ test('3.6 SSR removes scope choices, retains PM selection and preserves unknown 
   assert.equal(c.parsedData.stages[0].감리원.people[0].pre, 0);
   assert.equal(c.parsedData.stages[0].감리원.people[0].mdComplete, false);
   assert.equal(c.parsedData.stages[0].감리원.people[1].mdComplete, true);
+});
+test('user revised 3.6 receives ordered DB project keywords through safe SSR JSON without HTML injection', async () => {
+  const rows = [{ keyword: ' 원문 키워드 ' }, { keyword: 'A&B' }, { keyword: '</script><img src=x onerror=alert(1)>' }, { keyword: '네번째' }];
+  const result = await renderRequirements({}, [], [], rows);
+  const script = result.html.querySelectorAll('script').find(s => s.text.includes('var parsedData ='));
+  const c = vm.createContext({}); vm.runInContext(script.text, c);
+  assert.deepEqual(Array.from(c.parsedData.proposalKeywords), rows.map(r => r.keyword.trim()));
+  assert.equal(result.html.querySelector('img[src="x"]'), null);
+  assert(script.text.includes(String.raw`\u003c/script>`));
+  const T = sandbox().ProposalTemplate;
+  const map = T.complianceData(T.context(c.parsedData), menu('COMPLIANCE')).map;
+  assert.equal(map['[키워드1]'], '원문 키워드'); assert.equal(map['[키워드2]'], 'A&B');
+  assert.equal(map['[키워드3]'], rows[2].keyword);
 });
 test('proposal detail renders stored demand stages, days and MD together', async () => {
   const result = await renderRequirements({ required_phases: 3, required_audit_days: 5, required_md: 151, proposed_md: 126 });
