@@ -4,7 +4,7 @@
  */
 import { Hono } from 'hono'
 import { query, queryOne } from '../db/client.js'
-import { fetchPersonnelPhotos } from '../lib/nas-client.js'
+import { fetchPersonnelPhotoResults, validPhotoName } from '../lib/nas-client.js'
 
 const app = new Hono()
 
@@ -41,6 +41,25 @@ app.get('/', async (c) => {
 
   const rows = await query(sql, params)
   return c.json({ ok: true, data: rows })
+})
+
+// 정적 경로를 /:id보다 먼저 등록해야 이름 조회가 숫자 ID로 해석되지 않는다.
+app.get('/photo-image-by-name', async (c) => {
+  const name = (c.req.query('name') || '').trim()
+  if (!validPhotoName(name)) return c.json({ ok: false, error: 'invalid_name' }, 400)
+  c.header('Cache-Control', 'no-store')
+  const [result] = await fetchPersonnelPhotoResults([name])
+  return c.json(result)
+})
+
+// 읽기 전용 일괄 조회. DB 미연결 인원도 제안작업표의 이름으로 사진을 찾는다.
+app.post('/photo-images', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  if (!Array.isArray(body?.names) || !body.names.length || body.names.length > 100 || !body.names.every(validPhotoName)) {
+    return c.json({ ok: false, error: 'names must contain 1–100 valid names' }, 400)
+  }
+  c.header('Cache-Control', 'no-store')
+  return c.json({ ok: true, results: await fetchPersonnelPhotoResults(body.names) })
 })
 
 app.get('/:id', async (c) => {
@@ -443,7 +462,7 @@ app.get('/:id/photo-profile', async (c) => {
  * GET /api/personnel/:id/photo-image
  * NAS 증명사진 PNG를 base64(data URI)로 반환.
  * 파일명 패턴: 증명사진(이름).png
- * 사진이 없으면 { ok: false, error: 'not_found' } 반환 (404 아님 — 프론트 fallback용)
+ * 파일/경로 없음과 NAS 인증·권한·네트워크 오류를 구분하여 반환.
  */
 app.get('/:id/photo-image', async (c) => {
   const personnelId = Number(c.req.param('id'))
@@ -453,32 +472,10 @@ app.get('/:id/photo-image', async (c) => {
   const person = await queryOne<{ name: string }>(
     `SELECT name FROM personnel WHERE id = $1`, [personnelId]
   )
-  if (!person) return c.json({ ok: false, error: 'not_found' })
-
-  const photoMap = await fetchPersonnelPhotos([person.name])
-  const buf = photoMap.get(person.name)
-  if (!buf) return c.json({ ok: false, error: 'not_found' })
-
-  // base64 data URI로 반환 (프론트에서 ArrayBuffer로 변환 후 PPTX media 교체)
-  const b64 = buf.toString('base64')
-  return c.json({ ok: true, name: person.name, dataUri: `data:image/png;base64,${b64}` })
-})
-
-/**
- * GET /api/personnel/photo-image-by-name?name=홍길동
- * personnel_id가 없어도 이름만으로 NAS 증명사진을 조회한다.
- * personnelId=0인 인원(proposal_members.personnel_id=NULL)을 위한 fallback 엔드포인트.
- */
-app.get('/photo-image-by-name', async (c) => {
-  const name = (c.req.query('name') || '').trim()
-  if (!name) return c.json({ ok: false, error: 'name required' }, 400)
-
-  const photoMap = await fetchPersonnelPhotos([name])
-  const buf = photoMap.get(name)
-  if (!buf) return c.json({ ok: false, error: 'not_found' })
-
-  const b64 = buf.toString('base64')
-  return c.json({ ok: true, name, dataUri: `data:image/png;base64,${b64}` })
+  if (!person) return c.json({ ok: false, error: 'personnel_not_found' })
+  c.header('Cache-Control', 'no-store')
+  const [result] = await fetchPersonnelPhotoResults([person.name])
+  return c.json(result)
 })
 
 /**

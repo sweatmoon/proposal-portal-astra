@@ -2662,6 +2662,64 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
 // ── 목차 기반 사진장표 생성 ─────────────────────────────────────
 // 각 목차(toc)는 독립적으로 처리된다.
 // 흐름: readPhotoAssignConfig() → 목차별 인원 수집(portalOrder 순) → 슬롯 배치 → PPTX 생성
+// 사진은 프로파일 ID와 독립적으로 이름으로 조회한다. ID=0인 여러 인원도 구분한다.
+async function loadProposalPhotos(pages) {
+  const people = pages.flatMap(pg => Object.values(pg.slotPeople))
+  const key = p => String(p.name || '').trim()
+  const names = [...new Set(people.map(key).filter(n => n && !/^TBD\d*$/i.test(n)))]
+  const results = new Map()
+  for (let start = 0; start < names.length; start += 100) {
+    const batch = names.slice(start, start + 100)
+    try {
+      const res = await fetch('/api/personnel/photo-images', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ names: batch }),
+      })
+      if (!res.ok) throw new Error('HTTP ' + res.status)
+      const json = await res.json()
+      if (!json.ok || !Array.isArray(json.results)) throw new Error('응답 형식 오류')
+      for (const row of json.results) results.set(row.name, row)
+    } catch {
+      for (const name of batch) results.set(name, { ok: false, error: 'photo_api_error' })
+    }
+  }
+  const warnings = new Map()
+  const labels = {
+    nas_not_configured: 'NAS 환경변수 미설정',
+    nas_connection_error: 'NAS 연결 실패/시간 초과',
+    nas_http_error: 'NAS HTTP 오류',
+    nas_error: 'NAS 조회 실패',
+    nas_invalid_response: 'NAS 응답 형식 오류',
+    nas_invalid_image: 'NAS 사진 형식 오류',
+    photo_path_not_found: 'NAS 사진 파일/경로 확인 필요',
+    photo_api_error: '사진 API 조회 실패',
+    invalid_name: '사진 조회 이름 확인 필요',
+  }
+  for (const p of people) {
+    // 이전 생성의 사진이 조회 실패 후에도 남아 있지 않게 초기화한다.
+    delete p.photoArrayBuffer
+    const name = key(p)
+    const row = results.get(name)
+    if (row?.ok && /^data:image\/png;base64,/.test(row.dataUri || '')) {
+      try {
+        const bin = atob(row.dataUri.split(',')[1])
+        if (!bin.length) throw new Error('empty image')
+        const bytes = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+        p.photoArrayBuffer = bytes.buffer
+        continue
+      } catch { /* 잘못된 이미지도 조회 실패로 보고한다. */ }
+    }
+    const label = /^TBD\d*$/i.test(name) ? '미정 인력 (사진 조회 제외)'
+      : (labels[row?.error] || '사진 데이터 확인 필요')
+        + (row?.stage ? ' / ' + row.stage : '')
+        + (Number.isInteger(row?.code) ? ' (코드 ' + row.code + ')' : '')
+    if (!warnings.has(label)) warnings.set(label, new Set())
+    warnings.get(label).add(name || '(이름 없음)')
+  }
+  return [...warnings].map(([label, names]) => label + ' — 기존 대체 이미지 사용: ' + [...names].join(', '))
+}
+
 async function downloadPhotoAssignPptx(btn, opts) {
   opts = opts || {}
   if (typeof JSZip === 'undefined') { alert('JSZip 라이브러리 로딩 중입니다. 잠시 후 다시 시도해주세요.'); return null }
@@ -2793,7 +2851,7 @@ async function downloadPhotoAssignPptx(btn, opts) {
     const proposalId = parsedData.proposalId || 0
     const allPeople = []
     pages.forEach(pg => Object.values(pg.slotPeople).forEach(p => {
-      if (!allPeople.find(x => x.personnelId === p.personnelId)) allPeople.push(p)
+      if (!allPeople.find(x => x.personnelId === p.personnelId && x.name === p.name)) allPeople.push(p)
     }))
     const profileMap = {}
     await Promise.all(
@@ -2819,35 +2877,8 @@ async function downloadPhotoAssignPptx(btn, opts) {
       })
     })
 
-    // ── 증명사진 로드: NAS photo-image API 병렬 호출 ──────────────
-    // 각 인원의 personnelId로 /api/personnel/:id/photo-image 호출 → ArrayBuffer 주입
-    await Promise.all(
-      allPeople
-        .filter(p => p.personnelId)
-        .map(async p => {
-          try {
-            const res = await fetch(`/api/personnel/${p.personnelId}/photo-image`)
-            if (res.ok) {
-              const json = await res.json()
-              if (json.ok && json.dataUri) {
-                // data URI → ArrayBuffer 변환
-                const b64 = json.dataUri.replace(/^data:[^;]+;base64,/, '')
-                const bin = atob(b64)
-                const bytes = new Uint8Array(bin.length)
-                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-                p.photoArrayBuffer = bytes.buffer
-              }
-            }
-          } catch (e) { console.warn('photo-image 로드 실패:', p.name, e) }
-        })
-    )
-    // slotPeople에 photoArrayBuffer 주입
-    pages.forEach(pg => {
-      Object.values(pg.slotPeople).forEach(p => {
-        const found = allPeople.find(x => x.personnelId === p.personnelId)
-        if (found && found.photoArrayBuffer) p.photoArrayBuffer = found.photoArrayBuffer
-      })
-    })
+    // 사진은 이름 기준 일괄 조회: NAS 로그인 1회, 다운로드 동시성 제한.
+    const photoWarnings = await loadProposalPhotos(pages)
 
     // ── templateZips 로드 ──
     // PptMenuRegistry에서 AUDITOR_PROFILE 메뉴의 PERSON_2/4/6/9 템플릿 로드
@@ -2893,15 +2924,12 @@ async function downloadPhotoAssignPptx(btn, opts) {
     }
 
     const zip = await buildPhotoPptxFromTemplate(pages, templateZips)
-    if (opts.returnZip) {
-      const warnings = []
-      const people = pages.flatMap(pg => Object.values(pg.slotPeople))
-      const missingProfiles = [...new Set(people.filter(p => !p.personnelId || !profileMap[p.personnelId]).map(p => p.name))]
-      const missingPhotos = [...new Set(people.filter(p => !p.photoArrayBuffer).map(p => p.name))]
-      if (missingProfiles.length) warnings.push('프로파일 확인 필요: ' + missingProfiles.join(', '))
-      if (missingPhotos.length) warnings.push('실제 사진 없음 (기존 대체 이미지 사용): ' + missingPhotos.join(', '))
-      return { zip, warnings }
-    }
+    const warnings = [...photoWarnings]
+    const people = pages.flatMap(pg => Object.values(pg.slotPeople))
+    const missingProfiles = [...new Set(people.filter(p => !p.personnelId || !profileMap[p.personnelId]).map(p => p.name))]
+    if (missingProfiles.length) warnings.push('프로파일 확인 필요: ' + missingProfiles.join(', '))
+    if (opts.returnZip) return { zip, warnings }
+    if (warnings.length && !confirm('사진장표 검토 필요:\n' + warnings.join('\n') + '\n대체 이미지가 포함된 검토용 파일을 다운로드할까요?')) return null
 
     const today = new Date().toISOString().slice(0, 10)
     const blob = await zip.generateAsync({

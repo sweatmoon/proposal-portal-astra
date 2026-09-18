@@ -394,55 +394,126 @@ export async function fetchPersonalStampPngs(personNames: string[]): Promise<Map
 // 파일명 패턴: "증명사진(이름).png" (2026-09-14 사용자 확인)
 const PHOTO_FOLDER = '/activo/04.제안팀/99.악티보포털참조용/02.제안/04.증명사진'
 
-/**
- * 인력 이름 목록으로 증명사진 PNG를 NAS에서 한 번에 찾아 반환합니다.
- * (이름 → Buffer | null, 못 찾은 사람은 null)
- *
- * 파일명 패턴: "증명사진(이름).png"
- * 로그인/로그아웃은 전체 목록에 대해 1회만 수행하고, 폴더 목록도 1회만 조회해서
- * 이름별로 필터링합니다(fetchPersonalStampPngs와 동일한 패턴).
- *
- * NAS 연동이 실패해도 예외를 던지지 않고 전원 null로 채워 반환합니다 —
- * 사진을 못 구해도 PPT 생성 자체는 막지 않기 위함입니다.
- */
-export async function fetchPersonnelPhotos(personNames: string[]): Promise<Map<string, Buffer | null>> {
-  const result = new Map<string, Buffer | null>(personNames.map(name => [name, null]))
-  if (!NAS_BASE_URL || !NAS_USERNAME || !NAS_PASSWORD) {
-    console.warn('[nas-client] NAS_BASE_URL/NAS_USERNAME/NAS_PASSWORD 환경변수가 없어 증명사진 조회를 건너뜁니다.')
-    return result
-  }
+export type PersonnelPhotoResult = {
+  name: string
+  ok: boolean
+  dataUri?: string
+  error?: string
+  stage?: string
+  code?: number
+}
 
-  let sid: string
+export function validPhotoName(name: unknown): name is string {
+  return typeof name === 'string' && name.trim().length > 0 && name.length <= 100
+    && !/[\\/\\\\\x00-\x1f\x7f]/.test(name) && !name.includes('..')
+}
+
+class PhotoNasError extends Error {
+  constructor(public stage: string, public code?: number, public kind = 'nas_error') {
+    // URL, 비밀번호, SID, NAS 응답 원문은 로그/응답에 노출하지 않는다.
+    super(`사진 NAS ${stage} 실패 (${kind}${code === undefined ? '' : ': ' + code})`)
+  }
+}
+
+async function photoRequest(params: Record<string, string>, stage: string): Promise<Buffer> {
   try {
-    sid = await login()
+    const res = await fetch(`${NAS_BASE_URL}/webapi/entry.cgi`, {
+      method: 'POST', body: new URLSearchParams(params), signal: AbortSignal.timeout(15000),
+    })
+    if (!res.ok) throw new PhotoNasError(stage, res.status, 'nas_http_error')
+    return Buffer.from(await res.arrayBuffer())
   } catch (e) {
-    console.warn('[nas-client] NAS 로그인 실패:', (e as Error).message)
-    return result
+    if (e instanceof PhotoNasError) throw e
+    throw new PhotoNasError(stage, undefined, 'nas_connection_error')
   }
+}
 
-  try {
-    // 폴더 목록 1회 조회 → 이름별로 재사용
-    let files: { name: string; isdir: boolean }[] = []
+function photoJson(buf: Buffer, stage: string) {
+  let json
+  try { json = JSON.parse(buf.toString('utf8')) } catch { throw new PhotoNasError(stage, undefined, 'nas_invalid_response') }
+  if (!json || json.success !== true) {
+    const code = typeof json?.error?.code === 'number' ? json.error.code : undefined
+    throw new PhotoNasError(stage, code)
+  }
+  return json
+}
+
+// 동시에 시작된 사진 생성 요청도 로그인/로그아웃이 겹치지 않게 처리한다.
+// 데이터 캐시가 아닌 실행 잠금이며 파일·인력 데이터는 요청 종료 후 보관하지 않는다.
+let photoQueue: Promise<unknown> = Promise.resolve()
+export function fetchPersonnelPhotoResults(personNames: string[]): Promise<PersonnelPhotoResult[]> {
+  const names = [...new Set(personNames.map(n => n.trim()))]
+  const task = photoQueue.then(() => loadPersonnelPhotoResults(names))
+  photoQueue = task.catch(() => {})
+  return task
+}
+
+async function loadPersonnelPhotoResults(names: string[]): Promise<PersonnelPhotoResult[]> {
+  const results = new Map<string, PersonnelPhotoResult>()
+  for (const name of names) {
+    if (!validPhotoName(name)) results.set(name, { name, ok: false, error: 'invalid_name' })
+  }
+  if (!NAS_BASE_URL || !NAS_USERNAME || !NAS_PASSWORD) {
+    return names.map(name => results.get(name) || { name, ok: false, error: 'nas_not_configured', stage: 'configuration' })
+  }
+  // 정해진 파일명을 직접 다운로드한다. 폴더 List 권한/목록 API 성공을 전제하지 않는다.
+  // 세션/네트워크 오류만 한 차례 재시도하고 성공한 인력은 다시 받지 않는다.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const pending = names.filter(name => {
+      const r = results.get(name)
+      return !r || (!r.ok && (r.error === 'nas_connection_error' || (r.stage === 'download' && [106, 107, 119].includes(r.code ?? 0))))
+    })
+    if (!pending.length) break
+    let sid: string | undefined
     try {
-      files = await listFolder(sid, PHOTO_FOLDER)
+      const auth = photoJson(await photoRequest({
+        api: 'SYNO.API.Auth', version: '6', method: 'login',
+        account: NAS_USERNAME, passwd: NAS_PASSWORD, session: 'FileStation', format: 'sid',
+      }, 'login'), 'login')
+      if (typeof auth.data?.sid !== 'string' || !auth.data.sid) throw new PhotoNasError('login', undefined, 'nas_invalid_response')
+      sid = auth.data.sid
+      let next = 0
+      await Promise.all(Array.from({ length: Math.min(3, pending.length) }, async () => {
+        while (next < pending.length) {
+          const name = pending[next++]
+          try {
+            const buf = await photoRequest({
+              api: 'SYNO.FileStation.Download', version: '2', method: 'download', mode: 'open',
+              path: JSON.stringify([`${process.env.NAS_PHOTO_FOLDER?.trim().replace(/\/$/, '') || PHOTO_FOLDER}/증명사진(${name}).png`]),
+              _sid: sid!,
+            }, 'download')
+            // JSON 오류가 text/plain으로 와도 이미지로 넣지 않는다.
+            if (!buf.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+              photoJson(buf, 'download')
+              throw new PhotoNasError('download', undefined, 'nas_invalid_image')
+            }
+            results.set(name, { name, ok: true, dataUri: `data:image/png;base64,${buf.toString('base64')}` })
+          } catch (e) {
+            const err = e instanceof PhotoNasError ? e : new PhotoNasError('download', undefined, 'nas_invalid_response')
+            // File Station 408만 명시적인 파일/경로 없음. 권한/세션 오류와 구분한다.
+            results.set(name, { name, ok: false, error: err.code === 408 && err.kind === 'nas_error' ? 'photo_path_not_found' : err.kind, stage: err.stage, code: err.code })
+            console.warn('[nas-client]', err.message)
+          }
+        }
+      }))
     } catch (e) {
-      console.warn('[nas-client] 증명사진 폴더 목록 조회 실패:', (e as Error).message)
+      const err = e instanceof PhotoNasError ? e : new PhotoNasError('login', undefined, 'nas_invalid_response')
+      for (const name of pending) results.set(name, { name, ok: false, error: err.kind, stage: err.stage, code: err.code })
+      console.warn('[nas-client]', err.message)
+    } finally {
+      if (sid) await photoRequest({ api: 'SYNO.API.Auth', version: '6', method: 'logout', session: 'FileStation', _sid: sid }, 'logout').catch(() => {})
     }
-
-    await Promise.all(
-      personNames.map(async name => {
-        // "증명사진(이름).png" 패턴으로 매칭
-        const target = files.find(f => f.name === `증명사진(${name}).png`)
-        if (!target) return
-        const buf = await downloadFile(sid, `${PHOTO_FOLDER}/${target.name}`)
-        if (buf) result.set(name, buf)
-      })
-    )
-  } finally {
-    await logout(sid)
   }
+  return names.map(name => results.get(name)!)
+}
 
-  return result
+/** 기존 첨부 호출자와의 호환용. 본문 API는 상세 오류가 포함된 결과를 사용한다. */
+export async function fetchPersonnelPhotos(personNames: string[]): Promise<Map<string, Buffer | null>> {
+  const rows = await fetchPersonnelPhotoResults(personNames)
+  return new Map(personNames.map(name => {
+    const row = rows.find(r => r.name === name.trim())
+    return [name, row?.dataUri ? Buffer.from(row.dataUri.split(',')[1], 'base64') : null]
+  }))
 }
 
 // 감리원 경력 확인서 발급요청 엑셀 템플릿 — 재직증명서 발행파일처럼 폴더가 아니라 파일
