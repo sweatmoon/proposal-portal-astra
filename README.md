@@ -1,21 +1,90 @@
-```txt
-npm install
-npm run dev
+# Proposal Portal Astra
+
+정보시스템 감리 제안팀의 인력·사업 조회, 본문 PPT 및 첨부서류 제작을 지원합니다.
+
+## 실행 환경과 연결 대상
+
+- GitHub: https://github.com/sweatmoon/proposal-portal-astra
+- 기존 Astra 운영 주소: https://proposal-portal-proposal-portal-astra.up.railway.app/
+- Hono + Node.js + PostgreSQL, Docker/Railway 배포
+- 사진·회사 증빙·인력 서류는 Synology NAS에서 조회
+- Cloudflare 관련 초기 파일이 남아 있으나 현재 실행 대상은 Node.js입니다.
+- 이번 변경은 로컬 개발 단계이며 GitHub 푸시·Railway 배포·운영 DB 변경은 하지 않았습니다.
+
+## 주요 경로
+
+- `/`: 현황 대시보드
+- `/proposals`, `/proposals/:id`: 사업 목록·상세, 본문 PPT 모달
+- `/personnel`, `/personnel/:id`: 인력·경력 조회
+- `/upload`: HTML 적재
+- `/ppt-templates`: 목차·템플릿 관리
+- `/ppt-generate`: 첨부서류 생성 (이번 수정 범위 외)
+- `/api/ppt-menus?category=proposal`: 본문 목차·등록 템플릿 조회
+- `/api/ppt-menus/master-templates/active`: 활성 마스터 조회
+- `/health`: 서버 상태
+
+## 이번 본문 PPT 개선
+
+- 사업 데이터에 대상사업명·기간, RFP 요구공수·단계·일수 전달
+- 감리원 MD를 단계별 인력 배정에서 합산하여 단계 전체공수와 중복 계산하지 않음
+- `public/static/proposal-template.js`: 본문 전용 XML 치환·계산·검증 모듈
+- 여러 텍스트 런에 나뉜 토큰과 반복 토큰을 처리하며 XML 특수문자·주변 문구 보존
+- 공통 `[제목]`, `[주관기관]`, `[감리사업명]`, 대상사업 토큰 연결
+- 일정 계획: 4개 일반 단계·상주/상시 1단계, 분야별 고정 슬롯, 시작월부터 5개월·연도 치환
+- 세부 일정: 업로드 양식 사용, 미사용 단계 블록 제거, 상주/상시·검수지원 구분, 배정 MD와 합계 반영
+- 예비조사·조치확인 일수는 MD로 임의 역산하지 않고 확인 필요 표시
+- 조치확인 인력: post MD가 있는 인력을 단계별 열에 배치, 최대 3단계·15명 초과 시 명시적 오류
+- 사진 장표의 기존 2/4/6/9인 슬롯·페이지 복제는 유지하며 프로파일/사진 누락 경고 추가
+- 목차별 생성·실패·미치환 결과 보고서, 부분 생성 초안 다운로드 확인
+- 오류 발생 시 다른 목차의 구형 합본으로 조용히 대체하지 않음
+- RFP 공수 비교 범위를 담당자가 선택하기 전에는 충족을 확정하지 않음
+- 인력 자격은 증빙 판단 로직이 없으므로 항상 검토 필요
+- 합본 시 미디어 ContentType·외부 링크 보존, 마스터 ID 충돌 방지
+
+## 사용 방법
+
+1. 인력·사업 HTML을 적재하고 사업 상세 화면을 엽니다.
+2. 자동화 PPT 모달에서 추가 단계와 사진 장표 구성을 선택합니다.
+3. RFP 최소공수의 비교 범위를 확인합니다. 미확정이면 요약표는 검토 필요입니다.
+4. 전체 합본 또는 등록 양식의 세부 일정을 생성합니다.
+5. 목차별 실패·미치환·검토 항목을 확인한 뒤 검토용 초안을 다운로드합니다.
+6. PowerPoint에서 고정 문구·사진·도식·표 넘침·RFP 근거를 최종 검수합니다.
+
+## 데이터 및 보안
+
+- PostgreSQL: 인력·경력·사업·단계 배정·본문 템플릿·생성규칙 저장
+- NAS: 사진·원본 증빙자료 조회
+- 본문 생성은 브라우저에서 처리하며 이 개선에 신규 DB 마이그레이션은 없습니다.
+- `DATABASE_URL`, `NAS_BASE_URL`, `NAS_USERNAME`, `NAS_PASSWORD`는 Railway Variables 또는 로컬 `.env`에서 관리합니다. 저장소에 자격증명을 커밋하지 마세요.
+- 사용자가 정상화한 Astra DB 스키마는 이번 작업에서 변경하지 않았습니다. 저장소의 기존 스키마만으로 운영 DB를 재생성하지 말고 차이를 먼저 확인하세요.
+
+## 아직 미완성인 범위
+
+- 모든 38개 목차의 사업별 동적 작성은 완성되지 않았습니다.
+- 미등록 템플릿 목차는 결과 목록에서 실패로 표시합니다.
+- `MANPOWER_MD`는 기존 인력 실적표를 공수표라고 출력하지 않고 미구현으로 보고합니다. 공수표 전용 양식·생성기 연결이 다음 작업입니다.
+- 일정 도식의 막대·화살표 위치와 고정 수행기한 문구는 자동 수정하지 않습니다.
+- 현재 고정 양식 용량 초과는 데이터를 자르지 않고 오류로 알립니다. 임의 양식 확장은 하지 않습니다.
+- 조직도·비율·총괄 요건·교육·회사 실적 등 남은 목차의 규칙 확정과 구현이 필요합니다.
+- 전체 사업의 RFP 해석, 자격·증빙 판정, PowerPoint 시각 검수는 자동 검증 범위가 아닙니다.
+- 템플릿 메뉴 API의 Base64 일괄 로드는 유지됩니다. 필요 시 로드 방식은 후속 최적화 대상입니다.
+- 기존 사진·경력 장표 전체의 디자인·데이터 의미 검증은 별도입니다.
+
+## 개발 및 검증
+
+```sh
+npm ci
+npm test
+npm run build
 ```
 
-```txt
-npm run deploy
-```
+`npm test`는 합성 데이터와 메모리 내 PPTX를 사용하며 운영 DB나 NAS를 변경하지 않습니다. XML 파서는 개발 테스트에만 사용됩니다.
 
-[For generating/synchronizing types based on your Worker configuration run](https://developers.cloudflare.com/workers/wrangler/commands/#types):
+수동 추가 확인: Astra 운영 템플릿을 GET으로만 읽고 합성 인력을 적용하여 사진·경력 장표를 제외한 20개 목차의 치환·XML 파싱을 확인했습니다. 실제 PowerPoint 렌더링 검수와는 다릅니다.
 
-```txt
-npm run cf-typegen
-```
+## 배포 및 다음 단계
 
-Pass the `CloudflareBindings` as generics when instantiation `Hono`:
-
-```ts
-// src/index.ts
-const app = new Hono<{ Bindings: CloudflareBindings }>()
-```
+- Dockerfile이 TypeScript를 컴파일하고 정적 파일을 `dist/static`에 복사합니다.
+- GitHub 연결 배포가 활성화된 경우 푸시가 Railway 배포를 유발할 수 있습니다. 별도 승인 전 푸시하지 않습니다.
+- 배포 전: 담당자 검증용 사업 선정 → 생성 결과 시각 검수 → 미등록 양식/규칙 확정 → 승인 후 Astra에만 반영.
+- 원본 `sweatmoon/proposal-portal` 및 원본 production DB는 변경 대상이 아닙니다.

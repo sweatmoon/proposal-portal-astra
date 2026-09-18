@@ -2893,7 +2893,15 @@ async function downloadPhotoAssignPptx(btn, opts) {
     }
 
     const zip = await buildPhotoPptxFromTemplate(pages, templateZips)
-    if (opts.returnZip) return { zip }
+    if (opts.returnZip) {
+      const warnings = []
+      const people = pages.flatMap(pg => Object.values(pg.slotPeople))
+      const missingProfiles = [...new Set(people.filter(p => !p.personnelId || !profileMap[p.personnelId]).map(p => p.name))]
+      const missingPhotos = [...new Set(people.filter(p => !p.photoArrayBuffer).map(p => p.name))]
+      if (missingProfiles.length) warnings.push('프로파일 확인 필요: ' + missingProfiles.join(', '))
+      if (missingPhotos.length) warnings.push('실제 사진 없음 (기존 대체 이미지 사용): ' + missingPhotos.join(', '))
+      return { zip, warnings }
+    }
 
     const today = new Date().toISOString().slice(0, 10)
     const blob = await zip.generateAsync({
@@ -2919,139 +2927,46 @@ async function downloadPhotoAssignPptx(btn, opts) {
 // ── 요약표 PPT ──────────────────────────────────────────────
 async function downloadSummaryTablePptx(btn, opts) {
   opts = opts || {}
-  if (typeof PptxGenJS === 'undefined') { alert('PPT 라이브러리 로딩 중입니다.'); return null }
+  if (typeof PptxGenJS === 'undefined') throw new Error('PPT 라이브러리를 불러오지 못했습니다.')
   setBtnState(btn, true)
   try {
-    const extraSet = getExtraSet()
-    const { stages } = parsedData
-    const extraStages = stages.filter(s => extraSet.has(s.stage))
-    const baselineStages = stages.filter(s => !extraSet.has(s.stage))
-    const baselineMD = baselineStages.reduce((s, st) => s + (st['감리원'] ? st['감리원'].total : 0), 0)
-    const extraMD = extraStages.reduce((s, st) => s + (st['감리원'] ? st['감리원'].total : 0), 0)
-    let expertMD = 0, testerMD = 0
-    stages.forEach(s => (s['전문가'] ? s['전문가'].people : []).forEach(p => {
-      const md = p.pre + p.audit + p.post
-      const grp = (parsedData.personGradeMap[p.name] || {}).group || ''
-      if (grp === '테스터') testerMD += md; else expertMD += md
-    }))
-    const totalMD = baselineMD + extraMD + expertMD + testerMD
-    const baselineNames = baselineStages.map(s => s.stage)
-    const baselineDaysSum = baselineStages.reduce((s, st) => s + (st.days || 0), 0)
-    const extraNames = extraStages.map(s => s.stage)
+    const ctx = ProposalTemplate.context(parsedData, ProposalTemplate.options())
+    const checks = ProposalTemplate.checks(ctx)
     const pres = new PptxGenJS(); pres.layout = 'LAYOUT_WIDE'
-    const FONT_BOLD = 'KoPub돋움체 Bold', FONT_MEDIUM = 'KoPub돋움체 Medium'
-    const bd = { pt: 0.5, color: 'BFBFBF' }, bd0 = { type: 'none' }
-    const bMid = [bd, bd, bd, bd], bLeft = [bd, bd, bd, bd0], bRight = [bd, bd0, bd, bd]
-    const colW = [1.2, 2.3, 0.8, 5.3]
-    const base = e => Object.assign({ fontFace: FONT_MEDIUM, fontSize: 10, color: '222222', valign: 'middle', margin: [0.04, 0.04, 0.04, 0.1] }, e)
-    const headOpt = { fontFace: FONT_BOLD, fontSize: 11, color: '222222', bold: true, fill: { color: 'D2F0FF' }, align: 'center', valign: 'middle', margin: [0.04, 0.04, 0.04, 0.04] }
-    const fulfillOpt = { fontFace: FONT_BOLD, fontSize: 12, color: 'FFFFFF', bold: true, fill: { color: '1482CD' }, align: 'center', valign: 'middle' }
-    const mdText = '감리원: ' + baselineMD + (extraMD > 0 ? ' + 추가 ' + extraMD : '') + ' MD\n전문가: ' + expertMD + ' MD\n테스터: ' + testerMD + ' MD\n합계: ' + totalMD + ' MD'
-    const methodText = baselineNames.length + '단계 감리 (현장감리 ' + baselineDaysSum + '일)' + (extraNames.length > 0 ? ' + 추가 단계: ' + extraNames.join(', ') : '')
-    const tRows = [
-      [{ text: '요청 구분', options: Object.assign({}, headOpt, { border: bLeft }) }, { text: '제안요청 내용 (RFP)', options: Object.assign({}, headOpt, { border: bMid }) }, { text: '충족 여부', options: Object.assign({}, headOpt, { border: bMid }) }, { text: '제안 내역', options: Object.assign({}, headOpt, { border: bRight }) }],
-      [{ text: '감리 방법 및 일수', options: base({ bold: true, align: 'center', fill: { color: 'F2F2F2' }, border: bLeft }) }, { text: baselineNames.length + '단계 감리 실시\n최소 감리 일수: ' + baselineDaysSum + '일', options: base({ align: 'l', border: bMid }) }, { text: '충족', options: Object.assign({}, fulfillOpt, { border: bMid }) }, { text: methodText, options: base({ align: 'l', border: bRight }) }],
-      [{ text: '투입 공수', options: base({ bold: true, align: 'center', fill: { color: 'F2F2F2' }, border: bLeft }) }, { text: '요청 공수 이상 투입', options: base({ align: 'l', border: bMid }) }, { text: '충족', options: Object.assign({}, fulfillOpt, { border: bMid }) }, { text: mdText, options: base({ align: 'l', border: bRight }) }],
-      [{ text: '감리 인력', options: base({ bold: true, align: 'center', fill: { color: 'F2F2F2' }, border: bLeft }) }, { text: '요건에 맞는 감리원 구성', options: base({ align: 'l', border: bMid }) }, { text: '충족', options: Object.assign({}, fulfillOpt, { border: bMid }) }, { text: computeAssignRows().map(r => r.grade + ' ' + r.name + ' (' + (r.field || '분야미상') + ')').join('\n'), options: base({ align: 'l', border: bRight }) }],
-    ]
-    const rowH = [0.22, 0.8, 0.8, Math.max(0.8, computeAssignRows().length * 0.22)]
-    const sld = pres.addSlide()
-    sld.addTable(tRows, { x: 1.8, y: 1.4, w: colW.reduce((a, b) => a + b, 0), colW, rowH })
+    const slide = pres.addSlide()
+    slide.addText('주관기관 요청사항 준수 여부 — 입력값 기준 검토', { x: 0.5, y: 0.35, w: 12, h: 0.5, fontFace: 'KoPub돋움체 Bold', fontSize: 19 })
+    const header = ['요청 구분', '제안요청 내용 (RFP)', '판정', '제안 내역 / 확인 사항']
+      .map(text => ({ text, options: { bold: true, fill: 'D2F0FF', color: '222222' } }))
+    const rows = [header, ...checks.map(c => [c.label, c.required,
+      { text: c.status, options: { bold: true, color: c.status === '미충족' ? 'B91C1C' : c.status === '검토 필요' ? '92400E' : '166534' } }, c.actual])]
+    slide.addTable(rows, { x: 0.5, y: 1.15, w: 12.3, colW: [1.8, 3.0, 1.2, 6.3],
+      fontFace: 'KoPub돋움체 Medium', fontSize: 12, border: { pt: 0.5, color: 'BFBFBF' },
+      margin: 0.12, rowH: 0.75, valign: 'mid', autoPage: true, autoPageRepeatHeader: true })
+    slide.addText('충족은 선택한 범위의 숫자 비교 결과입니다. RFP 해석·증빙·인력 자격은 담당자 최종 확인이 필요합니다.',
+      { x: 0.5, y: 6.8, w: 12.3, h: 0.35, fontSize: 10, color: '92400E' })
+    const warnings = [...ctx.warnings, ...checks.filter(c => c.status !== '충족').map(c => `${c.label}: ${c.status} (${c.required})`)]
     if (opts.returnZip) {
-      const ab = await pres.write({ outputType: 'arraybuffer' })
-      const z = new JSZip(); await z.loadAsync(ab); return { zip: z }
+      const zip = await JSZip.loadAsync(await pres.write({ outputType: 'arraybuffer' }))
+      return { zip, warnings, mergeStrategy: 'FOREIGN_TEMPLATE' }
     }
-    await pres.writeFile({ fileName: '요약표_' + (parsedData.projectTitle || '').slice(0, 10) + '.pptx' })
-    showAutoAlert('✅ 요약표 생성 완료', true)
-    return null
-  } catch (e) { showAutoAlert('❌ 생성 실패: ' + e.message, false); return null }
-  finally { setBtnState(btn, false) }
+    await pres.writeFile({ fileName: '검토용_요약표_' + (parsedData.projectTitle || '').slice(0, 10) + '.pptx' })
+    showAutoAlert('검토용 요약표를 생성했습니다. RFP 비교 범위와 판정 근거를 확인하세요.', false)
+  } catch (e) {
+    showAutoAlert('요약표 생성 실패: ' + e.message, false)
+    if (opts.returnZip) throw e
+  } finally { setBtnState(btn, false) }
 }
 
 // ── 전체 합본 PPT ───────────────────────────────────────────
 // ppt-engine.js의 generateProposalPpt()를 우선 사용하고,
-// 메뉴 DB가 없거나 실패 시 레거시 고정 순서 방식으로 fallback
+// 오류를 숨기는 레거시 fallback 없이 결과 보고서를 표시
 async function downloadAllPptx(btn) {
-  if (typeof PptxGenJS === 'undefined' || typeof JSZip === 'undefined') { alert('PPT 라이브러리 로딩 중입니다. 잠시 후 다시 시도해주세요.'); return }
-  setBtnState(btn, true)
-  showAutoAlert('⏳ 생성 중... 완료될 때까지 잠시 기다려주세요.', false)
-  try {
-    // ── 메뉴 기반 Composer 시도 ─────────────────────────────────
-    let usedMenuComposer = false
-    if (typeof generateProposalPpt === 'function') {
-      try {
-        const vm = typeof buildProjectViewModel === 'function' ? buildProjectViewModel(parsedData) : null
-        const finalZip = await generateProposalPpt(vm)
-        const blob = await finalZip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', compression: 'DEFLATE', compressionOptions: { level: 6 } })
-        const d = new Date()
-        const dateStr = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0')
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a'); a.href = url; a.download = '자동화PPT_' + (parsedData.projectTitle || '').slice(0, 10) + '_' + dateStr + '.pptx'; a.click()
-        setTimeout(() => URL.revokeObjectURL(url), 2000)
-        showAutoAlert('✅ 자동화 PPT 생성 완료!', true)
-        usedMenuComposer = true
-      } catch (menuErr) {
-        console.warn('[downloadAllPptx] 메뉴 Composer 실패 → 레거시 방식으로 fallback:', menuErr.message)
-      }
-    }
-    if (usedMenuComposer) return
-
-    // ── 레거시 고정 순서 방식 (fallback) ────────────────────────
-    const parts = await Promise.all([
-      downloadDetailSchedule1Pptx(null, { returnZip: true }),
-      downloadAssignPptx(null, { returnZip: true }),
-      downloadPhotoAssignPptx(null, { returnZip: true }),
-      downloadSummaryTablePptx(null, { returnZip: true }),
-    ])
-    const usable = parts.filter(p => p && p.zip)
-    if (!usable.length) { showAutoAlert('❌ 생성할 슬라이드가 없습니다.', false); return }
-    const baseZip = usable[0].zip
-    let presXml = await baseZip.file('ppt/presentation.xml').async('string')
-    let presRelsXml = await baseZip.file('ppt/_rels/presentation.xml.rels').async('string')
-    let ctXml = await baseZip.file('[Content_Types].xml').async('string')
-    let maxRid = 0; presRelsXml.replace(/Id="rId(\d+)"/g, (_, n) => { maxRid = Math.max(maxRid, +n); return _ })
-    let maxSldId = 255; presXml.replace(/<p:sldId id="(\d+)"/g, (_, n) => { maxSldId = Math.max(maxSldId, +n); return _ })
-    let newRels = '', newIds = '', newCt = '', sc = 0
-    for (let i = 1; i < usable.length; i++) {
-      const srcZip = usable[i].zip
-      const srcRelsXml = await srcZip.file('ppt/_rels/presentation.xml.rels').async('string')
-      const relMap = {}
-      srcRelsXml.replace(/<Relationship\b[^>]*\/>/g, tag => {
-        const id = tag.match(/\bId="([^"]+)"/)?.[1]
-        const tgt = tag.match(/\bTarget="([^"]+)"/)?.[1]
-        const type = tag.match(/\bType="([^"]+)"/)?.[1] || ''
-        if (id && tgt && type.includes('slide') && !type.includes('slideLayout') && !type.includes('slideMaster')) relMap[id] = tgt
-        return tag
-      })
-      for (const [, tgt] of Object.entries(relMap)) {
-        const xml = await srcZip.file('ppt/' + tgt).async('string').catch(() => null)
-        if (!xml) continue
-        const relsPath = 'ppt/' + tgt.replace(/([^/]+)$/, '_rels/$1.rels')
-        const rels = await srcZip.file(relsPath).async('string').catch(() => null)
-        const newName = 'slideM' + (++sc) + '.xml'
-        baseZip.file('ppt/slides/' + newName, xml)
-        if (rels) baseZip.file('ppt/slides/_rels/' + newName + '.rels', rels)
-        const rid = 'rId' + (++maxRid); const sldId = ++maxSldId
-        newRels += '<Relationship Id="' + rid + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/' + newName + '"/>'
-        newIds += '<p:sldId id="' + sldId + '" r:id="' + rid + '"/>'
-        newCt += '<Override PartName="/ppt/slides/' + newName + '" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
-      }
-    }
-    presRelsXml = presRelsXml.replace('</Relationships>', newRels + '</Relationships>')
-    presXml = presXml.replace('</p:sldIdLst>', newIds + '</p:sldIdLst>')
-    ctXml = ctXml.replace('</Types>', newCt + '</Types>')
-    baseZip.file('ppt/presentation.xml', presXml)
-    baseZip.file('ppt/_rels/presentation.xml.rels', presRelsXml)
-    baseZip.file('[Content_Types].xml', ctXml)
-    const blob = await baseZip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', compression: 'DEFLATE', compressionOptions: { level: 6 } })
-    const url = URL.createObjectURL(blob)
-    const d = new Date()
-    const dateStr = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0')
-    const a = document.createElement('a'); a.href = url; a.download = '자동화PPT_' + (parsedData.projectTitle || '').slice(0, 10) + '_' + dateStr + '.pptx'; a.click()
-    setTimeout(() => URL.revokeObjectURL(url), 2000)
-    showAutoAlert('✅ 자동화 PPT 생성 완료!', true)
-  } catch (e) { showAutoAlert('❌ 생성 실패: ' + e.message, false); console.error(e) }
-  finally { setBtnState(btn, false) }
+  if (typeof downloadProposalPpt !== 'function') {
+    showAutoAlert('본문 생성 엔진을 불러오지 못했습니다. 새로고침 후 다시 시도하세요.', false)
+    return
+  }
+  // 실패를 숨기고 다른 목차로 만드는 레거시 합본 fallback은 사용하지 않는다.
+  return downloadProposalPpt(btn)
 }
 
 // ── 인원 상세 모달 ──────────────────────────────────────────

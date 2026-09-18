@@ -446,13 +446,15 @@ app.get('/proposals/:id', async (c) => {
         return {
             stage: String(ph.phase_name ?? ''),
             date: `${ph.phase_start_date ?? ''} ~ ${ph.phase_end_date ?? ''}`,
+            startDate: String(ph.phase_start_date ?? ''),
+            endDate: String(ph.phase_end_date ?? ''),
             days: ph.phase_days != null ? Number(ph.phase_days) : null,
             감리원: aPeople.length ? {
                 count: aPeople.length,
                 pre: sumMD(auditors, 'pre_survey_md'),
                 audit: sumMD(auditors, 'audit_md'),
                 post: sumMD(auditors, 'action_confirm_md'),
-                total: Number(ph.proposed_md ?? 0),
+                total: sumMD(auditors, 'pre_survey_md') + sumMD(auditors, 'audit_md') + sumMD(auditors, 'action_confirm_md'),
                 people: aPeople,
             } : null,
             전문가: ePeople.length ? {
@@ -511,7 +513,7 @@ app.get('/proposals/:id', async (c) => {
     // JSON 직렬화 (클라이언트에 전달)
     // </script> 문자열이 JSON 값 안에 있으면 브라우저가 스크립트 태그를 조기 종료하므로
     // 반드시 <\/script> 로 이스케이프 처리해야 함
-    const safeJSON = (v) => JSON.stringify(v).replace(/<\/script>/gi, '<\\/script>').replace(/<!--/g, '<\\!--');
+    const safeJSON = (v) => JSON.stringify(v).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
     const stagesJSON = safeJSON(stages);
     const personFieldMapJSON = safeJSON(personFieldMap);
     const personGradeMapJSON = safeJSON(personGradeMap);
@@ -519,7 +521,13 @@ app.get('/proposals/:id', async (c) => {
     const personnelIdMapJSON = safeJSON(personnelIdMap);
     const projectDataJSON = safeJSON({
         projectTitle: String(project.project_name ?? ''),
-        requestMD: 0, requestStageCount: 0, requestAuditDays: 0,
+        requestMD: project.required_md ?? null,
+        requestStageCount: project.required_phases ?? null,
+        requestAuditDays: project.required_audit_days ?? null,
+        proposedMD: project.proposed_md ?? null,
+        targetProjectName: String(project.target_project_name ?? ''),
+        targetStartDate: String(project.target_period_start ?? ''),
+        targetEndDate: String(project.target_period_end ?? ''),
         clientOrg: String(project.client_org ?? ''),
         pmName: String(project.director ?? ''),
     });
@@ -919,8 +927,17 @@ app.get('/proposals/:id', async (c) => {
     <div style="background:#fff;border-radius:12px;max-width:600px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;position:relative;box-shadow:0 8px 30px rgba(0,0,0,.25);font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
       <button onclick="closeAutoModal()" style="position:absolute;top:14px;right:16px;background:#e0e0e0;border:none;border-radius:50%;width:28px;height:28px;cursor:pointer;font-size:14px">✕</button>
       <h3 style="font-size:16px;font-weight:700;margin:0 0 6px;color:#1a2e4a">🛠️ 자동화 PPT 생성</h3>
-      <p style="font-size:13px;color:#666;margin:0 0 16px">세부감리일정(1,2) → 표장표 → 사진장표 → 요약표 순서로 하나의 PPT로 합쳐서 내려받습니다.</p>
-      <div id="autoModalAlertBox" style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:7px;font-size:13px;font-weight:600"></div>
+      <p style="font-size:13px;color:#666;margin:0 0 16px">활성화된 본문 목차 순서로 생성합니다. 누락·미치환·검토 항목을 확인한 뒤 초안을 다운로드하세요.</p>
+      <div id="autoModalAlertBox" role="status" style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:7px;font-size:13px;font-weight:600"></div>
+      <section id="proposal-generation-report" aria-live="polite" hidden style="margin-bottom:12px;padding:12px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;font-size:12px"></section>
+      <label for="proposal-md-scope" style="display:block;font-size:13px;margin-bottom:12px">RFP 최소 공수 비교 범위 (담당자 확인)
+        <select id="proposal-md-scope" style="display:block;width:100%;padding:7px;margin-top:4px">
+          <option value="">미확정 — 충족 여부는 검토 필요</option>
+          <option value="baseline-auditors">기본 단계 감리원만 (추가 단계·전문가·테스터 제외)</option>
+          <option value="auditors">전체 감리원 (추가 단계 포함)</option>
+          <option value="all">전체 인력 (추가 단계·전문가·테스터 포함)</option>
+        </select>
+      </label>
       <div style="margin-bottom:16px;background:#f7f8fa;border-radius:8px;padding:12px">
         <b style="font-size:13px;color:#333">추가 제안 단계</b>
         <div style="font-size:12px;color:#666;margin-top:4px">RFP 최소 요건 이상으로 추가 제안한 단계를 선택하세요 (요약표에 반영됩니다)</div>
@@ -946,7 +963,7 @@ app.get('/proposals/:id', async (c) => {
       <details style="margin-top:4px">
         <summary style="cursor:pointer;color:#555;font-size:13px;font-weight:600;padding:4px 0">🔧 개별 생성</summary>
         <div style="margin-top:10px;display:flex;flex-direction:column;gap:10px">
-          <button onclick="downloadDetailSchedule1Pptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">📅 세부 감리 일정 (1, 2) 생성</button>
+          <button onclick="downloadProposalPpt(this, ['DETAIL_SCHEDULE'])" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">📅 세부 감리 일정 (1, 2) 생성</button>
           <button onclick="downloadAssignPptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">📋 표장표 생성</button>
           <button onclick="downloadPhotoAssignPptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">🖼️ 사진장표 생성</button>
           <button onclick="downloadSummaryTablePptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">📊 요약표 생성</button>
@@ -983,6 +1000,7 @@ app.get('/proposals/:id', async (c) => {
   <script src="https://cdn.jsdelivr.net/npm/pptxgenjs@4.0.1/dist/pptxgen.bundle.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <script src="/static/photo-template.b64.js"></script>
+  <script src="/static/proposal-template.js"></script>
   <script src="/static/ppt-engine.js"></script>
 
   <script>
@@ -991,12 +1009,7 @@ app.get('/proposals/:id', async (c) => {
   // ══════════════════════════════════════════════════════════
   var parsedData = {
     proposalId:    ${id},
-    projectTitle:  ${projectDataJSON}.projectTitle,
-    requestMD:     ${project.required_md ?? 0},
-    requestStageCount: 0,
-    requestAuditDays:  0,
-    clientOrg:     ${projectDataJSON}.clientOrg,
-    pmName:        ${projectDataJSON}.pmName,
+    ...${projectDataJSON},
     stages:        ${stagesJSON},
     personFieldMap:${personFieldMapJSON},
     personGradeMap:${personGradeMapJSON},

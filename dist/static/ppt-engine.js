@@ -33,17 +33,17 @@ function buildProjectViewModel(pd) {
   if (!pd) return null;
 
   // 인력을 역할별로 분류
-  const allMembers = (pd.portalOrder || []).map(({ name }) => {
+  const allMembers = (pd.portalOrder || []).map(({ name, expertSubGroup }) => {
     const info = pd.personGradeMap?.[name] || {};
     const field = pd.personFieldMap?.[name] || '';
     const group = info.group || '';
-    return { name, field, grade: info.grade || '', group, residency: info.residency || '', certNo: info.certNo || '' };
+    return { name, field, grade: info.grade || '', group, expertSubGroup: info.expertSubGroup || expertSubGroup || '', residency: info.residency || '', certNo: info.certNo || '' };
   });
 
-  const auditMembers   = allMembers.filter(m => !m.group || m.group === '감리원');
-  const coreExperts    = allMembers.filter(m => m.group === '핵심기술');
-  const requiredExperts = allMembers.filter(m => m.group === '필수기술');
-  const securityExperts = allMembers.filter(m => m.group === '보안');
+  const auditMembers   = allMembers.filter(m => !m.group || m.group === '감리원' || m.group === '감리원팀');
+  const coreExperts    = allMembers.filter(m => m.group === '핵심기술' || (m.group === '전문가' && !/필수|보안/.test(m.expertSubGroup)));
+  const requiredExperts = allMembers.filter(m => m.group === '필수기술' || /필수/.test(m.expertSubGroup));
+  const securityExperts = allMembers.filter(m => m.group === '보안' || /보안/.test(m.expertSubGroup));
   const testers        = allMembers.filter(m => m.group === '테스터');
 
   return {
@@ -90,7 +90,7 @@ const PptMenuRegistry = (() => {
   async function load(force = false) {
     if (_cache && !force) return _cache;
     if (_fetchPromise) return _fetchPromise;
-    _fetchPromise = fetch('/api/ppt-menus')
+    _fetchPromise = fetch('/api/ppt-menus?category=proposal')
       .then(r => r.json())
       .then(json => {
         if (!json.ok) throw new Error('메뉴 로드 실패: ' + json.error);
@@ -107,9 +107,8 @@ const PptMenuRegistry = (() => {
         const byCode = {};
         list.forEach(m => { if (m.rule) byCode[m.menu_code] = m; });
         _cache = { byCode, list, tree: json.data };
-        _fetchPromise = null;
         return _cache;
-      });
+      }).finally(() => { _fetchPromise = null; });
     return _fetchPromise;
   }
 
@@ -421,7 +420,7 @@ async function _mergeForeign({ baseZip, srcZip, srcPresXml, srcPresRels, counter
   // ── src ZIP 내 모든 ppt/ 파일 목록 ───────────────────────────────
   const srcFiles = {};  // { 'ppt/slides/slide1.xml': <ZipObject>, ... }
   srcZip.forEach((relPath, file) => {
-    if (relPath.startsWith('ppt/')) srcFiles[relPath] = file;
+    if (relPath.startsWith('ppt/') && !file.dir) srcFiles[relPath] = file;
   });
 
   // ── 파일명에 prefix 적용하는 헬퍼 ───────────────────────────────
@@ -451,15 +450,13 @@ async function _mergeForeign({ baseZip, srcZip, srcPresXml, srcPresRels, counter
     // Target="...slides/slide1.xml"             → "...slides/p1_slide1.xml"
     // Target="../media/image3.png"              → "../media/p1_image3.png"
     // (relative path 패턴도 처리)
-    return xml.replace(/Target="([^"]+)"/g, (match, target) => {
-      // http / 절대경로 스킵
-      if (target.startsWith('http') || target.startsWith('/')) return match;
-      // 이미 prefix 적용된 것 스킵
-      if (target.includes('/' + px) || target.startsWith(px)) return match;
-      // 마지막 / 뒤 파일명에 prefix 삽입
-      const slash = target.lastIndexOf('/');
-      if (slash < 0) return `Target="${px}${target}"`;
-      return `Target="${target.slice(0, slash + 1)}${px}${target.slice(slash + 1)}"`;
+    return xml.replace(/<Relationship\b[^>]*\/>/g, tag => {
+      if (/TargetMode="External"/.test(tag)) return tag;
+      return tag.replace(/Target="([^"]+)"/, (match, target) => {
+        if (/^[a-z][a-z0-9+.-]*:/i.test(target)) return match;
+        const slash = target.lastIndexOf('/');
+        return `Target="${target.slice(0, slash + 1)}${px}${target.slice(slash + 1)}"`;
+      });
     });
   }
 
@@ -498,8 +495,12 @@ async function _mergeForeign({ baseZip, srcZip, srcPresXml, srcPresRels, counter
       masterRids.push({ rid: newRid, target: prefixedTgt });
       presRelsXml = presRelsXml.replace('</Relationships>',
         `<Relationship Id="${newRid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="${prefixedTgt}"/></Relationships>`);
+      const masterIds = [...presXml.matchAll(/<p:sldMasterId\b[^>]*\bid="(\d+)"/g)].map(m => Number(m[1]));
+      const masterId = Math.max(2147483647, ...masterIds) + 1;
+      presXml = presXml.replace(/<p:sldMasterIdLst\s*\/>/, '<p:sldMasterIdLst></p:sldMasterIdLst>');
+      if (!presXml.includes('</p:sldMasterIdLst>')) presXml = presXml.replace(/(<p:presentation\b[^>]*>)/, '$1<p:sldMasterIdLst></p:sldMasterIdLst>');
       presXml = presXml.replace('</p:sldMasterIdLst>',
-        `<p:sldMasterId id="${700 + foreignPathMap._partCount * 10}" r:id="${newRid}"/></p:sldMasterIdLst>`);
+        `<p:sldMasterId id="${masterId}" r:id="${newRid}"/></p:sldMasterIdLst>`);
     }
     return tag;
   });
@@ -559,6 +560,19 @@ async function _mergeForeign({ baseZip, srcZip, srcPresXml, srcPresRels, counter
     if (ct) newCt += `<Override PartName="/${destPath}" ContentType="${ct}"/>`;
   }
 
+  // 이미지·차트·노트 등 원본 ContentType을 누락하지 않는다.
+  const sourceTypes = await srcZip.file('[Content_Types].xml').async('string');
+  for (const tag of sourceTypes.match(/<Default\b[^>]*\/>/g) || []) {
+    const extension = tag.match(/Extension="([^"]+)"/)?.[1];
+    if (extension && !ctXml.includes(`Extension="${extension}"`)) ctXml = ctXml.replace('</Types>', tag + '</Types>');
+  }
+  for (const tag of sourceTypes.match(/<Override\b[^>]*\/>/g) || []) {
+    const path = tag.match(/PartName="\/?([^"]+)"/)?.[1];
+    if (!path || !srcFiles[path]) continue;
+    const dest = '/' + prefixedPath(path);
+    if (!(ctXml + newCt).includes(`PartName="${dest}"`)) newCt += tag.replace(/PartName="[^"]+"/, `PartName="${dest}"`);
+  }
+
   // 카운터 공유
   Object.assign(_counters, { maxRid, maxSldId,
     masterIdx: counters.masterIdx, themeIdx: counters.themeIdx,
@@ -594,7 +608,9 @@ async function generateMenuPpt(menu, vm) {
 
     // ── 세부 감리 일정 ─────────────────────────────────────────────
     case 'DETAIL_SCHEDULE':
-      result = await downloadDetailSchedule1Pptx(null, { returnZip: true });
+    case 'SCHEDULE_PLAN':
+    case 'ACTION_CONFIRM_STAFF':
+      result = await ProposalTemplate.build(menu, vm);
       break;
 
     // ── 사진장표 3종 ───────────────────────────────────────────────
@@ -651,8 +667,9 @@ async function generateMenuPpt(menu, vm) {
     }
 
     // ── 기존 표장표 (감리원/전문가 통합 표) ───────────────────────
-    case 'ASSIGN_TABLE':          // 구버전 alias
-    case 'MANPOWER_MD': {
+    case 'MANPOWER_MD':
+      throw new Error('공수표 전용 생성기는 아직 연결되지 않았습니다. 인력 실적표로 대체하지 않습니다.');
+    case 'ASSIGN_TABLE': { // 기존 인력 소개 표만 명시적으로 지원
       const _tpls = Array.isArray(menu.templates) ? menu.templates : [];
       const _tpl  = _tpls.find(t => t.pptx_b64_key) || null;
       console.log('[PptEngine] MANPOWER_MD templates:', _tpls.length, '개, 템플릿 b64:', _tpl ? '있음(길이:'+_tpl.pptx_b64_key.length+')' : 'null');
@@ -667,98 +684,9 @@ async function generateMenuPpt(menu, vm) {
       result = await downloadSummaryTablePptx(null, { returnZip: true });
       break;
 
-    default: {
-      // ── 템플릿 파일 직접 합본 (데이터 연동 미구현 메뉴) ──────────
-      // menu.templates 배열에서 pptx_b64_key가 있는 첫 번째 템플릿을 사용
-      const tpls = Array.isArray(menu.templates) ? menu.templates : [];
-      const tpl  = tpls.find(t => t.pptx_b64_key) || null;
-      if (!tpl) {
-        console.warn('[PptEngine] 템플릿 없음 (건너뜀):', menu.menu_code, menu.menu_name);
-        return null;
-      }
-      try {
-        // base64 → Uint8Array → JSZip
-        const b64   = tpl.pptx_b64_key;
-        const bin   = atob(b64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        const zip = await JSZip.loadAsync(bytes);
-
-        // ── [제목] 플레이스홀더 → 목차명 치환 ──────────────────────
-        // 목차명: menu_number + menu_name (예: "1.1 감리 수행 소식")
-        const menuTitle = [menu.menu_number, menu.menu_name].filter(Boolean).join(' ');
-        const slideFiles2 = Object.keys(zip.files).filter(f => /^ppt\/slides\/slide\d+\.xml$/.test(f));
-        for (const slideFile of slideFiles2) {
-          let xml = await zip.file(slideFile).async('string');
-
-          // Case 1: 단일 런에 [제목] 그대로 있는 경우 (가장 빠른 경로)
-          if (xml.includes('[제목]')) {
-            xml = xml.replace(/\[제목\]/g, menuTitle);
-            zip.file(slideFile, xml);
-            console.log('[PptEngine] [제목] 단순치환:', slideFile);
-            continue;
-          }
-
-          // Case 2: 분산 런 — [, 제목, ] 가 각각 별개 <a:r>에 분리된 경우
-          // 핵심: <a:r> 먼저 분리 → <a:t>([^<]*)</a:t> 로 순수 텍스트 추출
-          // ※ [\s\S]*? 쓰면 <a:rPr> 내부 태그 텍스트까지 포함해 오동작함
-          if (xml.includes('제목')) {
-            const paraReg = /(<a:p\b[^>]*>)([\s\S]*?)(<\/a:p>)/g;
-            let changed = false;
-            xml = xml.replace(paraReg, (full, open, inner, close) => {
-              // ① <a:r> 단위 분리 + [^<]* 로 순수 텍스트만 추출
-              const runs = [];
-              inner.replace(/<a:r\b[\s\S]*?<\/a:r>/g, run => {
-                const t = run.match(/<a:t[^>]*>([^<]*)<\/a:t>/);
-                runs.push({ run, text: t ? t[1] : '' });
-              });
-              const concat = runs.map(r => r.text).join('');
-              if (!concat.includes('[제목]')) return full;
-
-              // ② 포지션 기반으로 [제목] 구간에 걸치는 런 식별
-              const jStart = concat.indexOf('[제목]');   // inclusive
-              const jEnd   = jStart + 4;                 // '[제목]'.length = 4 (chars: [,제,목,])
-
-              let pos = 0;
-              let firstJRun = true; // [제목] 구간 첫 런 여부
-              const newInner = inner.replace(/<a:r\b[\s\S]*?<\/a:r>/g, run => {
-                const t = run.match(/<a:t[^>]*>([^<]*)<\/a:t>/);
-                const txt = t ? t[1] : '';
-                const rStart = pos;
-                const rEnd   = pos + txt.length;
-                pos = rEnd;
-
-                // 텍스트 없는 런 → 그대로 유지
-                if (txt === '') return run;
-
-                const overlap = rEnd > jStart && rStart < jEnd;  // [제목] 구간과 겹치는가
-                if (!overlap) return run;                         // 무관 런 → 그대로
-
-                if (firstJRun) {
-                  // [제목] 구간의 첫 번째 런 → menuTitle 로 교체
-                  firstJRun = false;
-                  return run.replace(/<a:t([^>]*)>[^<]*<\/a:t>/, `<a:t$1>${menuTitle}</a:t>`);
-                }
-                // [제목] 구간의 나머지 런 → 제거
-                return '';
-              });
-
-              changed = true;
-              console.log('[PptEngine] [제목] 분산런 치환:', slideFile, '→', menuTitle);
-              return open + newInner + close;
-            });
-            if (changed) zip.file(slideFile, xml);
-          }
-        }
-
-        console.log('[PptEngine] 템플릿 삽입:', menu.menu_code, '-', tpl.pptx_file_path || tpl.template_name);
-        result = { zip, mergeStrategy: 'FOREIGN_TEMPLATE' };
-      } catch (e) {
-        console.error('[PptEngine] 템플릿 로드 실패:', menu.menu_code, e.message);
-        return null;
-      }
+    default:
+      result = await ProposalTemplate.build(menu, vm);
       break;
-    }
 
   }  // end switch
 
@@ -771,7 +699,7 @@ async function generateMenuPpt(menu, vm) {
     slideCount = (presXml.match(/<p:sldId\b/g) || []).length;
   } catch (_) { slideCount = 1; }
 
-  return { ...result, slideCount, mergeStrategy };
+  return { ...result, slideCount, mergeStrategy: result.mergeStrategy || mergeStrategy };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -788,61 +716,77 @@ async function generateMenuPpt(menu, vm) {
  * @param {object} vm - ProjectViewModel
  * @returns {Promise<JSZip>} 최종 합본 JSZip 객체
  */
-async function generateProposalPpt(vm) {
-  // 1. 메뉴 목록 로드
-  const registry = await PptMenuRegistry.load();
-  const enabledMenus = Object.values(registry.byCode)
-    .filter(m => m.is_enabled && m.rule)
-    .sort((a, b) => a.sort_order - b.sort_order);
-
-  if (!enabledMenus.length) throw new Error('활성화된 메뉴가 없습니다.');
-
-  // 2. 마스터 템플릿 로드 (활성화된 것이 있으면)
+async function generateProposalPpt(vm, selectedCodes = null) {
+  const report = { entries: [], warnings: [], status: '생성 중' };
+  let registry;
+  try { registry = await PptMenuRegistry.load(true); }
+  catch (error) { report.status = '생성 실패'; report.warnings.push(error.message); renderProposalReport(report); throw error; }
+  const enabledMenus = registry.list.filter(m => m.is_enabled && !(m.children || []).length && (!selectedCodes || selectedCodes.includes(m.menu_code)))
+    .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+  if (!enabledMenus.length) throw new Error('활성화된 본문 목차가 없습니다.');
   let masterPart = null;
   try {
-    const mr = await fetch('/api/ppt-menus/master-templates/active');
-    const mj = await mr.json();
-    if (mj.ok && mj.data?.pptx_b64) {
-      const b64  = mj.data.pptx_b64;
-      const bin  = atob(b64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      const zip = await JSZip.loadAsync(bytes);
-      masterPart = { zip, mergeStrategy: 'MASTER_ONLY', name: mj.data.name };
-      console.log('[PptEngine] 마스터 템플릿 로드:', mj.data.name);
-    }
-  } catch (e) {
-    console.warn('[PptEngine] 마스터 템플릿 로드 실패 (무시):', e.message);
-  }
-
-  // 3. 각 메뉴 PPT 생성
-  showAutoAlert('⏳ PPT 생성 중... 완료될 때까지 잠시 기다려주세요.', false);
-
+    const response = await fetch('/api/ppt-menus/master-templates/active');
+    if (!response.ok) throw new Error('마스터 조회 실패');
+    const json = await response.json();
+    if (!json.ok) throw new Error(json.error || '마스터 조회 실패');
+    if (json.data?.pptx_b64) masterPart = { zip: await JSZip.loadAsync(json.data.pptx_b64, { base64: true }), mergeStrategy: 'MASTER_ONLY' };
+    else report.warnings.push('활성 마스터가 없습니다. 각 템플릿의 디자인을 유지합니다.');
+  } catch (error) { report.warnings.push('마스터 로드 실패: ' + error.message); }
   const parts = [];
   for (const menu of enabledMenus) {
+    const entry = { code: menu.menu_code, name: menu.menu_name, status: '생성 중', slides: 0, warnings: [] };
+    report.entries.push(entry);
     try {
+      if (!menu.rule) throw new Error('생성 규칙이 없습니다.');
+      showAutoAlert(`본문 생성 중: ${report.entries.length}/${enabledMenus.length}`, false);
       const part = await generateMenuPpt(menu, vm);
-      if (part && part.slideCount > 0) {
-        parts.push(part);
-        console.log(`[PptEngine] ${menu.menu_code} → ${part.slideCount}장`);
-      } else {
-        console.log(`[PptEngine] ${menu.menu_code} → 0장 (건너뜀)`);
-      }
-    } catch (e) {
-      console.error(`[PptEngine] ${menu.menu_code} 생성 실패:`, e);
-      // 개별 메뉴 실패는 건너뛰고 계속 진행
+      if (!part?.zip || !part.slideCount) throw new Error('생성된 슬라이드가 없습니다. 인력·데이터·템플릿을 확인하세요.');
+      entry.warnings = part.warnings || [];
+      entry.slides = part.slideCount;
+      entry.status = entry.warnings.length ? '검토 필요' : '생성됨';
+      parts.push(part);
+    } catch (error) {
+      entry.status = '생성 실패';
+      entry.warnings.push(error.message);
     }
+    renderProposalReport(report);
   }
-
-  if (!parts.length) throw new Error('생성할 슬라이드가 없습니다.');
-
-  // 4. 합본
-  // 마스터 템플릿이 있으면 맨 앞에 삽입 → baseZip으로 사용
-  // MASTER_ONLY 전략: 슬라이드는 0장이지만 master/theme/layout 체인을 제공
-  if (masterPart) {
-    parts.unshift(masterPart);
+  const failed = report.entries.some(e => e.status === '생성 실패');
+  report.status = !parts.length ? '생성 실패' : failed ? '부분 생성' : '검토 필요';
+  // 파일 생성은 제출 승인과 다르다. 시각 검수 전에는 완료/충족으로 단정하지 않는다.
+  report.warnings.push('다운로드는 초안입니다. 고정 문구·사진·표 넘침·요건 근거를 최종 검수하세요.');
+  renderProposalReport(report);
+  if (!parts.length) throw new Error('모든 목차 생성에 실패했습니다. 결과 목록을 확인하세요.');
+  if (masterPart) parts.unshift(masterPart);
+  try {
+    const zip = await mergePresentationZips(parts);
+    zip.proposalReport = report;
+    return zip;
+  } catch (error) {
+    report.status = '합본 실패'; report.warnings.push(error.message); renderProposalReport(report); throw error;
   }
-  return mergePresentationZips(parts);
+}
+
+function renderProposalReport(report) {
+  const root = document.getElementById('proposal-generation-report');
+  if (!root) return;
+  root.hidden = false;
+  root.replaceChildren();
+  const title = document.createElement('strong');
+  title.textContent = `본문 PPT: ${report.status}`;
+  root.appendChild(title);
+  const list = document.createElement('ul');
+  for (const entry of report.entries) {
+    const item = document.createElement('li');
+    item.textContent = `${entry.name}: ${entry.status}${entry.slides ? ` (${entry.slides}장)` : ''}${entry.warnings.length ? ' — ' + [...new Set(entry.warnings)].join(' / ') : ''}`;
+    item.style.marginTop = '6px';
+    list.appendChild(item);
+  }
+  root.appendChild(list);
+  for (const warning of report.warnings) {
+    const p = document.createElement('p'); p.textContent = warning; root.appendChild(p);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -850,15 +794,20 @@ async function generateProposalPpt(vm) {
 //    (기존 downloadAllPptx 대체)
 // ═══════════════════════════════════════════════════════════════
 
-async function downloadProposalPpt(btn) {
+async function downloadProposalPpt(btn, selectedCodes = null) {
   if (typeof PptxGenJS === 'undefined' || typeof JSZip === 'undefined') {
     alert('PPT 라이브러리 로딩 중입니다. 잠시 후 다시 시도해주세요.'); return;
   }
   setBtnState(btn, true);
   try {
     const vm = buildProjectViewModel(parsedData);
-    const finalZip = await generateProposalPpt(vm);
+    const finalZip = await generateProposalPpt(vm, selectedCodes);
 
+    const report = finalZip.proposalReport;
+    if (report && !confirm(`${report.status}: 생성 결과를 확인하세요. 누락·검토 항목이 있는 초안을 다운로드하시겠습니까?`)) {
+      showAutoAlert('다운로드를 취소했습니다. 생성 결과를 확인하세요.', false);
+      return;
+    }
     const blob = await finalZip.generateAsync({
       type: 'blob',
       mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
@@ -871,10 +820,10 @@ async function downloadProposalPpt(btn) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = '자동화PPT_' + (parsedData.projectTitle || '').slice(0, 10) + '_' + dateStr + '.pptx';
+    a.download = '검토용_자동화PPT_' + (parsedData.projectTitle || '').slice(0, 10) + '_' + dateStr + '.pptx';
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-    showAutoAlert('✅ 자동화 PPT 생성 완료!', true);
+    showAutoAlert('검토용 PPT를 다운로드했습니다. 생성 결과의 누락·검토 항목을 확인하세요.', false);
   } catch (e) {
     showAutoAlert('❌ 생성 실패: ' + e.message, false);
     console.error(e);
