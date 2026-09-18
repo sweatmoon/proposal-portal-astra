@@ -222,33 +222,37 @@ var ProposalTemplate = (() => {
     return sizes.length ? Math.max(...sizes) : fallback;
   }
   // 글자 크기는 절대 변경하지 않는다. 여백·문단 간격만 정리하고 필요한 행 높이를 계산한다.
-  function fitTable(table, height, warnings) {
+  function fitTable(table, height, warnings, { preserveCells = new Set(), lineHeight = 1.35, compactLines = false } = {}) {
     const rows = children(table, 'tr'), widths = nodes(table, 'gridCol').map(c => +c.getAttribute('w'));
     const minimums = rows.map(() => 1), merged = [];
     rows.forEach((row, ri) => children(row, 'tc').forEach((cell, ci) => {
-      // 빈 셀의 기본 12pt 문단이 행 높이를 강제하지 않도록 비표시 문단만 정리한다.
-      // 텍스트가 있는 셀의 rPr/defRPr/endParaRPr 크기는 변경하지 않는다.
-      if (!text(cell).trim()) {
-        for (const body of children(cell, 'txBody')) cell.removeChild(body);
-        const empty = parse(`<a:txBody xmlns:a="${A}"><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="100"/></a:pPr><a:endParaRPr sz="100"/></a:p></a:txBody>`).documentElement;
-        cell.insertBefore(cell.ownerDocument.importNode(empty, true), children(cell, 'tcPr')[0] || null);
-      }
-      let props = children(cell, 'tcPr')[0];
-      if (!props) { props = cell.ownerDocument.createElementNS(A, 'a:tcPr'); cell.appendChild(props); }
-      for (const attr of ['marT', 'marB']) props.setAttribute(attr, '0');
-      for (const attr of ['marL', 'marR']) props.setAttribute(attr, '6350');
-      for (const para of nodes(cell, 'pPr')) {
-        for (const attr of ['marL', 'marR', 'indent']) para.setAttribute(attr, '0');
-        para.setAttribute('latinLnBrk', '1');
-      }
-      for (const space of [...nodes(cell, 'spcPts'), ...nodes(cell, 'spcPct')]) {
-        if (space.parentNode.localName !== 'lnSpc') space.setAttribute('val', '0');
-        else if (space.localName === 'spcPct') space.setAttribute('val', '100000');
-      }
-      for (const body of nodes(cell, 'bodyPr')) {
-        for (const attr of ['tIns', 'bIns', 'lIns', 'rIns']) body.setAttribute(attr, '0');
-        for (const auto of [...children(body, 'spAutoFit'), ...children(body, 'normAutofit')]) body.removeChild(auto);
-        if (!children(body, 'noAutofit').length) body.appendChild(cell.ownerDocument.createElementNS(A, 'a:noAutofit'));
+      const preserve = preserveCells.has(cell);
+      if (!preserve) {
+        // 빈 셀의 기본 12pt 문단이 행 높이를 강제하지 않도록 비표시 문단만 정리한다.
+        // 텍스트가 있는 셀의 rPr/defRPr/endParaRPr 크기는 변경하지 않는다.
+        if (!text(cell).trim()) {
+          for (const body of children(cell, 'txBody')) cell.removeChild(body);
+          const empty = parse(`<a:txBody xmlns:a="${A}"><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="100"/></a:pPr><a:endParaRPr sz="100"/></a:p></a:txBody>`).documentElement;
+          cell.insertBefore(cell.ownerDocument.importNode(empty, true), children(cell, 'tcPr')[0] || null);
+        }
+        let props = children(cell, 'tcPr')[0];
+        if (!props) { props = cell.ownerDocument.createElementNS(A, 'a:tcPr'); cell.appendChild(props); }
+        for (const attr of ['marT', 'marB']) props.setAttribute(attr, '0');
+        for (const attr of ['marL', 'marR']) props.setAttribute(attr, '6350');
+        for (const para of nodes(cell, 'pPr')) {
+          for (const attr of ['marL', 'marR', 'indent']) para.setAttribute(attr, '0');
+          para.setAttribute('latinLnBrk', '1');
+        }
+        for (const space of [...nodes(cell, 'spcPts'), ...nodes(cell, 'spcPct')]) {
+          if (space.parentNode.localName !== 'lnSpc') space.setAttribute('val', '0');
+          else if (space.localName === 'spcPct') space.setAttribute('val', '100000');
+          else if (compactLines) space.setAttribute('val', Math.min(+space.getAttribute('val'), fontSize(cell)));
+        }
+        for (const body of nodes(cell, 'bodyPr')) {
+          for (const attr of ['tIns', 'bIns', 'lIns', 'rIns']) body.setAttribute(attr, '0');
+          for (const auto of [...children(body, 'spAutoFit'), ...children(body, 'normAutofit')]) body.removeChild(auto);
+          if (!children(body, 'noAutofit').length) body.appendChild(cell.ownerDocument.createElementNS(A, 'a:noAutofit'));
+        }
       }
       if (!text(cell).trim() || cell.getAttribute('vMerge') === '1' || cell.getAttribute('hMerge') === '1') return;
       const span = Math.max(1, +cell.getAttribute('rowSpan') || 1);
@@ -259,7 +263,33 @@ var ProposalTemplate = (() => {
         const chars = [...line].reduce((s, ch) => s + (/[\x00-\x7f]/.test(ch) ? 0.53 : 1), 0);
         return n + Math.max(1, Math.ceil(chars * size * 127 / Math.max(1, width - 12700)));
       }, 0), 0);
-      const min = Math.ceil(size * 127 * 1.35 * Math.max(1, lines));
+      // 보호된 고정 문구는 원본 들여쓰기·문단 간격·줄바꿈을 측정만 하고 수정하지 않는다.
+      const props = children(cell, 'tcPr')[0];
+      const inset = preserve ? (+props?.getAttribute('marL') || 0) + (+props?.getAttribute('marR') || 0) : 12700;
+      const preservedHeight = preserve ? nodes(cell, 'p').reduce((sum, p) => {
+        const pr = children(p, 'pPr')[0], indent = Math.max(0, +pr?.getAttribute('marL') || 0);
+        const available = Math.max(1, width - inset - indent);
+        let lineCount = 1, used = 0;
+        for (const part of Array.from(p.childNodes)) {
+          if (part.localName === 'br') { lineCount++; used = 0; continue; }
+          if (!['r', 'fld'].includes(part.localName)) continue;
+          const runSize = +children(part, 'rPr')[0]?.getAttribute('sz') || size;
+          for (const ch of text(part)) {
+            const advance = runSize * 127 * (/[\x00-\x7f]/.test(ch) ? 0.53 : 1);
+            if (used && used + advance > available) { lineCount++; used = 0; }
+            used += advance;
+          }
+        }
+        const spacing = name => {
+          const e = pr && children(pr, name)[0];
+          return e ? (+children(e, 'spcPts')[0]?.getAttribute('val') || 0) * 127 : 0;
+        };
+        const line = pr && children(pr, 'lnSpc')[0];
+        const pts = line && children(line, 'spcPts')[0], pct = line && children(line, 'spcPct')[0];
+        const leading = pts ? +pts.getAttribute('val') * 127 : size * 127 * (pct ? +pct.getAttribute('val') / 100000 : 1.2);
+        return sum + lineCount * leading + spacing('spcBef') + spacing('spcAft');
+      }, (+props?.getAttribute('marT') || 0) + (+props?.getAttribute('marB') || 0)) : 0;
+      const min = Math.ceil(preserve ? preservedHeight : size * 127 * lineHeight * Math.max(1, lines));
       if (span === 1) minimums[ri] = Math.max(minimums[ri], min);
       else merged.push({ ri, span, min });
     }));
@@ -501,6 +531,18 @@ var ProposalTemplate = (() => {
       }
     }
   }
+  // 감리원/전문가 같은 인력 구분이 아니라 실제 담당 분야로 왼쪽 계층을 구성한다.
+  function actionField(person) {
+    const field = String(person.field || '').trim();
+    const key = field.replace(/\([^)]*\)/g, '').replace(/\s+/g, '');
+    if (/사업관리|품질보증/.test(key)) return { group: '사업관리/품질보증', detail: field, rank: 0, split: false };
+    if (/^(데이터베이스|DB)(설계|구축|감리)?$/i.test(key)) return { group: '데이터베이스', detail: field, rank: 2, split: false };
+    if (/시스템구조|시스템아키텍처/.test(key)) return { group: '시스템 구조 및 보안', detail: field, rank: 3, split: false };
+    if (!field) return { group: '분야 확인 필요', detail: '분야 확인 필요', rank: 4, split: false };
+    if (/응용|애플리케이션|application/i.test(key) || /감리원/.test(person.group))
+      return { group: '응용시스템', detail: field, rank: 1, split: true };
+    return { group: field, detail: field, rank: 4, split: false };
+  }
   function actionResolver(doc, ctx, map, warnings) {
     const participants = stage => [...stage.auditors, ...stage.experts].filter(p => number(p.post) > 0);
     const stages = ctx.stages.filter(s => participants(s).length);
@@ -508,6 +550,9 @@ var ProposalTemplate = (() => {
     const byName = new Map(ctx.members.map(m => [m.name, m]));
     const names = unique([...ctx.members.filter(m => assigned.includes(m.name)).map(m => m.name), ...assigned]);
     const people = names.map(name => byName.get(name) || { name, group: '', expertSubGroup: '', field: ctx.pd.personFieldMap?.[name] || '' });
+    const fields = new Map(people.map(person => [person.name, actionField(person)]));
+    // 분야 분류 순서만 정렬하고 같은 분류 내의 포털 순서는 유지한다.
+    people.sort((a, b) => fields.get(a.name).rank - fields.get(b.name).rank);
     for (const table of nodes(doc, 'tbl')) {
       const rows = children(table, 'tr'), head = rows.find(r => /\[단계\d+\]/.test(text(r)));
       if (!head) continue;
@@ -522,6 +567,7 @@ var ProposalTemplate = (() => {
         ...people.map((person, i) => ({ row: bodyRows[i] || bodySource, person, i })),
         ...rows.slice(lastBody + 1).map(row => ({ row })),
       ];
+      const preserveCells = new Set();
       const oldHeight = tableHeight(table), frame = ancestor(table, 'graphicFrame'), box = frame && geometry(frame);
       const grid = nodes(table, 'tblGrid')[0], cols = grid && children(grid, 'gridCol');
       if (cols?.length) {
@@ -537,12 +583,14 @@ var ProposalTemplate = (() => {
         const expanded = [...cols.slice(0, first).map(c => c.cloneNode(true)),
           ...stages.map(() => { const c = cols[first].cloneNode(true); c.setAttribute('w', stageWidth); return c; }),
           ...cols.slice(last + 1).map(c => c.cloneNode(true))];
-        if (first === 3 && cols.length === last + 2 && stages.length > 3) {
-          // 반복되는 그룹/설명 칸의 여백을 줄이고 긴 분야명 칸에 폭을 배분한다.
-          const fractions = [0.03, 0.03, 0.32];
+        if (first === 3 && cols.length === last + 2 && stages.length) {
+          // 왼쪽 계층과 원본 수행방안에 읽을 수 있는 폭을 먼저 확보한다.
+          const fractions = [0.10, 0.085, 0.30];
           expanded.slice(0, 3).forEach((c, i) => c.setAttribute('w', Math.floor(targetWidth * fractions[i])));
-          expanded.slice(3, 3 + stages.length).forEach(c => c.setAttribute('w', Math.floor(targetWidth * 0.53 / stages.length)));
-          expanded[expanded.length - 1].setAttribute('w', Math.floor(targetWidth * 0.09));
+          const methodWidth = Math.max(+cols[last + 1].getAttribute('w'), Math.floor(targetWidth * 0.18));
+          expanded[expanded.length - 1].setAttribute('w', methodWidth);
+          const available = targetWidth - methodWidth - expanded.slice(0, 3).reduce((s, c) => s + +c.getAttribute('w'), 0);
+          expanded.slice(3, 3 + stages.length).forEach(c => c.setAttribute('w', Math.floor(available / stages.length)));
         }
         cols.forEach(c => grid.removeChild(c)); expanded.forEach(c => grid.appendChild(c));
         if (box) box.ext.setAttribute('cx', expanded.reduce((sum, col) => sum + +col.getAttribute('w'), 0));
@@ -568,12 +616,21 @@ var ProposalTemplate = (() => {
         });
         cells.forEach(c => row.removeChild(c)); [...before, ...stageCells, ...after].forEach(c => row.insertBefore(c, children(row, 'extLst')[0] || null));
         if (spec.person) {
-          replace(row, token => /^\[그룹\d+\]$/.test(token) ? [spec.person.group, spec.person.expertSubGroup].filter(Boolean).join(' / ')
-            : /^\[세부\d+\]$/.test(token) ? spec.person.field || '' : map[token]);
+          const field = fields.get(spec.person.name);
+          replace(row, token => /^\[그룹\d+\]$/.test(token) ? field.group
+            : /^\[세부\d+\]$/.test(token) ? field.detail : map[token]);
+          if (first === 3) {
+            unmerge(before[1]); unmerge(before[2]);
+            if (!field.split) {
+              // 세부 분야가 없는 행은 두 분류 칸을 가로 병합한다. 괄호 등 실제 분야 정보는 보존한다.
+              setText(before[1], field.detail); before[1].setAttribute('gridSpan', '2');
+              setText(before[2], ''); before[2].setAttribute('hMerge', '1');
+            }
+          }
           // 15행짜리 세로 병합을 실제 인원 수로 다시 만든다.
           if (before[0]) {
             unmerge(before[0]);
-            if (spec.i === 0) { setText(before[0], text(children(bodySource, 'tc')[0])); if (people.length > 1) before[0].setAttribute('rowSpan', people.length); }
+            if (spec.i === 0) { if (people.length > 1) before[0].setAttribute('rowSpan', people.length); }
             else { setText(before[0], ''); before[0].setAttribute('vMerge', '1'); }
           }
         }
@@ -587,7 +644,12 @@ var ProposalTemplate = (() => {
         for (let i = firstRow; i < rebuilt.length; i++) {
           const target = children(rebuilt[i], 'tc')[first + stages.length + j]; if (!target) continue;
           unmerge(target);
-          if (i === firstRow) { setText(target, text(cell)); if (span > 1) target.setAttribute('rowSpan', span); }
+          if (i === firstRow) {
+            // 텍스트를 평탄화하지 않고 원본 셀 전체를 복제: 런 색상, 굵기, 글머리표, 줄바꿈 유지.
+            const copy = cell.cloneNode(true); unmerge(copy);
+            if (span > 1) copy.setAttribute('rowSpan', span);
+            target.parentNode.replaceChild(copy, target); preserveCells.add(copy);
+          }
           else { setText(target, ''); target.setAttribute('vMerge', '1'); }
         }
       });
@@ -595,11 +657,12 @@ var ProposalTemplate = (() => {
         const label = children(rebuilt[0], 'tc')[0]; if (label) setText(label, '조치확인 공수가 있는 단계 없음');
       }
       rows.forEach(r => table.removeChild(r)); rebuilt.forEach(r => table.appendChild(r));
-      // 동일 그룹을 세로 병합하여 글꼴을 줄이지 않고 그룹 명칭 공간을 확보한다.
-      for (let start = firstBody; start < firstBody + people.length;) {
+      // 응용시스템만 하위 분야 행을 두고 상위 분류를 세로 병합한다.
+      for (let start = firstBody; first === 3 && start < firstBody + people.length;) {
+        if (!fields.get(people[start - firstBody].name).split) { start++; continue; }
         const firstCell = children(rebuilt[start], 'tc')[1]; if (!firstCell) break;
         const label = text(firstCell); let end = start + 1;
-        while (end < firstBody + people.length && text(children(rebuilt[end], 'tc')[1]) === label) end++;
+        while (end < firstBody + people.length && fields.get(people[end - firstBody].name).split && text(children(rebuilt[end], 'tc')[1]) === label) end++;
         if (label && end - start > 1) {
           firstCell.setAttribute('rowSpan', end - start);
           for (let i = start + 1; i < end; i++) { const cell = children(rebuilt[i], 'tc')[1]; setText(cell, ''); cell.setAttribute('vMerge', '1'); }
@@ -607,7 +670,11 @@ var ProposalTemplate = (() => {
         start = end;
       }
       if (box && box.y > 2000000 && box.y < 2150000) nodes(frame, 'off')[0]?.setAttribute('y', '2000000');
-      fitTable(table, box ? Math.min(oldHeight, 6590000 - box.y) : oldHeight, warnings);
+      // 병합 없는 별도 수행방안 셀도 서식을 보존한다.
+      for (const row of rebuilt) children(row, 'tc').slice(first + stages.length).forEach(cell => {
+        if (text(cell).trim()) preserveCells.add(cell);
+      });
+      fitTable(table, box ? Math.min(oldHeight, 6700000 - box.y) : oldHeight, warnings, { preserveCells, lineHeight: 1.15, compactLines: true });
     }
     return token => map[token];
   }

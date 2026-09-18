@@ -244,6 +244,61 @@ async function actionFixture() {
     row(['투입 공수','','','[단계1MD] MD','[단계2MD] MD','[단계3MD] MD','']),
     row(['주요 활동','','','고정 활동','','',''])], [800000,500000,900000,700000,700000,700000,1000000]));
 }
+test('action method cell preserves rich paragraphs and cell styling while resizing its merge', async () => {
+  const c = sandbox(), T = c.ProposalTemplate, d = data();
+  d.stages.push({ ...d.stages[0], stage: '종료', 감리원: { people: [{ name: '나', pre: 0, audit: 5, post: 2 }] } });
+  const z = await JSZip.loadAsync(await actionFixture(), { base64: true });
+  const doc = T.parse(await z.file('ppt/slides/slide1.xml').async('string'));
+  const rows = T.nodes(doc, 'tr'), source = T.nodes(rows[1], 'tc')[6];
+  const rich = T.parse(`<a:tc xmlns:a="${A}" rowSpan="17"><a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:pPr marL="162000" indent="-95250"><a:lnSpc><a:spcPts val="1500"/></a:lnSpc><a:spcBef><a:spcPts val="200"/></a:spcBef><a:buChar char="•"/></a:pPr><a:r><a:rPr sz="1200"/><a:t>단계 감리와 </a:t></a:r><a:r><a:rPr sz="1200" b="1"><a:solidFill><a:srgbClr val="1655A2"/></a:solidFill></a:rPr><a:t>동일한 인력</a:t></a:r><a:br/><a:r><a:rPr sz="1200" b="1"/><a:t>구성</a:t></a:r></a:p><a:p><a:endParaRPr sz="1200"/></a:p><a:p><a:pPr marL="162000" indent="-95250"><a:buChar char="•"/></a:pPr><a:r><a:rPr sz="1200"><a:solidFill><a:srgbClr val="1655A2"/></a:solidFill></a:rPr><a:t>1차 시정조치 미흡시 2차 시정조치 수행</a:t></a:r></a:p></a:txBody><a:tcPr marL="36000" marR="90000" marT="36000" marB="36000" anchor="ctr"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill></a:tcPr></a:tc>`).documentElement;
+  source.parentNode.replaceChild(doc.importNode(rich, true), source);
+  z.file('ppt/slides/slide1.xml', new XMLSerializer().serializeToString(doc));
+  const result = await T.build(menu('ACTION_CONFIRM_STAFF', await z.generateAsync({ type: 'base64' })), { _raw: d });
+  const out = T.parse(await result.zip.file('ppt/slides/slide1.xml').async('string'));
+  const matches = T.nodes(out, 'tc').filter(c => T.text(c).includes('단계 감리와'));
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].getAttribute('rowSpan'), '4'); // two people plus two footer rows
+  const serialize = el => new XMLSerializer().serializeToString(el);
+  for (const tag of ['txBody', 'tcPr']) assert.equal(serialize(T.nodes(matches[0], tag)[0]), serialize(T.nodes(rich, tag)[0]));
+  assert.equal(T.nodes(out, 'br').length, 1);
+  const cols = T.nodes(out, 'gridCol');
+  assert(Number(cols.at(-1).getAttribute('w')) >= 1000000);
+  assert.equal(result.slideCount, 1);
+});
+test('action left columns follow field hierarchy and preserve sorted name-to-stage mapping', async () => {
+  const c = sandbox(), T = c.ProposalTemplate, d = data();
+  const people = [
+    ['보안담당', '시스템 구조 및 보안'], ['응용둘', '분야2'], ['관리담당', '사업관리/품질보증'],
+    ['DB담당', '데이터베이스'], ['응용하나', '분야1'],
+  ];
+  d.portalOrder = people.map(([name]) => ({ name, group: '감리원팀' }));
+  d.personGradeMap = {}; d.personFieldMap = Object.fromEntries(people);
+  d.stages = ['설계', '종료', '검수지원'].map((stage, i) => ({ stage,
+    감리원: { people: people.map(([name], j) => ({ name, pre: 0, audit: 5, post: i === 2 ? 0 : j % 2 === i ? 1 : 0 })) },
+  }));
+  const result = await T.build(menu('ACTION_CONFIRM_STAFF', await actionFixture()), { _raw: d });
+  const out = T.parse(await result.zip.file('ppt/slides/slide1.xml').async('string'));
+  const rows = T.nodes(out, 'tr'), cells = r => T.nodes(r, 'tc');
+  assert.equal(rows.length, 8);
+  assert.equal(T.text(cells(rows[1])[1]), '사업관리/품질보증');
+  assert.equal(T.text(cells(rows[2])[1]), '응용시스템');
+  assert.equal(cells(rows[2])[1].getAttribute('rowSpan'), '2');
+  assert.equal(cells(rows[3])[1].getAttribute('vMerge'), '1');
+  assert.equal(T.text(cells(rows[2])[2]), '분야2');
+  assert.equal(T.text(cells(rows[3])[2]), '분야1');
+  for (const [i, label] of [[1, '사업관리/품질보증'], [4, '데이터베이스'], [5, '시스템 구조 및 보안']]) {
+    assert.equal(T.text(cells(rows[i])[1]), label);
+    assert.equal(cells(rows[i])[1].getAttribute('gridSpan'), '2');
+    assert.equal(cells(rows[i])[2].getAttribute('hMerge'), '1');
+  }
+  for (const [i, name, stageCol] of [[1, '관리담당', 3], [2, '응용둘', 4], [3, '응용하나', 3], [4, 'DB담당', 4], [5, '보안담당', 3]]) {
+    assert.equal(T.text(cells(rows[i])[stageCol]), name);
+    assert.equal(T.text(cells(rows[i])[stageCol === 3 ? 4 : 3]), '');
+  }
+  assert.equal(T.text(cells(rows[6])[3]), '3 MD'); assert.equal(T.text(cells(rows[6])[4]), '2 MD');
+  assert(!T.text(out).includes('감리원팀')); assert(!T.text(out).includes('검수지원'));
+  assert.equal(result.slideCount, 1);
+});
 test('action table grows to four positive-post columns and eighteen people without shrinking', async () => {
   const c=sandbox(),d=data();d.portalOrder=Array.from({length:18},(_,i)=>({name:`가${i}`,group:'감리원팀'}));
   const make=(stage,positive)=>({...d.stages[0],stage,감리원:{people:d.portalOrder.map(p=>({name:p.name,pre:0,audit:5,post:positive?1:0}))}});
