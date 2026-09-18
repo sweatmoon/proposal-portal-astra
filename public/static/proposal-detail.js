@@ -2809,14 +2809,19 @@ async function downloadSummaryTablePptx(btn, opts) {
   setBtnState(btn, true)
   try {
     let menu = opts.menu
+    let reportMenus = opts.menus || []
     if (!menu) {
       const registry = await PptMenuRegistry.load(true)
+      reportMenus = registry.list
       menu = registry.byCode.COMPLIANCE || registry.byCode.SUMMARY_TABLE
     }
     if (!menu) throw new Error('3.6 준수 여부 목차가 등록되어 있지 않습니다.')
     const result = await ProposalTemplate.build(menu, opts.vm || parsedData)
     if (opts.returnZip) return result
-    renderProposalReport({ status: '검토 필요', entries: [], warnings: result.warnings })
+    renderProposalReport({ status: '검토 필요', total: 1, entries: [{
+      ...proposalReportLocation(menu, reportMenus), status: result.warnings.length ? '검토 필요' : '생성됨',
+      slides: result.slideCount || 1, warnings: result.warnings,
+    }], warnings: ['다운로드는 초안입니다. 생성 결과와 증빙 확인 항목을 최종 검수하세요.'] })
     const blob = await result.zip.generateAsync({ type: 'blob' })
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')

@@ -716,6 +716,42 @@ async function generateMenuPpt(menu, vm) {
  * @param {object} vm - ProjectViewModel
  * @returns {Promise<JSZip>} 최종 합본 JSZip 객체
  */
+// 보고서에만 적용하는 목차 경로. 원본 메뉴 번호와 PPT 생성/합본 순서는 변경하지 않는다.
+function proposalReportLocation(menu, menus = []) {
+  const clean = value => String(value ?? '').trim().replace(/[.．]+$/, '');
+  const number = clean(menu.menu_number);
+  const ancestors = [], visited = new Set([String(menu.id)]);
+  let current = menu;
+  while (current) {
+    const parent = menus.find(m => current.parent_id != null && String(m.id) === String(current.parent_id))
+      || menus.find(m => (m.children || []).some(child => child === current || (child.id != null && String(child.id) === String(current.id))));
+    if (!parent || visited.has(String(parent.id))) break;
+    visited.add(String(parent.id)); ancestors.unshift(parent); current = parent;
+  }
+  const section = ancestors.find(m => /^[가-힣]$/.test(clean(m.menu_number))) || ancestors[0];
+  const prefix = number.match(/^([가-힣])[.．\s]/)?.[1] || '';
+  const sectionNumber = section ? clean(section.menu_number) : prefix;
+  const fullNumber = sectionNumber && /^[가-힣]$/.test(sectionNumber) && number && !prefix
+    ? `${sectionNumber}.${number}` : number;
+  function unnumbered(name, prefixes) {
+    let result = String(name || '').trim();
+    for (const value of prefixes.filter(Boolean)) {
+      if (result.startsWith(value) && /^[.．\s]/.test(result.slice(value.length))) {
+        result = result.slice(value.length).replace(/^[.．\s]+/, ''); break;
+      }
+    }
+    return result;
+  }
+  return {
+    id: menu.id, code: menu.menu_code,
+    number: fullNumber,
+    name: unnumbered(menu.menu_name, [fullNumber, number]),
+    sectionKey: section ? `menu:${section.id ?? section.menu_code}` : prefix ? `prefix:${prefix}` : 'ungrouped',
+    sectionNumber,
+    sectionName: section ? unnumbered(section.menu_name, [sectionNumber]) : prefix ? '' : '기타 목차',
+  };
+}
+
 async function generateProposalPpt(vm, selectedCodes = null) {
   const report = { entries: [], warnings: [], status: '생성 중' };
   let registry;
@@ -723,6 +759,8 @@ async function generateProposalPpt(vm, selectedCodes = null) {
   catch (error) { report.status = '생성 실패'; report.warnings.push(error.message); renderProposalReport(report); throw error; }
   const enabledMenus = registry.list.filter(m => m.is_enabled && !(m.children || []).length && (!selectedCodes || selectedCodes.includes(m.menu_code)))
     .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+  report.total = enabledMenus.length;
+  renderProposalReport(report);
   if (!enabledMenus.length) throw new Error('활성화된 본문 목차가 없습니다.');
   let masterPart = null;
   try {
@@ -735,8 +773,9 @@ async function generateProposalPpt(vm, selectedCodes = null) {
   } catch (error) { report.warnings.push('마스터 로드 실패: ' + error.message); }
   const parts = [];
   for (const menu of enabledMenus) {
-    const entry = { code: menu.menu_code, name: menu.menu_name, status: '생성 중', slides: 0, warnings: [] };
+    const entry = { ...proposalReportLocation(menu, registry.list), status: '생성 중', slides: 0, warnings: [] };
     report.entries.push(entry);
+    renderProposalReport(report);
     try {
       if (!menu.rule) throw new Error('생성 규칙이 없습니다.');
       showAutoAlert(`본문 생성 중: ${report.entries.length}/${enabledMenus.length}`, false);
@@ -772,20 +811,81 @@ function renderProposalReport(report) {
   const root = document.getElementById('proposal-generation-report');
   if (!root) return;
   root.hidden = false;
-  root.replaceChildren();
-  const title = document.createElement('strong');
-  title.textContent = `본문 PPT: ${report.status}`;
-  root.appendChild(title);
-  const list = document.createElement('ul');
-  for (const entry of report.entries) {
-    const item = document.createElement('li');
-    item.textContent = `${entry.name}: ${entry.status}${entry.slides ? ` (${entry.slides}장)` : ''}${entry.warnings.length ? ' — ' + [...new Set(entry.warnings)].join(' / ') : ''}`;
-    item.style.marginTop = '6px';
-    list.appendChild(item);
+  const openStates = new Map();
+  if (root._proposalReport === report) {
+    for (const group of root.querySelectorAll('details[data-section-key]')) openStates.set(group.getAttribute('data-section-key'), group.open);
   }
-  root.appendChild(list);
-  for (const warning of report.warnings) {
-    const p = document.createElement('p'); p.textContent = warning; root.appendChild(p);
+  root._proposalReport = report;
+  root.replaceChildren();
+  const el = (tag, className, text) => {
+    const node = document.createElement(tag);
+    if (className) node.setAttribute('class', className);
+    if (text !== undefined) node.textContent = String(text);
+    return node;
+  };
+  const entries = report.entries || [];
+  const counts = { '생성됨': 0, '검토 필요': 0, '생성 실패': 0, '생성 중': 0 };
+  entries.forEach(e => { if (Object.hasOwn(counts, e.status)) counts[e.status]++; });
+  const stateClass = status => ({ '생성됨': 'success', '검토 필요': 'review', '생성 실패': 'failure', '생성 중': 'running' })[status] || 'running';
+  const header = el('header', 'proposal-report-header');
+  const title = el('h4', 'proposal-report-title', `본문 PPT: ${report.status}`);
+  header.appendChild(title);
+  const completed = entries.length - counts['생성 중'];
+  const progress = el('p', 'proposal-report-progress', `${completed} / ${report.total ?? entries.length}개 목차 처리 · ${entries.reduce((sum, e) => sum + (Number(e.slides) || 0), 0)}장 생성`);
+  progress.setAttribute('role', 'status'); progress.setAttribute('aria-live', 'polite');
+  header.appendChild(progress);
+  const stats = el('ul', 'proposal-report-stats');
+  for (const [status, count] of Object.entries(counts)) {
+    stats.appendChild(el('li', `proposal-report-badge proposal-report-${stateClass(status)}`, `${status} ${count}`));
+  }
+  header.appendChild(stats); root.appendChild(header);
+  const groups = new Map();
+  for (const entry of entries) {
+    const key = entry.sectionKey || 'ungrouped';
+    if (!groups.has(key)) groups.set(key, { number: entry.sectionNumber || '', name: entry.sectionName || (key === 'ungrouped' ? '기타 목차' : ''), entries: [] });
+    groups.get(key).entries.push(entry);
+  }
+  let groupIndex = 0;
+  for (const [key, group] of groups) {
+    const section = el('details', 'proposal-report-section');
+    section.setAttribute('data-section-key', key);
+    section.open = openStates.has(key) ? openStates.get(key) : true;
+    const summary = el('summary', 'proposal-report-section-heading');
+    summary.appendChild(el('span', 'proposal-report-section-title', [group.number ? `${group.number}.` : '', group.name].filter(Boolean).join(' ')));
+    const failures = group.entries.filter(e => e.status === '생성 실패').length;
+    const reviews = group.entries.filter(e => e.status === '검토 필요').length;
+    summary.appendChild(el('span', 'proposal-report-section-count', `${group.entries.length}개 목차 · ${group.entries.reduce((sum, e) => sum + (Number(e.slides) || 0), 0)}장${failures ? ` · 실패 ${failures}` : ''}${reviews ? ` · 검토 ${reviews}` : ''}`));
+    section.appendChild(summary);
+    const list = el('ol', 'proposal-report-entries');
+    group.entries.forEach((entry, index) => {
+      const item = el('li', `proposal-report-entry proposal-report-entry-${stateClass(entry.status)}`);
+      const heading = el('header', 'proposal-report-entry-heading');
+      const name = el('h5', 'proposal-report-entry-title');
+      name.setAttribute('id', `proposal-report-entry-${groupIndex}-${index}`);
+      name.appendChild(el('span', 'proposal-report-number', entry.number || '번호 미등록'));
+      name.appendChild(el('span', 'proposal-report-name', entry.name || entry.code || '제목 미등록'));
+      heading.appendChild(name);
+      const meta = el('div', 'proposal-report-entry-meta');
+      meta.appendChild(el('span', `proposal-report-badge proposal-report-${stateClass(entry.status)}`, entry.status));
+      if (entry.slides) meta.appendChild(el('span', 'proposal-report-slides', `${entry.slides}장`));
+      heading.appendChild(meta); item.appendChild(heading);
+      const warnings = [...new Set(entry.warnings || [])];
+      if (warnings.length) {
+        const notes = el('ul', 'proposal-report-warnings');
+        notes.setAttribute('aria-labelledby', name.getAttribute('id'));
+        for (const warning of warnings) notes.appendChild(el('li', '', warning));
+        item.appendChild(notes);
+      }
+      list.appendChild(item);
+    });
+    section.appendChild(list); root.appendChild(section); groupIndex++;
+  }
+  if ((report.warnings || []).length) {
+    const notes = el('aside', 'proposal-report-notes');
+    notes.appendChild(el('h5', '', '공통 안내'));
+    const list = el('ul', 'proposal-report-warnings');
+    for (const warning of [...new Set(report.warnings)]) list.appendChild(el('li', '', warning));
+    notes.appendChild(list); root.appendChild(notes);
   }
 }
 

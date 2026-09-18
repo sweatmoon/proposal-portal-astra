@@ -949,13 +949,56 @@ app.get('/proposals/:id', async (c) => {
   </div>
 
   <!-- ── 자동화 PPT 모달 ───────────────────────────────── -->
-  <div id="autoModal" style="display:none;position:fixed;inset:0;z-index:3000;background:rgba(0,0,0,.5);align-items:center;justify-content:center;padding:20px">
-    <div style="background:#fff;border-radius:12px;max-width:600px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;position:relative;box-shadow:0 8px 30px rgba(0,0,0,.25);font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+  <style>
+    #autoModal { position:fixed; inset:0; z-index:3000; background:rgba(0,0,0,.5); align-items:center; justify-content:center; padding:20px; }
+    #autoModal .proposal-modal-dialog { box-sizing:border-box; background:#fff; border-radius:14px; max-width:1120px; width:100%; max-height:92vh; max-height:92dvh; overflow-y:auto; padding:28px; position:relative; box-shadow:0 8px 30px rgba(0,0,0,.25); font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif; }
+    #proposal-generation-report { margin:18px 0; padding:18px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:12px; font-size:13px; line-height:1.6; color:#334155; overflow-wrap:anywhere; }
+    #proposal-generation-report .proposal-report-header { margin-bottom:16px; }
+    #proposal-generation-report .proposal-report-title { margin:0; font-size:18px; font-weight:800; color:#0f172a; }
+    #proposal-generation-report .proposal-report-progress { margin:4px 0 10px; color:#64748b; font-size:12px; }
+    #proposal-generation-report .proposal-report-stats { display:flex; gap:8px; flex-wrap:wrap; list-style:none; margin:0; padding:0; }
+    #proposal-generation-report .proposal-report-badge { display:inline-flex; align-items:center; flex-shrink:0; white-space:nowrap; border-radius:6px; padding:3px 9px; font-size:12px; font-weight:700; }
+    #proposal-generation-report .proposal-report-success { background:#dcfce7; color:#166534; }
+    #proposal-generation-report .proposal-report-review { background:#fef3c7; color:#92400e; }
+    #proposal-generation-report .proposal-report-failure { background:#fee2e2; color:#991b1b; }
+    #proposal-generation-report .proposal-report-running { background:#dbeafe; color:#1e40af; }
+    #proposal-generation-report .proposal-report-section { margin-top:14px; border:1px solid #cbd5e1; border-radius:10px; overflow:hidden; background:#fff; }
+    #proposal-generation-report .proposal-report-section-heading { padding:12px 16px; background:#e2e8f0; color:#0f172a; cursor:pointer; }
+    #proposal-generation-report .proposal-report-section-title { font-size:15px; font-weight:800; margin-right:12px; }
+    #proposal-generation-report .proposal-report-section-count { color:#475569; font-size:12px; white-space:normal; }
+    #proposal-generation-report .proposal-report-entries { list-style:none; padding:0; margin:0; }
+    #proposal-generation-report .proposal-report-entry { padding:14px 16px; border-top:1px solid #e2e8f0; border-left:3px solid transparent; }
+    #proposal-generation-report .proposal-report-entry-failure { border-left-color:#ef4444; }
+    #proposal-generation-report .proposal-report-entry-review { border-left-color:#f59e0b; }
+    #proposal-generation-report .proposal-report-entry-heading { display:flex; gap:12px; align-items:flex-start; justify-content:space-between; }
+    #proposal-generation-report .proposal-report-entry-title { display:flex; align-items:baseline; gap:10px; min-width:0; margin:0; font-size:14px; font-weight:700; }
+    #proposal-generation-report .proposal-report-number { color:#4338ca; font-variant-numeric:tabular-nums; flex-shrink:0; }
+    #proposal-generation-report .proposal-report-name { min-width:0; }
+    #proposal-generation-report .proposal-report-entry-meta { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+    #proposal-generation-report .proposal-report-slides { color:#64748b; white-space:nowrap; font-size:12px; }
+    #proposal-generation-report .proposal-report-warnings { list-style:disc; padding-left:20px; margin:8px 0 0; color:#475569; font-size:12px; white-space:pre-wrap; }
+    #proposal-generation-report .proposal-report-warnings li + li { margin-top:5px; }
+    #proposal-generation-report .proposal-report-notes { margin-top:16px; padding:12px 14px; border:1px solid #cbd5e1; border-radius:8px; background:#fff; }
+    #proposal-generation-report .proposal-report-notes h5 { margin:0; font-weight:700; }
+    #proposal-generation-report summary:focus-visible { outline:2px solid #4f46e5; outline-offset:-3px; }
+    @media (max-width:640px) {
+      #autoModal { padding:8px; }
+      #autoModal .proposal-modal-dialog { padding:18px 12px; max-height:96vh; max-height:96dvh; }
+      #proposal-generation-report { padding:10px; }
+      #proposal-generation-report .proposal-report-section-heading { padding:10px; }
+      #proposal-generation-report .proposal-report-section-count { display:block; margin-top:4px; }
+      #proposal-generation-report .proposal-report-entry { padding:12px 10px; }
+      #proposal-generation-report .proposal-report-entry-heading { flex-direction:column; gap:6px; }
+      #proposal-generation-report .proposal-report-entry-title { flex-wrap:wrap; gap:4px 8px; }
+    }
+  </style>
+  <div id="autoModal" style="display:none">
+    <div class="proposal-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="proposal-modal-heading">
       <button onclick="closeAutoModal()" style="position:absolute;top:14px;right:16px;background:#e0e0e0;border:none;border-radius:50%;width:28px;height:28px;cursor:pointer;font-size:14px">✕</button>
-      <h3 style="font-size:16px;font-weight:700;margin:0 0 6px;color:#1a2e4a">🛠️ 자동화 PPT 생성</h3>
+      <h3 id="proposal-modal-heading" style="font-size:18px;font-weight:700;margin:0 36px 6px 0;color:#1a2e4a">🛠️ 자동화 PPT 생성</h3>
       <p style="font-size:13px;color:#666;margin:0 0 16px">활성화된 본문 목차 순서로 생성합니다. 누락·미치환·검토 항목을 확인한 뒤 초안을 다운로드하세요.</p>
       <div id="autoModalAlertBox" role="status" style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:7px;font-size:13px;font-weight:600"></div>
-      <section id="proposal-generation-report" aria-live="polite" hidden style="margin-bottom:12px;padding:12px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;font-size:12px"></section>
+      <section id="proposal-generation-report" aria-label="목차별 PPT 생성 결과" hidden></section>
       <section id="proposal-comparison-basis" aria-labelledby="proposal-comparison-heading" style="font-size:13px;margin-bottom:12px;padding:12px;background:#f7f8fa;border-radius:8px">
         <h4 id="proposal-comparison-heading" style="margin:0 0 6px">감리 요구사항 자동 비교 기준</h4>
         <p style="margin:4px 0">요구 공수 <b>${fmtRequirement(project.required_md, 'MD')}</b>: 감리원·전문가·테스터의 전체 배정 공수 합계로 비교합니다. 추가 단계 공수도 포함합니다.</p>

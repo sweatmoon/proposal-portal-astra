@@ -758,6 +758,84 @@ test('source master IDs are unique and within the OOXML master range', async () 
   const ids = [...(await z.file('ppt/presentation.xml').async('string')).matchAll(/<p:sldMasterId\b[^>]*\bid="(\d+)"/g)].map(m => +m[1]);
   assert.equal(ids.length, 2); assert.equal(new Set(ids).size, 2); assert(ids.every(x => x >= 2147483648));
 });
+test('report locations follow registry ancestors, preserve numbers and remove duplicate title prefixes', () => {
+  const c = sandbox();
+  const section = { id: 10, menu_number: '마', menu_name: '마. 감리 품질 및 지원' };
+  const subsection = { id: 11, parent_id: 10, menu_number: '3', menu_name: '지원' };
+  const leaf = { id: 12, parent_id: 11, menu_number: '3.5', menu_name: '3.5 안전 및 보건 관리', menu_code: 'SAFETY_HEALTH' };
+  const result = c.proposalReportLocation(leaf, [section, subsection, leaf]);
+  assert.equal(result.number, '마.3.5'); assert.equal(result.name, '안전 및 보건 관리');
+  assert.equal(result.sectionName, '감리 품질 및 지원'); assert.equal(result.sectionKey, 'menu:10');
+  assert.equal(c.proposalReportLocation({ ...leaf, menu_number: '마.3.5', menu_name: '마.3.5 안전' }, [section, subsection]).number, '마.3.5');
+  assert.equal(c.proposalReportLocation({ menu_number: '라.3.7', menu_name: '투입 비율' }).sectionNumber, '라');
+  const orphan = c.proposalReportLocation({ id: 99, parent_id: 999, menu_name: '미분류' }, [section]);
+  assert.equal(orphan.sectionKey, 'ungrouped'); assert.equal(orphan.number, '');
+  const viaTree = { ...leaf, parent_id: null };
+  assert.equal(c.proposalReportLocation(viaTree, [{ ...section, children: [viaTree] }, viaTree]).number, '마.3.5');
+  assert.doesNotThrow(() => c.proposalReportLocation(leaf, [leaf, { ...subsection, parent_id: 12 }]));
+});
+function reportDOM() {
+  const document = new DOMParser().parseFromString('<html><body><section id="proposal-generation-report"/></body></html>', 'text/html');
+  const root = document.getElementById('proposal-generation-report');
+  root.replaceChildren = () => { while (root.firstChild) root.removeChild(root.firstChild); };
+  root.querySelectorAll = () => Array.from(root.getElementsByTagName('details')).filter(n => n.hasAttribute('data-section-key'));
+  return { document, root, html: () => parseHtml(new XMLSerializer().serializeToString(root)) };
+}
+test('report displays chapter groups, full numbering, state badges, slide counts and separate safe warning lines', () => {
+  const dom = reportDOM(), c = sandbox({ document: dom.document });
+  const report = { status: '부분 생성', total: 4, warnings: ['공통 안내'], entries: ['다', '라', '마', '바'].map((sectionNumber, i) => ({
+    id: i, sectionKey: sectionNumber, sectionNumber, sectionName: '목차' + i, number: sectionNumber + '.3.1', name: '검증 항목',
+    status: ['생성됨', '검토 필요', '생성 실패', '생성 중'][i], slides: i === 0 ? 2 : i === 1 ? 1 : 0,
+    warnings: i === 1 ? ['누락 토큰: [이름1], [이름2]', '<img src=x onerror=alert(1)>', '누락 토큰: [이름1], [이름2]'] : [],
+  })) };
+  c.renderProposalReport(report);
+  const html = dom.html();
+  assert.equal(dom.root.hidden, false);
+  assert.deepEqual(html.querySelectorAll('.proposal-report-section-title').map(n => n.text), ['다. 목차0', '라. 목차1', '마. 목차2', '바. 목차3']);
+  assert.deepEqual(html.querySelectorAll('.proposal-report-number').map(n => n.text), ['다.3.1', '라.3.1', '마.3.1', '바.3.1']);
+  assert(html.querySelector('.proposal-report-progress').text.includes('3 / 4개 목차 처리 · 3장 생성'));
+  assert.equal(html.querySelectorAll('.proposal-report-stats li').length, 4);
+  assert.equal(html.querySelectorAll('.proposal-report-entry-review .proposal-report-warnings li').length, 2);
+  assert.equal(html.querySelector('img'), null); assert(html.text.includes('<img src=x onerror=alert(1)>'));
+  const sections = dom.root.querySelectorAll(); sections[1].open = false;
+  report.entries[3].status = '생성됨'; c.renderProposalReport(report);
+  assert.equal(dom.root.querySelectorAll()[1].open, false);
+  c.renderProposalReport({ ...report }); assert.equal(dom.root.querySelectorAll()[1].open, true);
+});
+test('report handles standalone/common errors and missing numbering without fabricating chapter labels', () => {
+  const dom = reportDOM(), c = sandbox({ document: dom.document });
+  c.renderProposalReport({ status: '생성 실패', entries: [], warnings: ['메뉴 조회 실패'] });
+  assert.equal(dom.html().querySelectorAll('.proposal-report-section').length, 0);
+  assert(dom.html().querySelector('.proposal-report-notes').text.includes('메뉴 조회 실패'));
+  c.renderProposalReport({ status: '검토 필요', entries: [{ name: '항목', status: '생성됨', slides: 1 }] });
+  assert.equal(dom.html().querySelector('.proposal-report-section-title').text, '기타 목차');
+  assert.equal(dom.html().querySelector('.proposal-report-number').text, '번호 미등록');
+});
+test('composer report retains chapter metadata for success/failure and selected menu generation', async () => {
+  const b64 = await template(shape(para('[제목]')));
+  const good = { ...menu('QA_SYSTEM', b64), id: 21, parent_id: 20, menu_number: '1.1', sort_order: 1 };
+  const bad = { ...menu('ORGANIZATION'), id: 11, parent_id: 10, menu_number: '2.1', sort_order: 2 };
+  const tree = [{ id: 10, menu_number: '라', menu_name: '감리 수행 인력', children: [bad] },
+    { id: 20, menu_number: '마', menu_name: '품질 및 지원', children: [good] }];
+  const c = sandbox({ fetch: async url => ({ ok: true, json: async () => url.includes('master-templates') ? { ok: true, data: null } : { ok: true, data: tree } }) });
+  const zip = await c.generateProposalPpt(c.buildProjectViewModel(data()));
+  assert.equal(zip.proposalReport.total, 2); assert.equal(zip.proposalReport.status, '부분 생성');
+  assert.deepEqual(Array.from(zip.proposalReport.entries, e => e.number), ['마.1.1', '라.2.1']);
+  assert.equal(zip.proposalReport.entries[1].sectionName, '감리 수행 인력');
+  const selected = await c.generateProposalPpt(c.buildProjectViewModel(data()), ['QA_SYSTEM']);
+  assert.equal(selected.proposalReport.total, 1); assert.equal(selected.proposalReport.entries[0].number, '마.1.1');
+});
+test('PPT modal is wide and responsive with scoped report styles and accessible dialog labeling', async () => {
+  const { html } = await renderRequirements({});
+  const modal = html.querySelector('#autoModal'), dialog = modal.querySelector('.proposal-modal-dialog');
+  assert.equal(dialog.getAttribute('role'), 'dialog');
+  assert.equal(dialog.getAttribute('aria-labelledby'), 'proposal-modal-heading');
+  assert(html.querySelector('#proposal-modal-heading'));
+  assert(pageSource.includes('max-width:1120px'));
+  assert(pageSource.includes('@media (max-width:640px)'));
+  assert.equal(modal.querySelector('#proposal-generation-report').getAttribute('aria-live'), undefined);
+});
+
 test('partial generation reports failed menus without fallback or false success', async () => {
   const b64 = await template(shape(para('[제목]'))), good = menu('QA_SYSTEM', b64), bad = { ...menu('ORGANIZATION'), id: 2 };
   const c = sandbox({ fetch: async url => ({ ok: true, json: async () => url.includes('master-templates') ? { ok: true, data: null } : { ok: true, data: [good, bad] } }) });
