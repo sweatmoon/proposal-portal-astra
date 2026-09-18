@@ -773,7 +773,11 @@ var ProposalTemplate = (() => {
     const usesMD = /\[[^\[\]]*(?:공수|MD)[^\[\]]*\]/i.test(content)
       || (menu.menu_code === 'DETAIL_SCHEDULE' && nodes(doc, 'tbl').some(t => /\[단계\d+\]/.test(text(t)) && /\(0\).*MD/.test(text(t))));
     const usesPersonnel = /\[이름\d*\]/.test(content) || menu.menu_code === 'ACTION_CONFIRM_STAFF';
-    return ctx.warnings.filter(w => w.includes('제안 인력 목록') ? usesPersonnel : usesMD);
+    return ctx.warnings.filter(w => {
+      // 조치확인 표의 단계별 MD는 참여자의 post 합계이며 사업 전체 공수 비교 대상이 아니다.
+      if (menu.menu_code === 'ACTION_CONFIRM_STAFF' && w.includes('사업 제안공수')) return false;
+      return w.includes('제안 인력 목록') ? usesPersonnel : usesMD;
+    });
   }
   // 원본 표의 행 높이·글꼴·문단을 변경하지 않고, 실제 셀 폭/행간에 따른 초과 가능성을 보고한다.
   function complianceOverflow(doc, warnings) {

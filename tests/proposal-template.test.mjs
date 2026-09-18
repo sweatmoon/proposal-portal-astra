@@ -562,6 +562,42 @@ async function actionFixture() {
     row(['투입 공수','','','[단계1MD] MD','[단계2MD] MD','[단계3MD] MD','']),
     row(['주요 활동','','','고정 활동','','',''])], [800000,500000,900000,700000,700000,700000,1000000]));
 }
+test('action confirmation sums only positive post assignments per stage without inheriting whole-project MD mismatch', async () => {
+  const c = sandbox(), T = c.ProposalTemplate, d = data(); d.proposedMD = 999;
+  d.stages = ['설계', '구현', '종료'].map((stage, i) => ({ ...d.stages[0], stage,
+    감리원: { people: [
+      { name: '가', pre: 2, audit: 10, post: i === 1 ? 0 : 4 },
+      { name: '나', pre: 3, audit: 20, post: i === 1 ? 4 : 0 },
+    ] }, 전문가: { people: [{ name: '전문참여자', pre: 1, audit: 5, post: '2' }] },
+  }));
+  d.portalOrder.push({ name: '전문참여자', group: '전문가' });
+  d.personGradeMap.전문참여자 = { group: '전문가' }; d.personFieldMap.전문참여자 = '보안';
+  d.stages.push({ ...d.stages[0], stage: '조치확인없음', 감리원: { people: [{ name: '가', pre: 1, audit: 99, post: 0 }] }, 전문가: { people: [] } });
+  assert(T.context(d).warnings.some(w => w.includes('사업 제안공수')));
+  const r = await T.build(menu('ACTION_CONFIRM_STAFF', await actionFixture()), { _raw: d });
+  const doc = T.parse(await r.zip.file('ppt/slides/slide1.xml').async('string'));
+  const rows = T.nodes(doc, 'tr'), values = row => Array.from(T.nodes(row, 'tc').slice(3, 6).map(T.text));
+  assert.deepEqual(values(rows[1]), ['가', '', '가']);
+  assert.deepEqual(values(rows[2]), ['', '나', '']);
+  assert.deepEqual(values(rows[3]), ['전문참여자', '전문참여자', '전문참여자']);
+  assert.deepEqual(values(rows.find(row => T.text(row).startsWith('투입 공수'))), ['6 MD', '6 MD', '6 MD']);
+  assert(!T.text(doc).includes('조치확인없음'));
+  assert(!r.warnings.some(w => w.includes('사업 제안공수')));
+  assert(r.warnings.some(w => w.includes('수행방안·횟수')));
+});
+test('action confirmation still reports invalid assignments, unlinked participants and unresolved tokens', async () => {
+  const c = sandbox(), T = c.ProposalTemplate, d = data(); d.proposedMD = 999;
+  d.stages[0].감리원.people[1].post = -1;
+  d.portalOrder = [];
+  const z = await JSZip.loadAsync(await actionFixture(), { base64: true });
+  const path = 'ppt/slides/slide1.xml';
+  z.file(path, (await z.file(path).async('string')).replace('</p:spTree>', shape(para('[미지원토큰]')) + '</p:spTree>'));
+  const r = await T.build(menu('ACTION_CONFIRM_STAFF', await z.generateAsync({ type: 'base64' })), { _raw: d });
+  assert(!r.warnings.some(w => w.includes('사업 제안공수')));
+  assert(r.warnings.some(w => w.includes('누락·음수·비숫자')));
+  assert(r.warnings.some(w => w.includes('제안 인력 목록')));
+  assert(r.warnings.some(w => w.includes('미치환') && w.includes('[미지원토큰]')));
+});
 test('action method cell preserves rich paragraphs and cell styling while resizing its merge', async () => {
   const c = sandbox(), T = c.ProposalTemplate, d = data();
   d.stages.push({ ...d.stages[0], stage: '종료', 감리원: { people: [{ name: '나', pre: 0, audit: 5, post: 2 }] } });
