@@ -153,10 +153,44 @@ test('3.6 deduplicates actually assigned staff and separates expert categories w
   assert(!map['[전문가구성]'].includes('미배정')); assert.equal(map['[전문가공수]'], 8); assert.equal(map['[테스트공수]'], 2);
   assert.equal(map['[공통판정]'], '검토 필요');
 });
-test('3.6 rejects absent or incomplete registered template without fallback', async () => {
+test('3.6 still rejects an absent template without fallback', async () => {
   const c = sandbox();
   await assert.rejects(c.ProposalTemplate.build(menu('COMPLIANCE'), data()), /DEFAULT/);
-  await assert.rejects(c.ProposalTemplate.build(menu('COMPLIANCE', await template(shape(para('[요구 단계] 충족')))), data()), /완성 양식이 아닙니다/);
+});
+test('3.6 replaces only existing tokens; optional absence is not an error and unsupported tokens stay reported', async () => {
+  const c = sandbox();
+  for (const code of ['COMPLIANCE', 'SUMMARY_TABLE']) {
+    const b64 = await template(shape(para('고정 문구: 100% 충족')) + shape(para('[요구 단계] / [공수합계] / [지원하지않는토큰]')));
+    const result = await c.ProposalTemplate.build(menu(code, b64), data());
+    const txt = docText(c, await result.zip.file('ppt/slides/slide1.xml').async('string'));
+    assert(txt.includes('고정 문구: 100% 충족')); assert(txt.includes('1 / 10 / [지원하지않는토큰]'));
+    assert.equal(result.slideCount, 1);
+    assert(result.warnings.some(w => w.includes('미치환: [지원하지않는토큰]')));
+    assert(!result.warnings.some(w => /누락 토큰|완성 양식/.test(w)));
+    const fixed = await c.ProposalTemplate.build(menu(code, await template(shape(para('고정 문구만 있는 장표')))), data());
+    assert.equal(docText(c, await fixed.zip.file('ppt/slides/slide1.xml').async('string')), '고정 문구만 있는 장표');
+    assert(!fixed.warnings.some(w => w.includes('미치환')));
+  }
+});
+test('3.6 preserves fixed summary and status cells in the original design instead of inferring replacements', async () => {
+  const c = complianceSandbox(complianceChoices), z = await JSZip.loadAsync(complianceB64, { base64: true });
+  const path = 'ppt/slides/slide1.xml', doc = c.ProposalTemplate.parse(await z.file(path).async('string'));
+  const fixed = { '[준수요약]': '제안요청 사항 100% 충족', '[추가제안요약]': '사업 성공에 필요한 추가 제안',
+    '[방법일수판정]': '충족', '[공수판정]': '충족', '[총괄판정]': '충족', '[감리원판정]': '충족', '[공통판정]': '충족' };
+  c.ProposalTemplate.replace(doc, token => fixed[token]);
+  const serialize = n => new XMLSerializer().serializeToString(n);
+  z.file(path, serialize(doc));
+  const fixedParagraphs = c.ProposalTemplate.nodes(doc, 'p').map((p, i) => ({ p, i }))
+    .filter(({ p }) => !/\[[^\]]+\]/.test(c.ProposalTemplate.text(p)));
+  const result = await c.ProposalTemplate.build(menu('COMPLIANCE', await z.generateAsync({ type: 'base64' })), data());
+  const afterXML = await result.zip.file(path).async('string'), after = c.ProposalTemplate.parse(afterXML);
+  assert(visibleComplianceText(c, afterXML).includes('제안요청 사항 100% 충족'));
+  assert(visibleComplianceText(c, afterXML).includes('전체 배정 공수: 10 MD'));
+  for (const { p, i } of fixedParagraphs) assert.equal(serialize(c.ProposalTemplate.nodes(after, 'p')[i]), serialize(p));
+  assert.equal(withoutText(c, afterXML), withoutText(c, serialize(doc)));
+  assert(!result.warnings.some(w => /누락 토큰|미치환/.test(w)));
+  // 고정 문구의 보존은 자동 검증 성공을 의미하지 않는다. 기존 계산 보고는 유지한다.
+  assert(result.warnings.some(w => w === '투입 공수: 미충족'));
 });
 test('COMPLIANCE and SUMMARY_TABLE dispatch registered template and preserve content after foreign merge', async () => {
   const c = complianceSandbox(complianceChoices);

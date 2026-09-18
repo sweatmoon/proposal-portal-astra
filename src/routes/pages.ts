@@ -1070,7 +1070,8 @@ app.get('/proposals/:id', async (c) => {
         </select>
       </label>
       <p style="font-size:12px;color:#666">PM은 실제 공수가 배정된 감리원만 반영합니다. 자격·경력·교육은 별도 증빙 검토가 필요합니다.
-        <a href="/static/compliance-template.pptx" download="3.6_주관기관_요청사항_준수여부_플레이스홀더.pptx">3.6 완성 양식 다운로드</a> 후 목차 템플릿(DEFAULT)에 등록하세요.
+        등록된 양식의 플레이스홀더만 자동 입력하며 고정 문구는 유지합니다.
+        <a href="/static/compliance-template.pptx" download="3.6_주관기관_요청사항_준수여부_플레이스홀더.pptx">3.6 참고 양식 다운로드</a>
       </p>
       <div style="margin-bottom:16px;background:#f7f8fa;border-radius:8px;padding:12px">
         <b style="font-size:13px;color:#333">추가 제안 단계</b>

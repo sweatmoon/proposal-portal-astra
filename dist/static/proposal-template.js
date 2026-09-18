@@ -813,7 +813,7 @@ var ProposalTemplate = (() => {
   }
   async function buildCompliance(menu, vm) {
     const template = (menu.templates || []).find(t => t.pptx_b64_key && t.variant_code === 'DEFAULT') || (menu.templates || []).find(t => t.pptx_b64_key);
-    if (!template) throw new Error('3.6 플레이스홀더 완성 양식을 해당 목차의 DEFAULT 템플릿으로 등록하세요. 별도 표로 대체하지 않습니다.');
+    if (!template) throw new Error('3.6 목차에 PPT 양식을 DEFAULT 템플릿으로 등록하세요. 별도 표로 대체하지 않습니다.');
     const zip = await JSZip.loadAsync(template.pptx_b64_key, { base64: true });
     const slides = await slidePaths(zip);
     if (slides.length !== 1) throw new Error('3.6은 원본 한 장 양식을 사용해야 합니다.');
@@ -829,12 +829,9 @@ var ProposalTemplate = (() => {
       const b = geometry(el);
       return b && b.x < +size.getAttribute('cx') && b.y < +size.getAttribute('cy') && b.x + b.w > 0 && b.y + b.h > 0;
     });
-    const tokens = visible.map(text).join('').replace(/\s+/g, '');
-    const required = ['제목', '준수요약', '추가제안요약', '요구단계', '요구감리일수', '요구투입공수',
-      '단계별감리일정', '일수비교기준', '공수합계', '공수비교내역', '총괄감리원', '총괄경력', '감리원구성', '전문가구성', '교육계획',
-      '방법일수판정', '공수판정', '총괄판정', '감리원판정', '공통판정'];
-    const missing = required.filter(key => !tokens.includes(`[${key}]`));
-    if (missing.length) throw new Error(`3.6 완성 양식이 아닙니다. 누락 토큰: ${missing.join(', ')}. 완성 PPTX를 등록하세요.`);
+    // 등록 양식의 토큰은 모두 선택 사항이다. 존재하는 토큰만 치환한다.
+    // 토큰 없는 고정 문구·판정 셀·도형은 사용자의 의도이므로 추정하여 변경하지 않는다.
+    // 실제로 존재하지만 지원하지 않는 토큰만 아래 replace()에서 미치환 경고로 남긴다.
     const { map, warnings } = complianceData(context(vm._raw || vm, options()), menu);
     for (const shape of visible) {
       const unresolved = replace(shape, token => map[token]);
