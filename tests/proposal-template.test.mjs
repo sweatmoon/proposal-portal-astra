@@ -262,7 +262,7 @@ test('3.6 does not infer PM or verified residency and career from director/legac
   assert(result.map['[총괄감리원]'].includes('미지정')); assert(!result.map['[총괄감리원]'].includes(d.pmName));
   assert(result.map['[감리원구성]'].includes('미확인 1명')); assert(!result.map['[감리원구성]'].includes('50%'));
   assert.equal(result.map['[총괄판정]'], '검토 필요'); assert.equal(result.map['[감리원판정]'], '검토 필요');
-  assert.equal(result.map['[공통판정]'], '검토 필요'); assert(result.map['[총괄경력]'].includes('증빙 확인 필요'));
+  assert.equal(result.map['[공통판정]'], '검토 필요'); assert.equal(result.map['[총괄경력]'], '');
   result = c.ProposalTemplate.complianceData(c.ProposalTemplate.context(d, { compliancePM: '미배정인력' }), menu('COMPLIANCE'));
   assert(result.map['[총괄감리원]'].includes('미지정'));
 });
@@ -383,6 +383,95 @@ test('3.6 retains long schedules, warns about overflow and never adds slides or 
   assert(r.warnings.some(w => w.includes('높이 초과')));
   assert.equal(withoutText(c, after), withoutText(c, await original.file('ppt/slides/slide1.xml').async('string')));
 });
+const proposalCopyB64 = readFileSync(new URL('../public/static/compliance-proposal-template.pptx', import.meta.url)).toString('base64');
+function pmCopyFixture() {
+  const d = complianceFixture(); d.proposalId = 42; d.personnelIdMap = { 가: 7, 나: 8 };
+  d.personGradeMap.나 = { group: '감리원팀', grade: '수석감리원', residency: '상근', fulltimeKnown: true };
+  return d;
+}
+const pmProfile = { personnelId: 7, projectId: 42, name: '가', directorCount: 19, auditCount: 141, career: '6년 2개월', missingRoleCount: 0, highlights: '등록 사업 경험 A\n등록 사업 경험 B' };
+function copySandbox(profile = pmProfile, values = complianceChoices) {
+  const c = complianceSandbox(values); c.requests = [];
+  c.fetch = async (url, init) => { c.requests.push({ url, init }); return { ok: true, json: async () => ({ ok: true, data: profile }) }; };
+  return c;
+}
+function mainComplianceTable(c, xml) { return c.ProposalTemplate.nodes(c.ProposalTemplate.parse(xml), 'tbl')[0]; }
+test('finished 3.6 copy pulls the selected PM DB summary and uses original proposal sentences with red 11pt emphasis', async () => {
+  const c = copySandbox(), T = c.ProposalTemplate, d = pmCopyFixture();
+  const result = await T.build(menu('COMPLIANCE', proposalCopyB64), { _raw: d });
+  assert.equal(c.requests.length, 1); assert.equal(c.requests[0].url, '/api/personnel/7/compliance-profile?projectId=42');
+  assert.equal(c.requests[0].init.cache, 'no-store');
+  const xml = await result.zip.file(ratioSlide).async('string'), table = mainComplianceTable(c, xml), txt = T.text(table);
+  for (const phrase of ['총 10 MD', '요청공수 대비 100% 투입', '단계 감리팀 제안 공수', '총괄 수행 19건, 감리 경력 6년 2개월 / 141건', '등록 사업 경험 A', '단계 감리원 2명 : 100% 상근 수석 감리원']) assert(txt.includes(phrase), phrase);
+  for (const absent of ['이승학', '증빙 확인 필요', '수석 표기', '총괄 수행  19건 ,', '투입 기간:', '자격번호', '일수 기준:', '검토 필요']) assert(!txt.includes(absent), absent);
+  assert(!result.warnings.some(w => w.includes('미치환')));
+  const totalRun = T.nodes(table, 'r').find(r => T.text(r).includes('총 10 MD'));
+  assert.equal(T.nodes(totalRun, 'rPr')[0].getAttribute('sz'), '1100');
+  const fillColor = run => T.nodes(Array.from(T.nodes(run, 'rPr')[0].childNodes).find(n => n.localName === 'solidFill'), 'srgbClr')[0].getAttribute('val');
+  assert.equal(fillColor(totalRun), 'E60012');
+  const ratioRun = T.nodes(table, 'r').find(r => T.text(r) === '100%');
+  assert.equal(T.nodes(ratioRun, 'rPr')[0].getAttribute('sz'), '1100');
+  assert.equal(fillColor(ratioRun), 'E60012');
+  assert(T.nodes(table, 'br').length > 5);
+  assert(!T.nodes(table, 't').some(t => t.textContent.includes('\n')));
+  assert(result.warnings.some(w => w.includes('실제 현장 투입 기간의 합계는 아닙니다')));
+});
+test('finished 3.6 preserves all fixed judgments, row geometry, off-slide reference objects and media', async () => {
+  const c = copySandbox(), T = c.ProposalTemplate, original = await JSZip.loadAsync(proposalCopyB64, { base64: true });
+  const result = await T.build(menu('COMPLIANCE', proposalCopyB64), pmCopyFixture());
+  const before = T.parse(await original.file(ratioSlide).async('string')), after = T.parse(await result.zip.file(ratioSlide).async('string'));
+  const rowsBefore = T.nodes(T.nodes(before, 'tbl')[0], 'tr'), rowsAfter = T.nodes(T.nodes(after, 'tbl')[0], 'tr');
+  assert.deepEqual(Array.from(rowsAfter.map(r => r.getAttribute('h'))), Array.from(rowsBefore.map(r => r.getAttribute('h'))));
+  for (let i = 1; i < rowsBefore.length; i++) {
+    assert.equal(serialized(T.nodes(rowsAfter[i], 'tc')[2]), serialized(T.nodes(rowsBefore[i], 'tc')[2]));
+    assert.equal(serialized(T.nodes(rowsAfter[i], 'tc')[0]), serialized(T.nodes(rowsBefore[i], 'tc')[0]));
+  }
+  const shapesB = Array.from(before.getElementsByTagNameNS(P, 'spTree')[0].childNodes), shapesA = Array.from(after.getElementsByTagNameNS(P, 'spTree')[0].childNodes);
+  for (let i = 0; i < shapesB.length; i++) if (![4, 17].includes(i)) assert.equal(serialized(shapesA[i]), serialized(shapesB[i]));
+  for (const path of Object.keys(original.files).filter(p => !original.files[p].dir && !/^ppt\/(slides|slideLayouts|slideMasters)\/[^/]+\.xml$/.test(p))) {
+    assert.deepEqual(await result.zip.file(path).async('uint8array'), await original.file(path).async('uint8array'), path);
+  }
+});
+test('finished 3.6 never reuses wrong-person history, fakes zero on lookup failure or writes report warnings into proposal copy', async () => {
+  for (const profile of [{ ...pmProfile, name: '다른사람' }, { ...pmProfile, personnelId: 8 }, { ...pmProfile, projectId: 99 }, { ...pmProfile, auditCount: -1 }]) {
+    const c = copySandbox(profile), T = c.ProposalTemplate;
+    const result = await T.build(menu('COMPLIANCE', proposalCopyB64), pmCopyFixture());
+    const txt = T.text(mainComplianceTable(c, await result.zip.file(ratioSlide).async('string')));
+    assert(!txt.includes('총괄 수행')); assert(!txt.includes('141건')); assert(!txt.includes('조회 실패'));
+    assert(result.warnings.some(w => w.includes('조회 실패')));
+  }
+  const c = copySandbox(); c.fetch = async () => { throw new Error('timeout'); };
+  const r = await c.ProposalTemplate.build(menu('COMPLIANCE', proposalCopyB64), pmCopyFixture());
+  assert(r.warnings.some(w => w.includes('조회 실패')));
+  const zero = copySandbox({ ...pmProfile, directorCount: 0, auditCount: 0, career: null, highlights: '' });
+  const z = await zero.ProposalTemplate.build(menu('COMPLIANCE', proposalCopyB64), pmCopyFixture());
+  assert(zero.ProposalTemplate.text(mainComplianceTable(zero, await z.zip.file(ratioSlide).async('string'))).includes('총괄 수행 0건, 감리 경력 — / 0건'));
+});
+test('finished 3.6 only fetches history for an assigned selected PM with an explicit DB ID and a history token', async () => {
+  const c = copySandbox();
+  const fixed = await template(shape(para('총괄 이력 고정 문구')));
+  await c.ProposalTemplate.build(menu('COMPLIANCE', fixed), pmCopyFixture()); assert.equal(c.requests.length, 0);
+  const d = pmCopyFixture(); d.personnelIdMap = {};
+  const r = await c.ProposalTemplate.build(menu('COMPLIANCE', proposalCopyB64), d); assert.equal(c.requests.length, 0);
+  assert(r.warnings.some(w => w.includes('연결 ID')));
+  const none = copySandbox(pmProfile, { 'proposal-compliance-pm': '미배정인력' });
+  await none.ProposalTemplate.build(menu('COMPLIANCE', proposalCopyB64), pmCopyFixture()); assert.equal(none.requests.length, 0);
+  const legacy = await c.ProposalTemplate.build(menu('COMPLIANCE', complianceB64), pmCopyFixture());
+  assert(c.ProposalTemplate.text(mainComplianceTable(c, await legacy.zip.file(ratioSlide).async('string'))).includes('총괄 수행 19건, 감리 경력 6년 2개월 / 141건'));
+});
+test('finished 3.6 handles six stages, raw missing MD, escaped DB text and optional additional notes without inventing facts', async () => {
+  const d = pmCopyFixture(); d.stages = Array.from({ length: 6 }, (_, i) => ({ ...d.stages[0], stage: `실제단계${i + 1}` }));
+  const c = copySandbox({ ...pmProfile, highlights: 'A&B <사업>\n두번째\n세번째' }, { ...complianceChoices, 'proposal-compliance-auditor-notes': '확인된 <경험>', 'proposal-compliance-education': '확정 교육 1회' });
+  const result = await c.ProposalTemplate.build(menu('COMPLIANCE', proposalCopyB64), d);
+  const table = mainComplianceTable(c, await result.zip.file(ratioSlide).async('string')), text = c.ProposalTemplate.text(table);
+  assert(text.includes('실제단계6')); assert(text.includes('A&B <사업>')); assert(!text.includes('세번째'));
+  assert(text.includes('확인된 <경험>')); assert(text.includes('확정 교육 1회'));
+  assert(result.warnings.some(w => w.includes('앞 두 항목')));
+  d.stages[0].감리원.people[0].mdComplete = false;
+  const missing = await c.ProposalTemplate.build(menu('COMPLIANCE', proposalCopyB64), d);
+  assert(c.ProposalTemplate.text(mainComplianceTable(c, await missing.zip.file(ratioSlide).async('string'))).includes('총 — MD'));
+});
+
 const summaryFunctionSource = readFileSync(new URL('../public/static/proposal-detail.js', import.meta.url), 'utf8').split('async function downloadSummaryTablePptx')[1].split('// ── 전체 합본 PPT')[0];
 test('standalone 3.6 reloads registry, returns same template result and downloads despite warnings', async () => {
   const c = complianceSandbox(complianceChoices); let clicked = 0, calls = 0;

@@ -62,6 +62,67 @@ app.post('/photo-images', async (c) => {
   return c.json({ ok: true, results: await fetchPersonnelPhotoResults(body.names) })
 })
 
+// 인력정보와 같은 감리이력 행 기준 집계. 사업명 중복 제거로 전체 건수를 줄이지 않는다.
+export function summarizeComplianceHistory(
+  person: { auditor_start_date?: unknown },
+  history: { audit_yearmonth?: unknown; role?: unknown }[],
+  now = new Date(),
+) {
+  const ym = (value: unknown): string | null => {
+    const m = String(value ?? '').trim().match(/^(\d{4})[.\-/\s년]+(\d{1,2})(?:$|[.\-/\s월])/)
+    return m && +m[2] >= 1 && +m[2] <= 12 ? `${m[1]}.${m[2].padStart(2, '0')}` : null
+  }
+  const first = history.map(h => ym(h.audit_yearmonth)).filter((s): s is string => s !== null).sort()[0]
+    ?? ym(person.auditor_start_date)
+  let career: string | null = null
+  if (first) {
+    const [year, month] = first.split('.').map(Number)
+    const months = (now.getFullYear() - year) * 12 + now.getMonth() + 1 - month
+    if (months >= 0) {
+      const years = Math.floor(months / 12), rest = months % 12
+      career = years ? `${years}년${rest ? ` ${rest}개월` : ''}` : `${rest}개월`
+    }
+  }
+  const directorRoles = new Set(['총괄', '총괄감리원', '총괄감리', '감리총괄', '총괄책임자', '총괄책임감리원', '총괄PM', 'PM'])
+  const isDirector = (role: unknown) => String(role ?? '').replace(/\s+/g, '').toUpperCase()
+    .split(/[,/;|()·]+/).some(token => directorRoles.has(token))
+  return {
+    auditCount: history.length,
+    directorCount: history.filter(h => isDirector(h.role)).length,
+    career,
+    careerStart: first ?? null,
+    missingRoleCount: history.filter(h => !String(h.role ?? '').trim()).length,
+  }
+}
+
+// 3.6 전용 읽기 API: 인력 ID와 제안 사업 연결을 확인하고 필요한 요약만 반환한다. NAS 호출 없음.
+app.get('/:id/compliance-profile', async (c) => {
+  const personnelId = Number(c.req.param('id')), projectId = Number(c.req.query('projectId'))
+  if (!Number.isSafeInteger(personnelId) || personnelId <= 0 || !Number.isSafeInteger(projectId) || projectId <= 0)
+    return c.json({ ok: false, error: 'invalid_id' }, 400)
+  c.header('Cache-Control', 'no-store')
+  try {
+    const member = await queryOne<{ person_name: string }>(
+      'SELECT person_name FROM proposal_members WHERE project_id = $1 AND personnel_id = $2 LIMIT 1', [projectId, personnelId]
+    )
+    if (!member) return c.json({ ok: false, error: 'person_not_in_proposal' }, 404)
+    const person = await queryOne<{ name: string; auditor_start_date: string | null; career_expert: string | null }>(
+      'SELECT name, auditor_start_date, career_expert FROM personnel WHERE id = $1', [personnelId]
+    )
+    if (!person) return c.json({ ok: false, error: 'person_not_found' }, 404)
+    const history = await query<{ audit_yearmonth: string; role: string | null }>(
+      'SELECT audit_yearmonth, role FROM personnel_audit_history WHERE personnel_id = $1 ORDER BY audit_yearmonth ASC', [personnelId]
+    )
+    return c.json({ ok: true, data: {
+      personnelId, projectId, name: member.person_name,
+      ...summarizeComplianceHistory(person, history),
+      highlights: person.career_expert ?? '',
+    } })
+  } catch {
+    return c.json({ ok: false, error: 'compliance_profile_unavailable' }, 503)
+  }
+})
+
 app.get('/:id', async (c) => {
   const id = Number(c.req.param('id'))
   if (isNaN(id)) return c.json({ ok: false, error: 'invalid id' }, 400)

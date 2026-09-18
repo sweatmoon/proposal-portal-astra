@@ -115,6 +115,61 @@ test('name route bypasses dynamic id route; batch is read-only and validates inp
   assert.equal(calls.length, before);
 });
 
+async function complianceApi({ member = { person_name: '시험PM' }, person = { name: '시험PM', auditor_start_date: '2020.07', career_expert: '등록 주요이력' }, history = [], fail = false } = {}) {
+  const db = moduleUrl(`export const calls = [];
+    export async function queryOne(sql, params) {
+      if (!/^SELECT /i.test(sql)) throw new Error('Read-only SELECT required');
+      calls.push({sql, params}); if (${fail}) throw new Error('db secret must not leak');
+      return sql.includes('proposal_members') ? ${JSON.stringify(member)} : ${JSON.stringify(person)};
+    }
+    export async function query(sql, params) {
+      if (!/^SELECT /i.test(sql) || !sql.includes('personnel_audit_history')) throw new Error('Unexpected query');
+      calls.push({sql, params}); return ${JSON.stringify(history)};
+    }
+    // instance ${sequence++}`);
+  const nas = moduleUrl('export function fetchPersonnelPhotoResults(){throw new Error("NAS forbidden")}; export function validPhotoName(){return true}');
+  const routes = routeSource.replace("'hono'", JSON.stringify(import.meta.resolve('hono')))
+    .replace("'../db/client.js'", JSON.stringify(db)).replace("'../lib/nas-client.js'", JSON.stringify(nas));
+  return { mod: await import(moduleUrl(routes)), db: await import(db) };
+}
+test('compliance DB summary counts role-specific history rows and matches personnel career years/months', async () => {
+  const { mod } = await complianceApi();
+  const history = Array.from({ length: 141 }, (_, i) => ({ audit_yearmonth: '2020.07', role: i < 19 ? '총괄 감리원' : '감리원' }));
+  const result = mod.summarizeComplianceHistory({}, history, new Date(2026, 8, 18));
+  assert.equal(result.directorCount, 19); assert.equal(result.auditCount, 141); assert.equal(result.career, '6년 2개월');
+  const roles = ['총괄', '감리총괄', 'PM', '총괄(PM)', '부총괄', '비총괄', '총괄 보조', '감리원', null];
+  const r = mod.summarizeComplianceHistory({ auditor_start_date: '2020.07' }, roles.map(role => ({ role })), new Date(2026, 8, 18));
+  assert.equal(r.directorCount, 4); assert.equal(r.missingRoleCount, 1); assert.equal(r.career, '6년 2개월');
+  assert.equal(mod.summarizeComplianceHistory({}, [], new Date(2026, 8, 18)).career, null);
+  assert.equal(mod.summarizeComplianceHistory({ auditor_start_date: '2027.01' }, [], new Date(2026, 8, 18)).career, null);
+  assert.equal(mod.summarizeComplianceHistory({ auditor_start_date: '2020.13' }, [], new Date(2026, 8, 18)).career, null);
+});
+test('compliance profile API uses linked personnel ID, SELECT-only data and no NAS', async () => {
+  const { mod, db } = await complianceApi({ history: [{ role: '총괄', audit_yearmonth: '2020.07' }, { role: '감리원', audit_yearmonth: '2021.09' }] });
+  const response = await mod.default.request('/7/compliance-profile?projectId=42');
+  assert.equal(response.status, 200); assert.equal(response.headers.get('cache-control'), 'no-store');
+  const { data } = await response.json();
+  assert.equal(data.personnelId, 7); assert.equal(data.projectId, 42); assert.equal(data.name, '시험PM');
+  assert.equal(data.directorCount, 1); assert.equal(data.auditCount, 2); assert.equal(data.highlights, '등록 주요이력');
+  assert.deepEqual(db.calls.map(c => c.params), [[42, 7], [7], [7]]);
+  const count = db.calls.length;
+  for (const path of ['/0/compliance-profile?projectId=42', '/7/compliance-profile', '/7.5/compliance-profile?projectId=42', '/7/compliance-profile?projectId=-1']) {
+    assert.equal((await mod.default.request(path)).status, 400);
+  }
+  assert.equal(db.calls.length, count);
+});
+test('compliance profile distinguishes real zero history from unlinked person and DB failure', async () => {
+  const zero = await complianceApi();
+  const data = (await (await zero.mod.default.request('/7/compliance-profile?projectId=42')).json()).data;
+  assert.equal(data.auditCount, 0); assert.equal(data.directorCount, 0);
+  const absent = await complianceApi({ member: null });
+  assert.equal((await absent.mod.default.request('/7/compliance-profile?projectId=42')).status, 404);
+  assert.equal(absent.db.calls.length, 1);
+  const failed = await complianceApi({ fail: true });
+  const response = await failed.mod.default.request('/7/compliance-profile?projectId=42');
+  assert.equal(response.status, 503); assert(!JSON.stringify(await response.json()).includes('secret'));
+});
+
 function photoBrowser(fetch) {
   const c = vm.createContext({ fetch, atob, Uint8Array });
   vm.runInContext(detail.slice(detail.indexOf('async function loadProposalPhotos('), detail.indexOf('async function downloadPhotoAssignPptx(')), c);
