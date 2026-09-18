@@ -1,0 +1,4440 @@
+/**
+ * 메인화면 라우트 + 제안작업표 목록/상세 라우트
+ */
+import { Hono } from 'hono';
+import { query, queryOne } from '../db/client.js';
+import { layout, statusBadge, fmtMoney, fmtDate } from '../views/layout.js';
+// [ppt-portal 추가 기능] "첨부PPT 생성" 위젯 — 자세한 설명/이식 방법은 파일 상단 주석 참고.
+// ── 감리경력 "n년 n개월" 포맷 헬퍼 ──────────────────────────────
+// earliest: "YYYY.MM" 문자열
+function fmtCareer(earliest) {
+    if (!earliest)
+        return '-';
+    const m = String(earliest).match(/^(\d{4})\.(\d{2})$/);
+    if (!m)
+        return '-';
+    const [, sy, sm] = m;
+    const now = new Date();
+    const totalMonths = (now.getFullYear() - Number(sy)) * 12 + (now.getMonth() + 1 - Number(sm));
+    if (totalMonths < 0)
+        return '-';
+    const years = Math.floor(totalMonths / 12);
+    const months = totalMonths % 12;
+    if (years === 0)
+        return `${months}개월`;
+    if (months === 0)
+        return `${years}년`;
+    return `${years}년 ${months}개월`;
+}
+// ── 인력풀 카드 SSR 헬퍼 ─────────────────────────────────────────
+// 인력 풀 섹션에서 각 인원 카드를 서버 사이드로 렌더링
+function renderPoolPersonSSR(name, fieldMap, gradeMap) {
+    const field = fieldMap[name] || '';
+    const info = gradeMap[name] || {};
+    const rawGrade = info.grade || '';
+    const grade = rawGrade === '수석감리원' ? '수석감리원'
+        : rawGrade === '감리원' ? '감리원'
+            : rawGrade === '테스터' ? '테스터'
+                : '전문가';
+    const gradeColor = grade === '수석감리원' ? '#1a2e4a'
+        : grade === '감리원' ? '#3a6ea8'
+            : grade === '테스터' ? '#6b21a8'
+                : '#2e7d32';
+    const safeName = name.replace(/"/g, '&quot;');
+    const safeField = field.replace(/"/g, '&quot;');
+    return `<div class="pool-person" data-name="${safeName}" data-field="${safeField}" ` +
+        `style="display:flex;flex-direction:column;gap:3px;padding:6px 10px;border-radius:6px;` +
+        `margin-bottom:5px;background:#f8f9fc;border:1px solid #e5e8f0;cursor:pointer;transition:background .15s" ` +
+        `onclick="highlightByName('${safeName}')" title="${safeName} 강조">` +
+        (field
+            ? `<span style="font-size:10px;color:#2e7d32;font-style:italic;background:#e8f5e9;` +
+                `border:1px solid #c8e6c9;border-radius:3px;padding:1px 5px;display:inline-block">${field}</span>`
+            : '') +
+        `<div style="display:flex;align-items:center;gap:6px">` +
+        `<span style="background:${gradeColor};color:#fff;border-radius:4px;font-size:11px;` +
+        `padding:2px 7px;font-weight:700;flex-shrink:0">${grade}</span>` +
+        `<span style="font-size:13px;font-weight:700;color:#1a2e4a">${name}</span>` +
+        `</div>` +
+        `</div>`;
+}
+const app = new Hono();
+// ── 메인 (대시보드) ───────────────────────────────────────────
+app.get('/', async (c) => {
+    const [totalProjects, totalPersonnel, statusRows, recentProjects] = await Promise.all([
+        queryOne('SELECT COUNT(*) AS cnt FROM audit_projects'),
+        queryOne('SELECT COUNT(*) AS cnt FROM personnel'),
+        query('SELECT proposal_status, COUNT(*) AS cnt FROM audit_projects GROUP BY proposal_status ORDER BY cnt DESC'),
+        query(`
+      SELECT id, project_name, client_org, bid_deadline, bid_amount, proposal_status, bid_rate
+      FROM audit_projects
+      ORDER BY updated_at DESC NULLS LAST
+      LIMIT 8
+    `),
+    ]);
+    const tProj = Number(totalProjects?.cnt ?? 0);
+    const tPers = Number(totalPersonnel?.cnt ?? 0);
+    const statusCards = [
+        { label: '입력중', icon: 'fa-pen', color: 'yellow', key: '입력중' },
+        { label: '자동화요청', icon: 'fa-robot', color: 'blue', key: '자동화요청' },
+        { label: '지원요청', icon: 'fa-hand-paper', color: 'purple', key: '지원요청' },
+        { label: '지원완료', icon: 'fa-check-circle', color: 'green', key: '지원완료' },
+    ].map(sc => {
+        const cnt = Number(statusRows.find(r => r.proposal_status === sc.key)?.cnt ?? 0);
+        const colorMap = {
+            yellow: 'bg-yellow-50 border-yellow-200 text-yellow-700',
+            blue: 'bg-blue-50 border-blue-200 text-blue-700',
+            purple: 'bg-violet-50 border-violet-200 text-violet-700',
+            green: 'bg-emerald-50 border-emerald-200 text-emerald-700',
+        };
+        const iconMap = {
+            yellow: 'bg-yellow-100 text-yellow-600',
+            blue: 'bg-blue-100 text-blue-600',
+            purple: 'bg-violet-100 text-violet-600',
+            green: 'bg-emerald-100 text-emerald-600',
+        };
+        return `
+    <a href="/proposals?status=${encodeURIComponent(sc.key)}"
+       class="bg-white border ${colorMap[sc.color]} rounded-2xl p-5 card-hover flex items-center gap-4">
+      <div class="w-12 h-12 rounded-xl ${iconMap[sc.color]} flex items-center justify-center flex-shrink-0">
+        <i class="fas ${sc.icon} text-xl"></i>
+      </div>
+      <div>
+        <p class="text-2xl font-bold">${cnt}</p>
+        <p class="text-sm font-medium mt-0.5">${sc.label}</p>
+      </div>
+    </a>`;
+    }).join('');
+    const recentRows = recentProjects.map(p => `
+    <tr class="hover:bg-slate-50 cursor-pointer" onclick="location.href='/proposals/${p.id}'">
+      <td class="px-4 py-3 text-sm font-medium text-indigo-700 max-w-xs truncate">${p.project_name}</td>
+      <td class="px-4 py-3 text-sm text-slate-600">${p.client_org ?? '-'}</td>
+      <td class="px-4 py-3 text-sm text-slate-600">${fmtDate(p.bid_deadline)}</td>
+      <td class="px-4 py-3 text-sm text-right text-slate-700 font-medium">${fmtMoney(p.bid_amount)}</td>
+      <td class="px-4 py-3 text-center">${statusBadge(p.proposal_status)}</td>
+    </tr>`).join('');
+    const body = `
+  <div class="p-6 md:p-8">
+    <!-- 페이지 타이틀 -->
+    <div class="mb-8">
+      <h1 class="text-2xl font-bold text-slate-800">대시보드</h1>
+      <p class="text-slate-500 text-sm mt-1">제안팀 포털 현황</p>
+    </div>
+
+    <!-- 상단 KPI 카드 2개 -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+      <a href="/proposals" class="bg-white rounded-2xl p-5 border border-slate-200 card-hover flex items-center gap-4 col-span-2 md:col-span-1">
+        <div class="w-12 h-12 rounded-xl bg-indigo-100 text-indigo-600 flex items-center justify-center flex-shrink-0">
+          <i class="fas fa-clipboard-list text-xl"></i>
+        </div>
+        <div>
+          <p class="text-2xl font-bold text-slate-800">${tProj}</p>
+          <p class="text-sm text-slate-500 mt-0.5">전체 제안작업표</p>
+        </div>
+      </a>
+      <a href="/personnel" class="bg-white rounded-2xl p-5 border border-slate-200 card-hover flex items-center gap-4 col-span-2 md:col-span-1">
+        <div class="w-12 h-12 rounded-xl bg-teal-100 text-teal-600 flex items-center justify-center flex-shrink-0">
+          <i class="fas fa-users text-xl"></i>
+        </div>
+        <div>
+          <p class="text-2xl font-bold text-slate-800">${tPers}</p>
+          <p class="text-sm text-slate-500 mt-0.5">등록 인력</p>
+        </div>
+      </a>
+      ${statusCards}
+    </div>
+
+    <!-- 최근 제안작업표 -->
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm">
+      <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
+        <h2 class="font-bold text-slate-700"><i class="fas fa-clock mr-2 text-slate-400"></i>최근 제안작업표</h2>
+        <a href="/proposals" class="text-sm text-indigo-600 hover:underline">전체보기 →</a>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full">
+          <thead>
+            <tr class="bg-slate-50 text-xs text-slate-500 uppercase">
+              <th class="px-4 py-3 text-left">사업명</th>
+              <th class="px-4 py-3 text-left">발주기관</th>
+              <th class="px-4 py-3 text-left">입찰마감</th>
+              <th class="px-4 py-3 text-right">입찰금액</th>
+              <th class="px-4 py-3 text-center">상태</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100">
+            ${recentRows || '<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400">데이터가 없습니다</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>`;
+    return c.html(layout('홈', body, 'home'));
+});
+// ── 제안작업표 목록 ───────────────────────────────────────────
+app.get('/proposals', async (c) => {
+    const status = c.req.query('status') || '';
+    const search = c.req.query('search') || '';
+    const PAGE_SIZE = 10;
+    const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
+    let whereSql = `FROM audit_projects p LEFT JOIN proposal_members pm ON pm.project_id = p.id WHERE 1=1`;
+    const params = [];
+    let idx = 1;
+    if (status) {
+        whereSql += ` AND p.proposal_status = $${idx++}`;
+        params.push(status);
+    }
+    if (search) {
+        whereSql += ` AND (p.project_name ILIKE $${idx} OR p.client_org ILIKE $${idx})`;
+        params.push(`%${search}%`);
+        idx++;
+    }
+    const countSql = `SELECT COUNT(DISTINCT p.id) AS total ${whereSql}`;
+    const countRow = await query(countSql, params);
+    const totalCount = parseInt(countRow[0]?.total || '0', 10);
+    const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+    const currentPage = Math.min(page, totalPages);
+    const offset = (currentPage - 1) * PAGE_SIZE;
+    let sql = `
+    SELECT p.id, p.project_name, p.client_org, p.bid_notice_no,
+           p.bid_deadline, p.bid_amount, p.bid_rate,
+           p.required_md, p.proposed_md,
+           p.proposal_status, p.eval_method,
+           p.writer, p.director, p.registered_yearmonth,
+           COUNT(DISTINCT pm.id) AS member_count
+    ${whereSql}
+    GROUP BY p.id ORDER BY p.bid_deadline DESC NULLS LAST, p.id DESC
+    LIMIT $${idx} OFFSET $${idx + 1}
+  `;
+    params.push(PAGE_SIZE, offset);
+    const projects = await query(sql, params);
+    const statusTabs = ['', '입력중', '자동화요청', '지원요청', '지원완료'].map(s => {
+        const active = status === s;
+        return `<a href="/proposals${s ? '?status=' + encodeURIComponent(s) : ''}"
+      class="px-4 py-2 rounded-lg text-sm font-medium transition whitespace-nowrap
+      ${active ? 'bg-indigo-600 text-white' : 'bg-white border border-slate-200 text-slate-600 hover:border-indigo-300'}">
+      ${s || '전체'}</a>`;
+    }).join('');
+    const rows = projects.map((p, i) => `
+    <tr class="hover:bg-indigo-50 transition group" onclick="location.href='/proposals/${p.id}'">
+      <td class="px-4 py-3 text-center text-sm text-slate-400">${offset + i + 1}</td>
+      <td class="px-4 py-3">
+        <div class="text-sm font-semibold text-indigo-700 leading-snug line-clamp-2 max-w-xs">${p.project_name}</div>
+        ${p.bid_notice_no ? `<div class="text-xs text-slate-400 mt-0.5">${p.bid_notice_no}</div>` : ''}
+      </td>
+      <td class="px-4 py-3 text-sm text-slate-600">${p.client_org ?? '-'}</td>
+      <td class="px-4 py-3 text-sm text-slate-600 text-center">${p.registered_yearmonth ?? '-'}</td>
+      <td class="px-4 py-3 text-sm font-medium text-center ${p.bid_deadline?.includes('2026') ? 'text-red-600' : 'text-slate-600'}">${fmtDate(p.bid_deadline)}</td>
+      <td class="px-4 py-3 text-sm text-right font-semibold text-slate-700">${fmtMoney(p.bid_amount)}</td>
+      <td class="px-4 py-3 text-center text-sm text-slate-500">${p.bid_rate != null ? Math.round(Number(p.bid_rate) * 100) + '%' : '-'}</td>
+      <td class="px-4 py-3 text-center text-sm text-slate-600">${p.required_md ?? '-'} MD</td>
+      <td class="px-4 py-3 text-center text-sm text-slate-600">${p.member_count ?? 0}명</td>
+      <td class="px-4 py-3 text-center">${statusBadge(p.proposal_status)}</td>
+      <td class="px-4 py-3 text-center" onclick="event.stopPropagation()">
+        <button onclick="confirmDelete(${p.id}, '${String(p.project_name).replace(/'/g, "\\'")}')"
+          class="opacity-0 group-hover:opacity-100 transition-opacity px-2.5 py-1.5 bg-red-50 hover:bg-red-100 text-red-500 hover:text-red-700 rounded-lg text-xs font-medium border border-red-200 hover:border-red-400 flex items-center gap-1 whitespace-nowrap">
+          <i class="fas fa-trash-alt"></i> 삭제
+        </button>
+      </td>
+    </tr>`).join('');
+    const body = `
+  <div class="p-6 md:p-8">
+    <div class="mb-6">
+      <h1 class="text-2xl font-bold text-slate-800">제안작업표</h1>
+      <p class="text-slate-500 text-sm mt-1">총 ${totalCount}건</p>
+    </div>
+
+    <!-- 필터 + 검색 -->
+    <div class="flex flex-wrap gap-2 mb-4 items-center">
+      <div class="flex flex-wrap gap-2">${statusTabs}</div>
+      <div class="ml-auto">
+        <form method="GET" action="/proposals" class="flex gap-2">
+          ${status ? `<input type="hidden" name="status" value="${status}">` : ''}
+          <input type="text" name="search" value="${search}"
+            placeholder="사업명 / 발주기관 검색..."
+            class="border border-slate-200 rounded-lg px-3 py-2 text-sm w-56 focus:outline-none focus:ring-2 focus:ring-indigo-300">
+          <button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">
+            <i class="fas fa-search"></i>
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- 목록 테이블 -->
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="bg-slate-50 text-xs text-slate-500 uppercase border-b border-slate-200">
+              <th class="px-4 py-3 text-center w-10">#</th>
+              <th class="px-4 py-3 text-left">사업명</th>
+              <th class="px-4 py-3 text-left">발주기관</th>
+              <th class="px-4 py-3 text-center">등록년월</th>
+              <th class="px-4 py-3 text-center">입찰마감</th>
+              <th class="px-4 py-3 text-right">입찰금액</th>
+              <th class="px-4 py-3 text-center">투찰률</th>
+              <th class="px-4 py-3 text-center">요구공수</th>
+              <th class="px-4 py-3 text-center">제안인력</th>
+              <th class="px-4 py-3 text-center">상태</th>
+              <th class="px-4 py-3 text-center w-16"></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100">
+            ${rows || '<tr><td colspan="11" class="px-4 py-12 text-center text-slate-400">데이터가 없습니다.<br><a href="/upload" class="text-indigo-500 underline mt-2 inline-block">HTML 파일을 업로드해주세요</a></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+      ${totalPages > 1 ? `
+      <div class="flex items-center justify-center gap-1 px-4 py-3 border-t border-slate-100">
+        ${currentPage > 1 ? `<a href="/proposals?${new URLSearchParams({ ...(status ? { status } : {}), ...(search ? { search } : {}), page: String(currentPage - 1) }).toString()}" class="px-3 py-1.5 rounded-lg border border-slate-200 text-sm text-slate-600 hover:border-indigo-300 hover:text-indigo-600 transition"><i class="fas fa-chevron-left"></i></a>` : `<span class="px-3 py-1.5 rounded-lg border border-slate-100 text-sm text-slate-300"><i class="fas fa-chevron-left"></i></span>`}
+        ${Array.from({ length: totalPages }, (_, i) => i + 1).map(pg => {
+        const isActive = pg === currentPage;
+        const url = '/proposals?' + new URLSearchParams({ ...(status ? { status } : {}), ...(search ? { search } : {}), page: String(pg) }).toString();
+        return isActive
+            ? `<span class="px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-sm font-semibold">${pg}</span>`
+            : `<a href="${url}" class="px-3 py-1.5 rounded-lg border border-slate-200 text-sm text-slate-600 hover:border-indigo-300 hover:text-indigo-600 transition">${pg}</a>`;
+    }).join('')}
+        ${currentPage < totalPages ? `<a href="/proposals?${new URLSearchParams({ ...(status ? { status } : {}), ...(search ? { search } : {}), page: String(currentPage + 1) }).toString()}" class="px-3 py-1.5 rounded-lg border border-slate-200 text-sm text-slate-600 hover:border-indigo-300 hover:text-indigo-600 transition"><i class="fas fa-chevron-right"></i></a>` : `<span class="px-3 py-1.5 rounded-lg border border-slate-100 text-sm text-slate-300"><i class="fas fa-chevron-right"></i></span>`}
+      </div>` : ''}
+    </div>
+  </div>
+
+  <!-- 삭제 확인 모달 -->
+  <div id="deleteModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div class="absolute inset-0 bg-black/40 backdrop-blur-sm" onclick="closeDeleteModal()"></div>
+    <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 p-6">
+      <div class="flex items-center gap-3 mb-4">
+        <div class="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center flex-shrink-0">
+          <i class="fas fa-trash-alt text-red-500"></i>
+        </div>
+        <div>
+          <h3 class="font-bold text-slate-800 text-base">제안건 삭제</h3>
+          <p class="text-xs text-slate-500 mt-0.5">이 작업은 되돌릴 수 없습니다</p>
+        </div>
+      </div>
+      <div class="bg-red-50 border border-red-200 rounded-xl px-4 py-3 mb-5">
+        <p class="text-sm text-red-700 font-medium" id="deleteModalName"></p>
+        <p class="text-xs text-red-500 mt-1">감리 단계, 투입 인력, 키워드 등 모든 관련 데이터가 함께 삭제됩니다.</p>
+      </div>
+      <div class="flex gap-3 justify-end">
+        <button onclick="closeDeleteModal()"
+          class="px-4 py-2 rounded-xl border border-slate-200 text-slate-600 text-sm hover:bg-slate-50 transition">
+          취소
+        </button>
+        <button id="deleteConfirmBtn" onclick="executeDelete()"
+          class="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-700 text-white text-sm font-semibold transition flex items-center gap-2">
+          <i class="fas fa-trash-alt"></i> 삭제
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  var _deleteTargetId = null;
+  function confirmDelete(id, name) {
+    _deleteTargetId = id;
+    document.getElementById('deleteModalName').textContent = name;
+    document.getElementById('deleteModal').classList.remove('hidden');
+  }
+  function closeDeleteModal() {
+    document.getElementById('deleteModal').classList.add('hidden');
+    _deleteTargetId = null;
+  }
+  async function executeDelete() {
+    if (!_deleteTargetId) return;
+    var btn = document.getElementById('deleteConfirmBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 삭제 중...';
+    try {
+      var res = await fetch('/api/projects/' + _deleteTargetId, { method: 'DELETE' });
+      var json = await res.json();
+      if (json.ok) {
+        closeDeleteModal();
+        location.reload();
+      } else {
+        alert('삭제 실패: ' + (json.error || '알 수 없는 오류'));
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-trash-alt"></i> 삭제';
+      }
+    } catch(e) {
+      alert('삭제 중 오류가 발생했습니다: ' + e.message);
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-trash-alt"></i> 삭제';
+    }
+  }
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') closeDeleteModal();
+  });
+  </script>`;
+    return c.html(layout('제안작업표', body, 'proposals'));
+});
+// ── 제안작업표 상세 ───────────────────────────────────────────
+app.get('/proposals/:id', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (isNaN(id))
+        return c.redirect('/proposals');
+    const project = await queryOne('SELECT * FROM audit_projects WHERE id = $1', [id]);
+    if (!project)
+        return c.html(layout('없음', '<div class="p-8 text-center text-red-500">프로젝트를 찾을 수 없습니다</div>', 'proposals'));
+    const [phases, members, keywords, files, toc, kwMappings] = await Promise.all([
+        query(`
+      SELECT ph.*,
+        COALESCE(json_agg(
+          json_build_object(
+            'id', pa.id, 'person_name', pa.person_name, 'member_type', pa.member_type,
+            'domain', pa.domain, 'pre_survey_md', pa.pre_survey_md,
+            'audit_md', pa.audit_md, 'action_confirm_md', pa.action_confirm_md,
+            'total_md', pa.total_md
+          ) ORDER BY pa.id
+        ) FILTER (WHERE pa.id IS NOT NULL), '[]'::json) AS assignments
+      FROM audit_phases ph
+      LEFT JOIN audit_phase_assignments pa ON pa.phase_id = ph.id
+      WHERE ph.project_id = $1
+      GROUP BY ph.id ORDER BY ph.phase_order, ph.id
+    `, [id]),
+        query(`SELECT * FROM proposal_members WHERE project_id = $1 ORDER BY id ASC`, [id]),
+        query(`SELECT * FROM keywords WHERE project_id = $1 ORDER BY sort_order`, [id]),
+        query(`SELECT * FROM proposal_files WHERE project_id = $1 ORDER BY id`, [id]),
+        query(`SELECT * FROM proposal_attachments_toc WHERE project_id = $1 ORDER BY item_order`, [id]),
+        query(`SELECT id, original_keyword, mapped_keyword FROM keyword_mappings WHERE project_id = $1 ORDER BY id ASC`, [id]),
+    ]);
+    // 키워드 태그
+    const kwTags = keywords.map(k => `<span class="inline-block px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full text-xs">${k.keyword}</span>`).join(' ');
+    // ── DB → parsedData 포맷 변환 ────────────────────────────────
+    // proposal_members → personFieldMap / personGradeMap / portalOrder
+    const personFieldMap = {};
+    const personGradeMap = {};
+    const portalOrder = [];
+    members.forEach(m => {
+        const name = String(m.person_name ?? '');
+        if (!name)
+            return;
+        const rawGroup = String(m.member_group ?? '');
+        // member_group 값: "감리팀", "전문가/핵심기술", "전문가/필수기술", "전문가/보안진단", "테스터" 등
+        const isExpert = rawGroup.includes('전문가') || rawGroup.includes('테스터');
+        const group = rawGroup.includes('테스터') ? '테스터'
+            : rawGroup.includes('전문가') ? '전문가'
+                : '감리원팀';
+        // expertSubGroup: "핵심기술", "필수기술", "보안진단" 등
+        const subMatch = rawGroup.match(/(핵심기술|필수기술|보안진단)/);
+        const expertSubGroup = subMatch ? subMatch[1] : '';
+        personFieldMap[name] = String(m.domain ?? '');
+        personGradeMap[name] = {
+            grade: String(m.auditor_grade ?? ''),
+            group,
+            expertSubGroup,
+            residency: m.is_fulltime ? '상근' : '비상근',
+            certNo: String(m.auditor_cert_no ?? ''),
+        };
+        if (!portalOrder.find(p => p.name === name)) {
+            portalOrder.push({ name, group, expertSubGroup });
+        }
+    });
+    const stages = phases.map(ph => {
+        const rawAssign = ph.assignments;
+        const assigns = typeof rawAssign === 'string' ? JSON.parse(rawAssign) : (rawAssign ?? []);
+        const auditors = assigns.filter(a => String(a.member_type ?? '감리원') !== '전문가' && String(a.member_type ?? '') !== '테스터');
+        const experts = assigns.filter(a => String(a.member_type ?? '') === '전문가' || String(a.member_type ?? '') === '테스터');
+        const toPeople = (arr) => arr.map(a => ({
+            name: String(a.person_name ?? ''),
+            pre: Number(a.pre_survey_md ?? 0),
+            audit: Number(a.audit_md ?? 0),
+            post: Number(a.action_confirm_md ?? 0),
+            field: personFieldMap[String(a.person_name ?? '')] ?? String(a.domain ?? ''),
+        }));
+        const sumMD = (arr, key) => arr.reduce((s, a) => s + Number(a[key] ?? 0), 0);
+        const aPeople = toPeople(auditors);
+        const ePeople = toPeople(experts);
+        return {
+            stage: String(ph.phase_name ?? ''),
+            date: `${ph.phase_start_date ?? ''} ~ ${ph.phase_end_date ?? ''}`,
+            days: ph.phase_days != null ? Number(ph.phase_days) : null,
+            감리원: aPeople.length ? {
+                count: aPeople.length,
+                pre: sumMD(auditors, 'pre_survey_md'),
+                audit: sumMD(auditors, 'audit_md'),
+                post: sumMD(auditors, 'action_confirm_md'),
+                total: Number(ph.proposed_md ?? 0),
+                people: aPeople,
+            } : null,
+            전문가: ePeople.length ? {
+                count: ePeople.length,
+                pre: sumMD(experts, 'pre_survey_md'),
+                audit: sumMD(experts, 'audit_md'),
+                post: sumMD(experts, 'action_confirm_md'),
+                total: sumMD(experts, 'pre_survey_md') + sumMD(experts, 'audit_md') + sumMD(experts, 'action_confirm_md'),
+                people: ePeople,
+            } : null,
+        };
+    });
+    // 요약 계산
+    let totalAuditMD = 0, totalExpertMD = 0, totalTesterMD = 0;
+    stages.forEach(s => {
+        if (s.감리원)
+            totalAuditMD += s.감리원.total;
+        if (s.전문가)
+            s.전문가.people.forEach(p => {
+                const grp = (personGradeMap[p.name] || {}).group || '';
+                const md = p.pre + p.audit + p.post;
+                if (grp === '테스터')
+                    totalTesterMD += md;
+                else
+                    totalExpertMD += md;
+            });
+    });
+    const totalAllMD = totalAuditMD + totalExpertMD + totalTesterMD;
+    // 인력 그룹 분류
+    const auditNames = [];
+    const coreNames = [], requiredNames = [], securityNames = [], testerNames = [];
+    portalOrder.forEach(({ name, group, expertSubGroup }) => {
+        if (group === '테스터') {
+            testerNames.push(name);
+            return;
+        }
+        if (group === '전문가') {
+            if (expertSubGroup.includes('보안'))
+                securityNames.push(name);
+            else if (expertSubGroup.includes('필수'))
+                requiredNames.push(name);
+            else
+                coreNames.push(name);
+            return;
+        }
+        auditNames.push(name);
+    });
+    // personnelIdMap: 이름 → personnel_id (photo-profile API 호출용)
+    const personnelIdMap = {};
+    members.forEach(m => {
+        const name = String(m.person_name ?? '');
+        const pid = m.personnel_id ? Number(m.personnel_id) : 0;
+        if (name && pid)
+            personnelIdMap[name] = pid;
+    });
+    // JSON 직렬화 (클라이언트에 전달)
+    // </script> 문자열이 JSON 값 안에 있으면 브라우저가 스크립트 태그를 조기 종료하므로
+    // 반드시 <\/script> 로 이스케이프 처리해야 함
+    const safeJSON = (v) => JSON.stringify(v).replace(/<\/script>/gi, '<\\/script>').replace(/<!--/g, '<\\!--');
+    const stagesJSON = safeJSON(stages);
+    const personFieldMapJSON = safeJSON(personFieldMap);
+    const personGradeMapJSON = safeJSON(personGradeMap);
+    const portalOrderJSON = safeJSON(portalOrder);
+    const personnelIdMapJSON = safeJSON(personnelIdMap);
+    const projectDataJSON = safeJSON({
+        projectTitle: String(project.project_name ?? ''),
+        requestMD: 0, requestStageCount: 0, requestAuditDays: 0,
+        clientOrg: String(project.client_org ?? ''),
+        pmName: String(project.director ?? ''),
+    });
+    // ── 감리 단계 스케줄 테이블 (새 통합 버전) ──────────────────
+    const scheduleSection = phases.length > 0 ? `
+  <div id="schedule-section" style="font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+    <!-- 요약 카드바 -->
+    <div id="summary-bar" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px 16px;text-align:center;min-width:90px">
+        <div style="font-size:22px;font-weight:700;color:#1a2e4a">${stages.length}</div><div style="font-size:12px;color:#666;margin-top:2px">총 단계</div>
+      </div>
+      <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px 16px;text-align:center;min-width:90px">
+        <div style="font-size:22px;font-weight:700;color:#1a2e4a">${totalAuditMD}</div><div style="font-size:12px;color:#666;margin-top:2px">감리원 MD</div>
+      </div>
+      <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px 16px;text-align:center;min-width:90px">
+        <div style="font-size:22px;font-weight:700;color:#1b5e20">${totalExpertMD}</div><div style="font-size:12px;color:#666;margin-top:2px">전문가 MD</div>
+      </div>
+      <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px 16px;text-align:center;min-width:90px">
+        <div style="font-size:22px;font-weight:700;color:#6a1b9a">${totalTesterMD}</div><div style="font-size:12px;color:#666;margin-top:2px">테스터 MD</div>
+      </div>
+      <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px 16px;text-align:center;min-width:90px">
+        <div style="font-size:22px;font-weight:700;color:#e65100">${totalAllMD}</div><div style="font-size:12px;color:#666;margin-top:2px">총 제안 MD</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap">
+        <button onclick="clearHighlights()" style="background:#e0e0e0;color:#333;border:none;border-radius:5px;padding:6px 12px;font-size:13px;cursor:pointer;font-family:inherit">🧹 강조 초기화</button>
+        <button onclick="highlightCorrections('pre')" style="background:#e65100;color:#fff;border:none;border-radius:5px;padding:6px 12px;font-size:13px;cursor:pointer;font-family:inherit">🔎 예비조사</button>
+        <button onclick="highlightCorrections('audit')" style="background:#6a1b9a;color:#fff;border:none;border-radius:5px;padding:6px 12px;font-size:13px;cursor:pointer;font-family:inherit">🔔 감리</button>
+        <button onclick="highlightCorrections('post')" style="background:#c62828;color:#fff;border:none;border-radius:5px;padding:6px 12px;font-size:13px;cursor:pointer;font-family:inherit">🚨 조치확인</button>
+        <button onclick="openAutoModal()" style="background:linear-gradient(135deg,#7c3aed,#4338ca);color:#fff;border:none;border-radius:7px;padding:8px 16px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;box-shadow:0 2px 8px rgba(67,56,202,.4)">🛠️ 자동화 PPT</button>
+      </div>
+    </div>
+
+    <!-- 범례 -->
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;font-size:12px;color:#444">
+      <span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:12px;border-radius:2px;display:inline-block;background:#fff9c4;border:1px solid #f9a825"></span>이름 강조</span>
+      <span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:12px;border-radius:2px;display:inline-block;background:#e8f5e9;border:1px solid #43a047"></span>분야 강조</span>
+      <span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:12px;border-radius:2px;display:inline-block;background:#eef4ff;border:1px solid #1565c0"></span>예비조사&gt;0</span>
+      <span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:12px;border-radius:2px;display:inline-block;background:#f5eefc;border:1px solid #6a1b9a"></span>감리&gt;0</span>
+      <span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:12px;border-radius:2px;display:inline-block;background:#ffcdd2;border:1px solid #c62828"></span>조치확인&gt;0</span>
+    </div>
+
+    <!-- 스케줄 테이블 -->
+    <div style="overflow-x:auto;border-radius:8px;margin-bottom:20px">
+      <table id="schedule-table" style="width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.1);font-size:13px">
+        <thead>
+          <tr>
+            <th rowspan="2" style="background:#1a2e4a;color:#fff;padding:8px 10px;text-align:center;font-size:12px;font-weight:600;border:1px solid #2b4a78;min-width:90px;white-space:nowrap">단계 구분</th>
+            <th rowspan="2" style="background:#1a2e4a;color:#fff;padding:8px 10px;text-align:center;font-size:12px;font-weight:600;border:1px solid #2b4a78;min-width:70px">감리원<br>MD</th>
+            <th rowspan="2" style="background:#1a2e4a;color:#fff;padding:8px 10px;text-align:center;font-size:12px;font-weight:600;border:1px solid #2b4a78;min-width:70px">전문가<br>MD</th>
+            <th rowspan="2" style="background:#1a2e4a;color:#fff;padding:8px 10px;text-align:center;font-size:12px;font-weight:600;border:1px solid #2b4a78;min-width:60px">총 MD</th>
+            <th style="background:#1a2e4a;color:#fff;padding:8px 10px;text-align:center;font-size:12px;font-weight:600;border:1px solid #2b4a78;min-width:280px">감리원 투입 인력</th>
+            <th style="background:#1a2e4a;color:#fff;padding:8px 10px;text-align:center;font-size:12px;font-weight:600;border:1px solid #2b4a78;min-width:280px">전문가 투입 인력</th>
+          </tr>
+          <tr>
+            <th style="background:#1a2e4a;color:#a8c4e0;padding:6px 10px;text-align:center;font-size:11px;border:1px solid #2b4a78">투입 MD 합계</th>
+            <th style="background:#1a2e4a;color:#a8c4e0;padding:6px 10px;text-align:center;font-size:11px;border:1px solid #2b4a78">투입 MD 합계</th>
+          </tr>
+        </thead>
+        <tbody id="schedule-tbody">
+          ${stages.map((s, si) => {
+        const ae = s.감리원 ?? { total: 0, people: [], count: 0 };
+        const ee = s.전문가 ?? { total: 0, people: [], count: 0 };
+        const tot = ae.total + ee.total;
+        const auditPeople = ae.people.map((p) => `<span class="person-chip" data-name="${p.name}" data-field="${(p.field || '').replace(/"/g, '&quot;')}" data-stage="${si}" data-pre="${p.pre}" data-audit="${p.audit}" data-post="${p.post}" style="display:inline-flex;align-items:center;gap:3px;cursor:pointer;border-radius:3px;padding:2px 6px;border:1px solid transparent;margin:2px;white-space:nowrap;transition:all .15s">
+                <span class="chip-name" style="font-weight:700;color:#1a2e4a;font-size:12px">${p.name}</span>
+                <span class="chip-mds" style="color:#666;font-size:11px">
+                  <span class="mds-num" data-k="pre">${p.pre}</span>:<span class="mds-num" data-k="audit">${p.audit}</span>:<span class="mds-num" data-k="post">${p.post}</span>
+                </span>
+              </span>`).join('');
+        const expertPeople = ee.people.map((p) => `<span class="person-chip" data-name="${p.name}" data-field="${(p.field || '').replace(/"/g, '&quot;')}" data-stage="${si}" data-pre="${p.pre}" data-audit="${p.audit}" data-post="${p.post}" style="display:inline-flex;align-items:center;gap:3px;cursor:pointer;border-radius:3px;padding:2px 6px;border:1px solid transparent;margin:2px;white-space:nowrap;transition:all .15s">
+                <span class="chip-name" style="font-weight:700;color:#1a2e4a;font-size:12px">${p.name}</span>
+                <span class="chip-mds" style="color:#666;font-size:11px">
+                  <span class="mds-num" data-k="pre">${p.pre}</span>:<span class="mds-num" data-k="audit">${p.audit}</span>:<span class="mds-num" data-k="post">${p.post}</span>
+                </span>
+  
+              </span>`).join('');
+        return `<tr data-stage="${si}">
+              <td style="padding:8px 10px;border:1px solid #ddd;background:#e8edf5;font-weight:700;text-align:center;white-space:nowrap;font-size:14px">
+                <div>${s.stage}</div>
+                ${s.date && s.date.trim() !== ' ~ ' ? `<div style="font-size:11px;color:#444;margin-top:2px;font-weight:400">${s.date}</div>` : ''}
+                ${s.days ? `<div style="font-size:12px;color:#3a6ea8;font-weight:600;margin-top:2px">(${s.days}일)</div>` : ''}
+              </td>
+              <td style="padding:8px 10px;border:1px solid #ddd;text-align:center;font-weight:700;font-size:14px;background:#fff9e8;vertical-align:middle">
+                <div>${ae.total}</div><div style="font-size:10px;color:#888;font-weight:400">(${ae.count || ae.people.length}명)</div>
+              </td>
+              <td style="padding:8px 10px;border:1px solid #ddd;text-align:center;font-weight:700;font-size:14px;background:#fff9e8;vertical-align:middle">
+                <div>${ee.total}</div><div style="font-size:10px;color:#888;font-weight:400">(${ee.count || ee.people.length}명)</div>
+              </td>
+              <td style="padding:8px 10px;border:1px solid #ddd;text-align:center;font-weight:700;font-size:14px;background:#e8f5e9;color:#1b5e20;vertical-align:middle">${tot}</td>
+              <td class="people-cell" data-ci="people-audit-${si}" style="padding:6px 8px;border:1px solid #ddd;vertical-align:top;line-height:1.8">
+                ${auditPeople || '<span style="color:#bbb;font-size:12px">없음</span>'}
+              </td>
+              <td class="people-cell" data-ci="people-expert-${si}" style="padding:6px 8px;border:1px solid #ddd;vertical-align:top;line-height:1.8">
+                ${expertPeople || '<span style="color:#bbb;font-size:12px">없음</span>'}
+              </td>
+            </tr>`;
+    }).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 인력 모음 풀 -->
+    <div id="personnel-pool" style="margin-top:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+        <h3 style="font-size:15px;font-weight:700;color:#1a2e4a;margin:0">👥 인력 모음</h3>
+        <button onclick="copyPersonnelTable()" style="background:#1a2e4a;color:#fff;border:none;border-radius:5px;padding:6px 12px;font-size:13px;cursor:pointer;font-family:inherit">📋 표로 복사</button>
+      </div>
+      <div id="pool-row" style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap">
+        <div id="pool-audit-group" class="pool-group" style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px;flex:1;min-width:160px">
+          <div style="font-size:14px;font-weight:700;color:#1a2e4a;margin-bottom:8px;padding-bottom:5px;border-bottom:2px solid #e0e8f5">🔵 감리원 (${auditNames.length}명)</div>
+          <div id="pool-audit-list">${auditNames.map(n => renderPoolPersonSSR(n, personFieldMap, personGradeMap)).join('')}</div>
+        </div>
+        <div id="pool-core-group" class="pool-group" style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px;flex:1;min-width:160px">
+          <div style="font-size:14px;font-weight:700;color:#1a2e4a;margin-bottom:8px;padding-bottom:5px;border-bottom:2px solid #e0e8f5">🟢 핵심기술 (${coreNames.length}명)</div>
+          <div id="pool-core-list">${coreNames.map(n => renderPoolPersonSSR(n, personFieldMap, personGradeMap)).join('')}</div>
+        </div>
+        <div id="pool-required-group" class="pool-group" style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px;flex:1;min-width:160px">
+          <div style="font-size:14px;font-weight:700;color:#1a2e4a;margin-bottom:8px;padding-bottom:5px;border-bottom:2px solid #e0e8f5">🟩 필수기술 (${requiredNames.length}명)</div>
+          <div id="pool-required-list">${requiredNames.map(n => renderPoolPersonSSR(n, personFieldMap, personGradeMap)).join('')}</div>
+        </div>
+        <div id="pool-security-group" class="pool-group" style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px;flex:1;min-width:160px">
+          <div style="font-size:14px;font-weight:700;color:#1a2e4a;margin-bottom:8px;padding-bottom:5px;border-bottom:2px solid #e0e8f5">🔴 보안진단 (${securityNames.length}명)</div>
+          <div id="pool-security-list">${securityNames.map(n => renderPoolPersonSSR(n, personFieldMap, personGradeMap)).join('')}</div>
+        </div>
+        <div id="pool-tester-group" class="pool-group" style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px;flex:1;min-width:160px">
+          <div style="font-size:14px;font-weight:700;color:#1a2e4a;margin-bottom:8px;padding-bottom:5px;border-bottom:2px solid #e0e8f5">🟣 테스터 (${testerNames.length}명)</div>
+          <div id="pool-tester-list">${testerNames.map(n => renderPoolPersonSSR(n, personFieldMap, personGradeMap)).join('')}</div>
+        </div>
+      </div>
+    </div>
+  </div>` : '';
+    // ── 제안 인력 테이블 ──────────────────────────────────────────
+    const memberRows = members.map(m => {
+        const pid = m.personnel_id;
+        const nameCell = pid
+            ? `<span class="cursor-pointer text-indigo-700 font-semibold hover:underline" onclick="openPersonModal(${pid})">${m.person_name}</span><span class="text-xs text-teal-600 font-bold cursor-pointer hover:text-teal-800 ml-0.5" onclick="openKModal(${pid},${id},'${String(m.person_name).replace(/'/g, "\\'")}')"> (K)</span>`
+            : `<span class="font-medium text-slate-700">${m.person_name}</span>`;
+        return `
+    <tr class="hover:bg-slate-50 text-sm border-t border-slate-100">
+      <td class="px-4 py-2.5 text-slate-500 text-xs">${m.member_group ?? '-'}</td>
+      <td class="px-4 py-2.5">${nameCell}</td>
+      <td class="px-4 py-2.5 text-slate-600 text-xs">${m.member_type ?? '-'}</td>
+      <td class="px-4 py-2.5 text-slate-600 text-xs">${m.domain ?? '-'}</td>
+      <td class="px-4 py-2.5 text-center">${m.total_md ?? 0} MD</td>
+      <td class="px-4 py-2.5 text-center text-xs text-slate-500">${m.is_fulltime ? '상근' : '비상근'}</td>
+      <td class="px-4 py-2.5 text-slate-600 text-xs">${m.auditor_grade ?? '-'}</td>
+      <td class="px-4 py-2.5 text-slate-500 text-xs">${m.phone ?? '-'}</td>
+    </tr>`;
+    }).join('');
+    // 파일 목록
+    const fileRows = files.map(f => `
+    <tr class="text-xs border-t border-slate-100">
+      <td class="px-4 py-2 text-slate-500">${f.file_category ?? '-'}</td>
+      <td class="px-4 py-2 font-medium text-slate-700">${f.file_name}</td>
+      <td class="px-4 py-2 text-right text-slate-500">${f.file_size_kb != null ? Number(f.file_size_kb).toFixed(1) + ' KB' : '-'}</td>
+      <td class="px-4 py-2 text-slate-500">${f.uploaded_at ?? '-'}</td>
+    </tr>`).join('');
+    // TOC
+    const tocItems = toc.map(t => `<li class="text-sm text-slate-600 flex gap-2"><span class="text-slate-400 w-5 text-right flex-shrink-0">${t.item_order}.</span>${t.item_name}</li>`).join('');
+    const infoRow = (label, value, span = false) => `<tr>
+      <th class="px-4 py-2.5 text-left text-xs font-medium text-slate-500 bg-slate-50 w-28 whitespace-nowrap">${label}</th>
+      <td class="px-4 py-2.5 text-sm text-slate-800 ${span ? 'colspan=\"3\"' : ''}">${value}</td>
+    </tr>`;
+    const body = `
+  <div class="p-6 md:p-8">
+    <!-- 뒤로가기 + 제목 -->
+    <div class="mb-6 flex items-start gap-4">
+      <a href="/proposals" class="mt-1 text-slate-400 hover:text-slate-600 transition">
+        <i class="fas fa-arrow-left text-lg"></i>
+      </a>
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-3 flex-wrap mb-1">
+          ${statusBadge(project.proposal_status)}
+          <span class="text-xs text-slate-400">${project.registered_yearmonth ?? ''}</span>
+        </div>
+        <h1 class="text-xl font-bold text-slate-800 leading-snug">${project.project_name}</h1>
+        <p class="text-slate-500 text-sm mt-1">${project.client_org ?? ''}</p>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+      <!-- 왼쪽 메인 -->
+      <div class="xl:col-span-2 space-y-6">
+
+        <!-- 기본 정보 -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="px-5 py-3 bg-slate-700 text-white font-semibold text-sm flex items-center gap-2">
+            <i class="fas fa-info-circle"></i> 기본 정보
+          </div>
+          <table class="w-full divide-y divide-slate-100">
+            <tbody>
+              ${infoRow('사업명', String(project.project_name ?? '-'))}
+              ${infoRow('발주기관', String(project.client_org ?? '-'))}
+              ${infoRow('입찰공고번호', project.bid_notice_no
+        ? `<a href="https://www.g2b.go.kr/link/PNPE027_01/single/?bidPbancNo=${project.bid_notice_no}" target="_blank" class="text-indigo-600 hover:underline">${project.bid_notice_no}</a>`
+        : '-')}
+              ${infoRow('입찰마감일시', `<span class="${String(project.bid_deadline ?? '').includes('2026') ? 'text-red-600 font-semibold' : ''}">${fmtDate(project.bid_deadline)}</span>`)}
+              ${infoRow('평가일시', fmtDate(project.eval_dt))}
+              ${infoRow('제안평가방식', String(project.eval_method ?? '-'))}
+              ${infoRow('제안작업상태', statusBadge(project.proposal_status))}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 금액 정보 -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="px-5 py-3 bg-indigo-700 text-white font-semibold text-sm flex items-center gap-2">
+            <i class="fas fa-won-sign"></i> 금액 정보
+          </div>
+          <div class="grid grid-cols-2 md:grid-cols-3 divide-x divide-y divide-slate-100">
+            ${[
+        ['사업금액', fmtMoney(project.base_budget)],
+        ['배정예산', fmtMoney(project.target_budget)],
+        ['입찰금액(VAT포함)', `<span class="text-indigo-700 font-bold text-base">${fmtMoney(project.bid_amount)}</span>`],
+        ['입찰금액(VAT제외)', fmtMoney(project.bid_amount_excl_vat)],
+        ['투찰률', project.bid_rate != null ? `<span class="font-semibold">${Math.round(Number(project.bid_rate) * 100)}%</span>` : '-'],
+        ['1MD단가(VAT제외)', fmtMoney(project.md_unit_price_excl)],
+        ['요구투입공수', `<span class="font-semibold">${project.required_md ?? '-'} MD</span>`],
+        ['제안투입공수', `<span class="font-semibold text-indigo-700">${project.proposed_md ?? '-'} MD</span>`],
+        ['제안수당', project.proposal_allowance ? `${fmtMoney(project.proposal_allowance)} (${project.proposal_allowance_rate != null ? Number(project.proposal_allowance_rate).toFixed(2) + '%' : ''})` : '-'],
+    ].map(([k, v]) => `
+              <div class="px-4 py-3">
+                <p class="text-xs text-slate-500 mb-1">${k}</p>
+                <p class="text-sm">${v}</p>
+              </div>`).join('')}
+          </div>
+        </div>
+
+        <!-- 감리 단계별 인력 배정 (통합 뷰어) -->
+        ${phases.length > 0 ? `
+        <div>
+          <h2 class="font-bold text-slate-700 mb-3 flex items-center gap-2">
+            <i class="fas fa-tasks text-slate-400"></i> 감리 단계별 인력 배정
+          </h2>
+          ${scheduleSection}
+        </div>` : ''}
+
+        <!-- 제안 인력 -->
+        ${members.length > 0 ? `
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="px-5 py-3 bg-teal-700 text-white font-semibold text-sm flex items-center gap-2">
+            <i class="fas fa-users"></i> 제안 인력 (${members.length}명)
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full">
+              <thead><tr class="bg-slate-50 text-xs text-slate-500 border-b">
+                <th class="px-4 py-2 text-left">그룹</th>
+                <th class="px-4 py-2 text-left">성명</th>
+                <th class="px-4 py-2 text-center">구분</th>
+                <th class="px-4 py-2 text-center">분야</th>
+                <th class="px-4 py-2 text-center">공수</th>
+                <th class="px-4 py-2 text-center">상근</th>
+                <th class="px-4 py-2 text-center">등급</th>
+                <th class="px-4 py-2 text-center">연락처</th>
+              </tr></thead>
+              <tbody class="divide-y divide-slate-100">${memberRows}</tbody>
+            </table>
+          </div>
+        </div>` : ''}
+
+      </div>
+
+      <!-- 오른쪽 사이드 -->
+      <div class="space-y-6">
+
+        <!-- 제안 관련자 -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+          <h3 class="font-bold text-slate-700 mb-3 text-sm"><i class="fas fa-user-tie mr-2 text-slate-400"></i>제안 관련자</h3>
+          <div class="space-y-2 text-sm">
+            ${project.writer ? `<div class="flex gap-2"><span class="text-slate-400 w-14">작성자</span><span class="font-medium">${project.writer}</span></div>` : ''}
+            ${project.director ? `<div class="flex gap-2"><span class="text-slate-400 w-14">총괄</span><span class="font-medium">${project.director}</span></div>` : ''}
+            ${project.supporters ? `<div class="flex gap-2"><span class="text-slate-400 w-14">지원</span><span class="text-slate-600">${project.supporters}</span></div>` : ''}
+            ${project.references_cc ? `<div class="flex gap-2"><span class="text-slate-400 w-14">참조</span><span class="text-slate-600 text-xs leading-relaxed">${project.references_cc}</span></div>` : ''}
+          </div>
+        </div>
+
+        <!-- 키워드 -->
+        ${keywords.length > 0 ? `
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+          <h3 class="font-bold text-slate-700 mb-3 text-sm"><i class="fas fa-tags mr-2 text-slate-400"></i>키워드 (${keywords.length}개)</h3>
+          <div class="flex flex-wrap gap-1.5 mb-4">${kwTags}</div>
+
+          <!-- 키워드 치환 규칙 -->
+          <div class="border-t border-slate-100 pt-4">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs font-semibold text-slate-600"><i class="fas fa-exchange-alt mr-1 text-teal-500"></i>키워드 치환 규칙</span>
+              <span class="text-xs text-slate-400">검색된 키워드를 장표에 표시할 다른 이름으로 변환</span>
+            </div>
+            <!-- 기존 규칙 목록 -->
+            <div id="kwMappingList" class="space-y-1 mb-3">
+              ${kwMappings.length === 0
+        ? `<p class="text-xs text-slate-400 py-1">등록된 치환 규칙이 없습니다.</p>`
+        : kwMappings.map(m => `
+                  <div class="flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-1.5" data-mapping-id="${m.id}">
+                    <span class="text-xs text-slate-500 line-through">${m.original_keyword}</span>
+                    <i class="fas fa-arrow-right text-teal-400 text-xs"></i>
+                    <span class="text-xs font-semibold text-teal-700">${m.mapped_keyword}</span>
+                    <button onclick="deleteKwMapping(${id}, ${m.id})" class="ml-auto text-slate-300 hover:text-red-400 transition text-xs" title="삭제"><i class="fas fa-times"></i></button>
+                  </div>`).join('')}
+            </div>
+            <!-- 새 규칙 입력 -->
+            <div class="flex gap-2 items-start">
+              <div class="flex-1">
+                <input id="kwMapOrig" type="text" placeholder="원본 키워드 (쉼표로 여러 개)"
+                  class="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-teal-300 placeholder-slate-300" />
+              </div>
+              <i class="fas fa-arrow-right text-teal-400 text-xs mt-2.5"></i>
+              <div class="flex-1">
+                <input id="kwMapMapped" type="text" placeholder="변환할 이름"
+                  class="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-teal-300 placeholder-slate-300" />
+              </div>
+              <button onclick="addKwMapping(${id})"
+                class="px-3 py-2 bg-teal-600 hover:bg-teal-700 text-white text-xs rounded-lg transition whitespace-nowrap">
+                <i class="fas fa-plus mr-1"></i>추가
+              </button>
+            </div>
+            <div class="mt-2 text-xs text-slate-400 leading-relaxed">
+              <span class="font-semibold text-slate-500">예시)</span>
+              한국공항공사 → 주관기관 &nbsp;·&nbsp;
+              환경부, 환경측정 → 환경 &nbsp;·&nbsp;
+              지방계약, 계약관리 → 계약/이행평가
+            </div>
+          </div>
+        </div>` : ''}
+
+        <!-- 감리 일정 -->
+        ${project.special_notes ? `
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+          <h3 class="font-bold text-slate-700 mb-3 text-sm"><i class="fas fa-calendar-alt mr-2 text-slate-400"></i>감리 일정</h3>
+          <p class="text-xs text-slate-600 whitespace-pre-line leading-relaxed">${project.special_notes}</p>
+        </div>` : ''}
+
+        <!-- 첨부 목차 -->
+        ${toc.length > 0 ? `
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+          <h3 class="font-bold text-slate-700 mb-3 text-sm"><i class="fas fa-list mr-2 text-slate-400"></i>첨부 목차 (${toc.length}건)</h3>
+          <ol class="space-y-1">${tocItems}</ol>
+        </div>` : ''}
+
+        <!-- 제안 파일 -->
+        ${files.length > 0 ? `
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="px-4 py-3 bg-amber-50 border-b border-amber-100">
+            <h3 class="font-bold text-amber-700 text-sm"><i class="fas fa-paperclip mr-2"></i>제안 파일 (${files.length}건)</h3>
+          </div>
+          <table class="w-full">
+            <thead><tr class="bg-slate-50 text-xs text-slate-500 border-b">
+              <th class="px-4 py-2 text-left">분류</th>
+              <th class="px-4 py-2 text-left">파일명</th>
+              <th class="px-4 py-2 text-right">크기</th>
+            </tr></thead>
+            <tbody class="divide-y divide-slate-100">${fileRows}</tbody>
+          </table>
+        </div>` : ''}
+
+        <!-- 비고 -->
+        ${project.remarks ? `
+        <div class="bg-amber-50 rounded-2xl border border-amber-200 p-5">
+          <h3 class="font-bold text-amber-700 mb-2 text-sm"><i class="fas fa-sticky-note mr-2"></i>비고</h3>
+          <p class="text-sm text-amber-800 whitespace-pre-line leading-relaxed">${project.remarks}</p>
+        </div>` : ''}
+
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 인원 상세 모달 ─────────────────────────────── -->
+  <div id="personModal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4">
+    <div class="absolute inset-0 bg-black/40 backdrop-blur-sm" onclick="closePersonModal()"></div>
+    <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] overflow-y-auto">
+      <div class="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between rounded-t-2xl z-10">
+        <h2 class="font-bold text-slate-800 text-lg" id="personModalTitle">인원 정보</h2>
+        <button onclick="closePersonModal()" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+      </div>
+      <div id="personModalBody" class="p-6">
+        <div class="flex justify-center py-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── K 감리이력 매칭 모달 ──────────────────────────── -->
+  <div id="kModal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4">
+    <div class="absolute inset-0 bg-black/40 backdrop-blur-sm" onclick="closeKModal()"></div>
+    <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[90vh] overflow-y-auto">
+      <div class="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between rounded-t-2xl z-10">
+        <h2 class="font-bold text-slate-800 text-lg" id="kModalTitle">감리이력 키워드 매칭</h2>
+        <button onclick="closeKModal()" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+      </div>
+      <div id="kModalBody" class="p-6">
+        <div class="flex justify-center py-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-teal-500"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 자동화 PPT 모달 ───────────────────────────────── -->
+  <div id="autoModal" style="display:none;position:fixed;inset:0;z-index:3000;background:rgba(0,0,0,.5);align-items:center;justify-content:center;padding:20px">
+    <div style="background:#fff;border-radius:12px;max-width:600px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;position:relative;box-shadow:0 8px 30px rgba(0,0,0,.25);font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+      <button onclick="closeAutoModal()" style="position:absolute;top:14px;right:16px;background:#e0e0e0;border:none;border-radius:50%;width:28px;height:28px;cursor:pointer;font-size:14px">✕</button>
+      <h3 style="font-size:16px;font-weight:700;margin:0 0 6px;color:#1a2e4a">🛠️ 자동화 PPT 생성</h3>
+      <p style="font-size:13px;color:#666;margin:0 0 16px">세부감리일정(1,2) → 표장표 → 사진장표 → 요약표 순서로 하나의 PPT로 합쳐서 내려받습니다.</p>
+      <div id="autoModalAlertBox" style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:7px;font-size:13px;font-weight:600"></div>
+      <div style="margin-bottom:16px;background:#f7f8fa;border-radius:8px;padding:12px">
+        <b style="font-size:13px;color:#333">추가 제안 단계</b>
+        <div style="font-size:12px;color:#666;margin-top:4px">RFP 최소 요건 이상으로 추가 제안한 단계를 선택하세요 (요약표에 반영됩니다)</div>
+        <div id="extra-stage-boxes" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:8px">
+          ${stages.map(s => `<label style="display:flex;align-items:center;gap:4px;font-size:13px;color:#333;cursor:pointer"><input type="checkbox" class="st-extra-stage-cb" value="${s.stage}"> ${s.stage}</label>`).join('')}
+        </div>
+        <div style="font-size:12px;color:#777;margin-top:8px">
+          요청공수: <b>${project.required_md != null ? project.required_md + ' MD' : '(없음)'}</b> · 
+          주관기관: <b>${project.client_org ?? '(없음)'}</b> · 
+          총괄감리원: <b>${project.director ?? '(없음)'}</b>
+        </div>
+      </div>
+      <!-- ── 사진장표용 분류 체크리스트 ── -->
+      <div style="margin-bottom:16px;border:1px solid #e8eaf0;border-radius:8px;padding:12px">
+        <b style="font-size:13px;color:#333">🖼️ 사진장표용 분류 체크리스트</b>
+        <div id="photo-assign-rows" style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
+          <span style="color:#aaa;font-size:13px">인력 데이터를 불러오는 중...</span>
+        </div>
+      </div>
+      <button onclick="downloadAllPptx(this)" style="width:100%;padding:14px 0;font-size:16px;font-weight:800;color:#fff;background:linear-gradient(135deg,#7c3aed,#4338ca);border:none;border-radius:9px;cursor:pointer;box-shadow:0 3px 10px rgba(67,56,202,.4);font-family:inherit;margin-bottom:16px">
+        🚀 자동화 생성 (전체 합본)
+      </button>
+      <details style="margin-top:4px">
+        <summary style="cursor:pointer;color:#555;font-size:13px;font-weight:600;padding:4px 0">🔧 개별 생성</summary>
+        <div style="margin-top:10px;display:flex;flex-direction:column;gap:10px">
+          <button onclick="downloadDetailSchedule1Pptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">📅 세부 감리 일정 (1, 2) 생성</button>
+          <button onclick="downloadAssignPptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">📋 표장표 생성</button>
+          <button onclick="downloadPhotoAssignPptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">🖼️ 사진장표 생성</button>
+          <button onclick="downloadSummaryTablePptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">📊 요약표 생성</button>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <!-- ── 인력 모음 표 복사 모달 ─────────────────────────── -->
+  <div id="personnelTableModal" style="display:none;position:fixed;inset:0;z-index:3000;background:rgba(0,0,0,.5);align-items:center;justify-content:center;padding:20px">
+    <div style="background:#fff;border-radius:10px;max-width:560px;width:100%;max-height:85vh;overflow-y:auto;padding:22px;position:relative;font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+      <button onclick="closePersonnelTableModal()" style="position:absolute;top:14px;right:16px;background:#e0e0e0;border:none;border-radius:50%;width:28px;height:28px;cursor:pointer;font-size:14px">✕</button>
+      <h3 style="font-size:16px;font-weight:700;margin:0 0 4px">👥 인력 모음 표</h3>
+      <div style="font-size:12px;color:#888;margin-bottom:14px">역할 · 분야 · 이름(음절마다 띄어쓰기). 셀을 드래그해 선택 후 Ctrl+C 복사, 또는 전체 복사 버튼을 사용하세요.</div>
+      <div id="personnel-table-wrap" style="overflow-x:auto;margin-top:4px"></div>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button onclick="copyPersonnelSummaryTable()" style="flex:1;background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit">📋 전체 복사</button>
+        <button onclick="closePersonnelTableModal()" style="flex:1;background:#e0e0e0;color:#333;border:none;border-radius:6px;padding:9px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit">닫기</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 전문가 분류별 Breakdown 모달 ─────────────────────── -->
+  <div id="expertBreakdownModal" style="display:none;position:fixed;inset:0;z-index:3000;background:rgba(0,0,0,.5);align-items:center;justify-content:center;padding:20px" onclick="if(event.target===this)closeExpertBreakdown()">
+    <div style="background:#fff;border-radius:10px;max-width:440px;width:100%;max-height:80vh;overflow-y:auto;padding:22px;position:relative;font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+      <button onclick="closeExpertBreakdown()" style="position:absolute;top:14px;right:16px;background:#e0e0e0;border:none;border-radius:50%;width:28px;height:28px;cursor:pointer;font-size:14px">✕</button>
+      <h3 id="ebTitle" style="font-size:16px;font-weight:700;margin:0 0 2px">전문가 분류별 인력</h3>
+      <div id="ebSub" style="font-size:12px;color:#888;margin-bottom:14px"></div>
+      <div id="ebBody"></div>
+    </div>
+  </div>
+
+  <!-- pptxgenjs + jszip + 사진장표 PPTX 템플릿 (base64) -->
+  <script src="https://cdn.jsdelivr.net/npm/pptxgenjs@4.0.1/dist/pptxgen.bundle.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="/static/photo-template.b64.js"></script>
+  <script src="/static/ppt-engine.js"></script>
+
+  <script>
+  // ══════════════════════════════════════════════════════════
+  // 데이터 주입 (서버에서 렌더링된 JSON) — 함수는 외부 JS로 분리
+  // ══════════════════════════════════════════════════════════
+  var parsedData = {
+    proposalId:    ${id},
+    projectTitle:  ${projectDataJSON}.projectTitle,
+    requestMD:     ${project.required_md ?? 0},
+    requestStageCount: 0,
+    requestAuditDays:  0,
+    clientOrg:     ${projectDataJSON}.clientOrg,
+    pmName:        ${projectDataJSON}.pmName,
+    stages:        ${stagesJSON},
+    personFieldMap:${personFieldMapJSON},
+    personGradeMap:${personGradeMapJSON},
+    portalOrder:   ${portalOrderJSON},
+    personnelIdMap:${personnelIdMapJSON},
+  }
+  var activeHL = null
+  var correctionMode = null
+  var gradeOverrides = {}
+
+  </script>
+  <script src="/static/proposal-detail.js"></script>`;
+    return c.html(layout(String(project.project_name), body, 'proposals'));
+});
+// ── 인력정보 목록 ─────────────────────────────────────────────
+app.get('/personnel', async (c) => {
+    const search = c.req.query('search') || '';
+    const grade = c.req.query('grade') || '';
+    let sql = `
+    SELECT p.id, p.name, p.position, p.company, p.is_fulltime,
+           p.auditor_grade, p.auditor_cert_no, p.phone,
+           COUNT(DISTINCT pc.id) AS cert_count,
+           COUNT(DISTINCT ph.id) AS audit_count,
+           MIN(ph.audit_yearmonth) AS earliest_audit
+    FROM personnel p
+    LEFT JOIN personnel_certifications pc ON pc.personnel_id = p.id
+    LEFT JOIN personnel_audit_history  ph ON ph.personnel_id = p.id
+    WHERE 1=1
+  `;
+    const params = [];
+    let idx = 1;
+    if (search) {
+        sql += ` AND (p.name ILIKE $${idx} OR p.company ILIKE $${idx})`;
+        params.push(`%${search}%`);
+        idx++;
+    }
+    if (grade) {
+        sql += ` AND p.auditor_grade = $${idx++}`;
+        params.push(grade);
+    }
+    sql += ` GROUP BY p.id ORDER BY TRIM(p.name) COLLATE "C" ASC`;
+    const list = await query(sql, params);
+    const gradeOptions = ['', '특급', '고급', '중급', '초급'].map(g => `<option value="${g}" ${grade === g ? 'selected' : ''}>${g || '전체 등급'}</option>`).join('');
+    const rows = list.map((p, i) => `
+    <tr class="hover:bg-indigo-50 cursor-pointer transition" onclick="location.href='/personnel/${p.id}'">
+      <td class="px-4 py-3 text-center text-sm text-slate-400">${i + 1}</td>
+      <td class="px-4 py-3 font-semibold text-indigo-700">${p.name}</td>
+      <td class="px-4 py-3 text-sm text-slate-600">${p.position ?? '-'}</td>
+      <td class="px-4 py-3 text-sm text-slate-600">${p.company ?? '-'}</td>
+      <td class="px-4 py-3 text-center">
+        <span class="status-badge ${p.is_fulltime ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-500'}">
+          ${p.is_fulltime ? '상근' : '비상근'}
+        </span>
+      </td>
+      <td class="px-4 py-3 text-center text-sm">${p.auditor_grade ?? '-'}</td>
+      <td class="px-4 py-3 text-center text-sm text-slate-500">${p.auditor_cert_no ?? '-'}</td>
+      <td class="px-4 py-3 text-center text-sm">${fmtCareer(p.earliest_audit)}</td>
+      <td class="px-4 py-3 text-center text-sm text-slate-500">${p.cert_count ?? 0}개</td>
+      <td class="px-4 py-3 text-center text-sm text-slate-500">${p.audit_count ?? 0}건</td>
+      <td class="px-4 py-3 text-sm text-slate-500">${p.phone ?? '-'}</td>
+    </tr>`).join('');
+    // [ppt-portal 추가 기능 — 감리원 경력 확인서 발급요청] 모달 체크리스트 후보 —
+    // 이 문서 자체가 "감리원"용이라 수석감리원/감리원 등급만 대상으로 한다(2026-09-08).
+    const careerRequestCandidates = list.filter(p => p.auditor_grade === '수석감리원' || p.auditor_grade === '감리원');
+    const careerRequestRows = careerRequestCandidates.map(p => `
+    <label class="career-request-row flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-indigo-50 cursor-pointer" data-name="${String(p.name).toLowerCase()}">
+      <input type="checkbox" class="career-request-checkbox w-4 h-4 accent-indigo-600" value="${p.id}">
+      <span class="text-sm font-medium text-slate-800 flex-1">${p.name}</span>
+      <span class="text-xs text-slate-400">${p.auditor_grade}</span>
+      <span class="text-xs text-slate-400">${p.company ?? '-'}</span>
+    </label>`).join('');
+    const body = `
+  <div class="p-6 md:p-8">
+    <div class="mb-6">
+      <h1 class="text-2xl font-bold text-slate-800">인력정보</h1>
+      <p class="text-slate-500 text-sm mt-1">총 ${list.length}명</p>
+    </div>
+
+    <div class="flex flex-wrap gap-2 mb-4 items-center justify-between">
+      <form method="GET" action="/personnel" class="flex gap-2 flex-wrap">
+        <input type="text" name="search" value="${search}"
+          placeholder="이름 / 회사 검색..."
+          class="border border-slate-200 rounded-lg px-3 py-2 text-sm w-48 focus:outline-none focus:ring-2 focus:ring-indigo-300">
+        <select name="grade" class="border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+          ${gradeOptions}
+        </select>
+        <button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">
+          <i class="fas fa-search mr-1"></i>검색
+        </button>
+      </form>
+      <button type="button" onclick="openCareerRequestModal()"
+        class="px-4 py-2 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700 whitespace-nowrap">
+        <i class="fas fa-file-excel mr-1"></i>경력 확인서 발급요청
+      </button>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="bg-slate-50 text-xs text-slate-500 uppercase border-b border-slate-200">
+              <th class="px-4 py-3 text-center w-10">#</th>
+              <th class="px-4 py-3 text-left">이름</th>
+              <th class="px-4 py-3 text-left">직위</th>
+              <th class="px-4 py-3 text-left">소속</th>
+              <th class="px-4 py-3 text-center">상근여부</th>
+              <th class="px-4 py-3 text-center">감리등급</th>
+              <th class="px-4 py-3 text-center">자격번호</th>
+              <th class="px-4 py-3 text-center">감리경력</th>
+              <th class="px-4 py-3 text-center">자격증</th>
+              <th class="px-4 py-3 text-center">감리실적</th>
+              <th class="px-4 py-3 text-left">연락처</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100">
+            ${rows || '<tr><td colspan="11" class="px-4 py-12 text-center text-slate-400">데이터가 없습니다.<br><a href="/upload" class="text-indigo-500 underline mt-2 inline-block">HTML 파일을 업로드해주세요</a></td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- [ppt-portal 추가 기능] 감리원 경력 확인서 발급요청 모달 -->
+  <div id="careerRequestModal" class="hidden fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-xl w-full max-w-lg max-h-[85vh] flex flex-col">
+      <div class="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
+        <h2 class="font-bold text-slate-800">감리원 경력 확인서 발급요청</h2>
+        <button type="button" onclick="closeCareerRequestModal()" class="text-slate-400 hover:text-slate-600">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+      <div class="px-5 py-3 border-b border-slate-100 flex gap-2 items-center">
+        <input type="text" id="careerRequestFilter" placeholder="이름으로 필터..." oninput="filterCareerRequestRows(this.value)"
+          class="flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+        <button type="button" onclick="toggleAllCareerRequestRows(true)" class="text-xs text-indigo-600 hover:underline whitespace-nowrap">전체선택</button>
+        <button type="button" onclick="toggleAllCareerRequestRows(false)" class="text-xs text-slate-400 hover:underline whitespace-nowrap">전체해제</button>
+      </div>
+      <div class="px-2 py-2 overflow-y-auto flex-1">
+        ${careerRequestRows || '<p class="text-center text-slate-400 text-sm py-8">수석감리원/감리원 등급의 인력이 없습니다.</p>'}
+      </div>
+      <div class="px-5 py-4 border-t border-slate-200 flex items-center justify-between">
+        <span id="careerRequestCount" class="text-xs text-slate-400">0명 선택</span>
+        <button type="button" id="careerRequestSubmitBtn" onclick="submitCareerRequest()"
+          class="px-4 py-2 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed">
+          요청서 생성
+        </button>
+      </div>
+    </div>
+  </div>
+  <script>
+    function openCareerRequestModal() {
+      document.getElementById('careerRequestModal').classList.remove('hidden')
+      updateCareerRequestCount()
+    }
+    function closeCareerRequestModal() {
+      document.getElementById('careerRequestModal').classList.add('hidden')
+    }
+    function filterCareerRequestRows(text) {
+      const needle = text.trim().toLowerCase()
+      document.querySelectorAll('.career-request-row').forEach(row => {
+        row.style.display = !needle || row.dataset.name.includes(needle) ? '' : 'none'
+      })
+    }
+    function toggleAllCareerRequestRows(checked) {
+      document.querySelectorAll('.career-request-row').forEach(row => {
+        if (row.style.display === 'none') return
+        row.querySelector('.career-request-checkbox').checked = checked
+      })
+      updateCareerRequestCount()
+    }
+    function updateCareerRequestCount() {
+      const n = document.querySelectorAll('.career-request-checkbox:checked').length
+      document.getElementById('careerRequestCount').textContent = n + '명 선택'
+    }
+    document.addEventListener('change', (ev) => {
+      if (ev.target.classList && ev.target.classList.contains('career-request-checkbox')) updateCareerRequestCount()
+    })
+    async function submitCareerRequest() {
+      const ids = [...document.querySelectorAll('.career-request-checkbox:checked')].map(el => Number(el.value))
+      if (!ids.length) { alert('한 명 이상 선택해주세요.'); return }
+
+      const btn = document.getElementById('careerRequestSubmitBtn')
+      btn.disabled = true
+      btn.textContent = '생성 중...'
+      try {
+        const res = await fetch('/api/personnel-career-request', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ personnelIds: ids }),
+        })
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}))
+          throw new Error(err.error || ('요청 실패 (' + res.status + ')'))
+        }
+        const blob = await res.blob()
+        const disposition = res.headers.get('Content-Disposition') || ''
+        const m = disposition.match(/filename="([^"]+)"/)
+        const filename = m ? decodeURIComponent(m[1]) : '감리원_경력_확인서_발급요청.xlsx'
+
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url; a.download = filename
+        document.body.appendChild(a); a.click(); a.remove()
+        URL.revokeObjectURL(url)
+
+        const decodeList = (h) => { const v = res.headers.get(h); return v ? decodeURIComponent(v).split(',').filter(Boolean) : [] }
+        const notFound = decodeList('X-Skipped-Not-Found')
+        const noPptx = decodeList('X-Skipped-No-Cert-Pptx')
+        const noGradeImg = decodeList('X-Skipped-No-Grade-Image')
+        const noCertImg = decodeList('X-Skipped-No-Cert-Image')
+        const noHireDate = decodeList('X-Skipped-No-Hire-Date')
+        const notices = []
+        if (noPptx.length) notices.push('자격증 스캔본을 못 찾음(그림 미삽입): ' + noPptx.join(', '))
+        if (noGradeImg.length) notices.push('등급 이미지를 못 찾음: ' + noGradeImg.join(', '))
+        if (noCertImg.length) notices.push('자격명 이미지를 못 찾음: ' + noCertImg.join(', '))
+        if (noHireDate.length) notices.push('입사일을 못 찾음(재직증명서발행파일에 없거나 퇴직 처리됨): ' + noHireDate.join(', '))
+        if (notFound.length) notices.push('인력 정보를 못 찾음(제외됨): ' + notFound.join(', '))
+        if (notices.length) alert('일부 항목을 확인해주세요:\\n\\n' + notices.join('\\n'))
+
+        closeCareerRequestModal()
+      } catch (e) {
+        alert('요청서 생성 중 오류가 발생했습니다: ' + e.message)
+      } finally {
+        btn.disabled = false
+        btn.textContent = '요청서 생성'
+      }
+    }
+  </script>`;
+    return c.html(layout('인력정보', body, 'personnel'));
+});
+// ── 인력 상세 ─────────────────────────────────────────────────
+app.get('/personnel/:id', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (isNaN(id))
+        return c.redirect('/personnel');
+    const person = await queryOne('SELECT * FROM personnel WHERE id = $1', [id]);
+    if (!person)
+        return c.html(layout('없음', '<div class="p-8 text-center text-red-500">인력 정보를 찾을 수 없습니다</div>', 'personnel'));
+    const [certs, auditHistory, itCareer, projectCareer] = await Promise.all([
+        query('SELECT * FROM personnel_certifications WHERE personnel_id = $1 ORDER BY cert_year DESC', [id]),
+        query('SELECT * FROM personnel_audit_history WHERE personnel_id = $1 ORDER BY audit_yearmonth ASC', [id]),
+        query('SELECT * FROM personnel_it_career WHERE personnel_id = $1 ORDER BY period_start DESC', [id]),
+        query('SELECT * FROM personnel_project_career WHERE personnel_id = $1 ORDER BY year_range DESC', [id]),
+    ]);
+    // 감리 실적 표시용 정렬: 최신순(DESC)
+    const auditHistoryDesc = [...auditHistory].reverse();
+    // 감리경력 동적 계산: audit_history 최솟값 → fmtCareer로 n년 n개월
+    const toSortableYM = (ym) => {
+        const m = String(ym).match(/(\d{4})[.\s년](\d{1,2})/);
+        return m ? `${m[1]}.${m[2].padStart(2, '0')}` : String(ym);
+    };
+    const sortedYM = auditHistory
+        .map(h => toSortableYM(String(h.audit_yearmonth ?? '')))
+        .filter(s => /^\d{4}\.\d{2}$/.test(s))
+        .sort();
+    const dynamicStartDate = sortedYM[0] ?? null;
+    // 자격증 목록
+    const certRows = certs.map(cert => `
+    <tr class="border-t border-slate-100 hover:bg-slate-50">
+      <td class="px-4 py-2.5 text-sm font-medium text-slate-800">${cert.cert_name}</td>
+      <td class="px-4 py-2.5 text-sm text-slate-600 text-center">${cert.cert_year ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm text-slate-600">${cert.issuer ?? '-'}</td>
+      <td class="px-4 py-2.5 text-center">
+        <span class="inline-block px-2 py-0.5 rounded-full text-xs font-medium ${cert.is_national ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-500'}">
+          ${cert.is_national ? '국가자격' : '민간자격'}
+        </span>
+      </td>
+      <td class="px-4 py-2.5 text-sm text-slate-500">${cert.related_field ?? '-'}</td>
+    </tr>`).join('');
+    // 감리 실적 목록
+    const auditRows = auditHistoryDesc.map(h => `
+    <tr class="border-t border-slate-100 hover:bg-slate-50">
+      <td class="px-4 py-2.5 text-sm text-slate-600 text-center whitespace-nowrap">${h.audit_yearmonth ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm font-medium text-slate-800 max-w-xs">
+        <div class="line-clamp-2">${h.project_name}</div>
+      </td>
+      <td class="px-4 py-2.5 text-sm text-slate-600">${h.client_org ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm text-slate-500 text-center">${h.sector ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm text-slate-500 text-center">${h.domain ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm text-slate-500 text-center">${h.role ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm text-slate-500 text-center">${h.phase ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm text-slate-500 text-center">${h.participation_rate != null ? h.participation_rate + '%' : '-'}</td>
+    </tr>`).join('');
+    // IT 경력 목록 (감리 이외의 IT 경력: 기간(년)|경력|담당 업무|유사 경력의 근거)
+    const careerRows = itCareer.map(c2 => `
+    <tr class="border-t border-slate-100 hover:bg-slate-50">
+      <td class="px-4 py-2.5 text-xs text-slate-500 whitespace-nowrap">${c2.period_start ?? ''} ~ ${c2.period_end ?? ''}</td>
+      <td class="px-4 py-2.5 text-sm font-medium text-slate-800 max-w-xs">
+        <div class="line-clamp-2">${c2.career}</div>
+      </td>
+      <td class="px-4 py-2.5 text-sm text-slate-600 whitespace-pre-line">${c2.duty ?? '-'}</td>
+      <td class="px-4 py-2.5 text-xs text-slate-400 whitespace-pre-line">${c2.basis ?? '-'}</td>
+    </tr>`).join('');
+    // 프로젝트 및 기타 경력 목록 (연도|프로젝트명|주관 기관|담당 분야|역할|소속 회사|비고)
+    const projectCareerRows = projectCareer.map(pc => `
+    <tr class="border-t border-slate-100 hover:bg-slate-50">
+      <td class="px-4 py-2.5 text-xs text-slate-500 whitespace-nowrap">${pc.year_range ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm font-medium text-slate-800 max-w-xs">
+        <div class="line-clamp-2">${pc.project_name}</div>
+      </td>
+      <td class="px-4 py-2.5 text-sm text-slate-600">${pc.client_org ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm text-slate-500">${pc.domain ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm text-slate-500 text-center">${pc.role ?? '-'}</td>
+      <td class="px-4 py-2.5 text-sm text-slate-500">${pc.company ?? '-'}</td>
+      <td class="px-4 py-2.5 text-xs text-slate-400">${pc.remarks ?? '-'}</td>
+    </tr>`).join('');
+    // 기본 정보 항목 헬퍼
+    const infoItem = (label, value) => `<div class="flex gap-2 py-2 border-b border-slate-100 last:border-0">
+      <span class="text-slate-400 text-xs w-24 flex-shrink-0 mt-0.5">${label}</span>
+      <span class="text-sm text-slate-800 flex-1">${value || '-'}</span>
+    </div>`;
+    const gradeBadge = (grade) => {
+        const map = {
+            '특급': 'bg-purple-100 text-purple-700',
+            '고급': 'bg-blue-100 text-blue-700',
+            '중급': 'bg-teal-100 text-teal-700',
+            '초급': 'bg-slate-100 text-slate-600',
+        };
+        const cls = map[grade] ?? 'bg-slate-100 text-slate-500';
+        return `<span class="inline-block px-3 py-1 rounded-full text-sm font-bold ${cls}">${grade ?? '-'}</span>`;
+    };
+    const body = `
+  <div class="p-6 md:p-8">
+    <!-- 뒤로가기 + 헤더 -->
+    <div class="mb-6 flex items-start gap-4">
+      <a href="/personnel" class="mt-1 text-slate-400 hover:text-slate-600 transition">
+        <i class="fas fa-arrow-left text-lg"></i>
+      </a>
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-3 flex-wrap mb-2">
+          ${gradeBadge(person.auditor_grade)}
+          <span class="inline-block px-2 py-1 rounded-full text-xs font-medium ${person.is_fulltime ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-500'}">
+            ${person.is_fulltime ? '상근' : '비상근'}
+          </span>
+          ${person.tech_grade ? `<span class="inline-block px-2 py-1 rounded-full text-xs bg-green-50 text-green-700">기술등급: ${person.tech_grade}</span>` : ''}
+        </div>
+        <h1 class="text-2xl font-bold text-slate-800">${person.name}</h1>
+        <p class="text-slate-500 text-sm mt-1">${person.position ?? ''} ${person.company ? '· ' + person.company : ''}</p>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+      <!-- 왼쪽 메인 -->
+      <div class="xl:col-span-2 space-y-6">
+
+        <!-- 감리 실적 -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="px-5 py-3 bg-slate-700 text-white font-semibold text-sm flex items-center justify-between">
+            <span><i class="fas fa-history mr-2"></i>감리 실적 (${auditHistoryDesc.length}건)</span>
+          </div>
+          ${auditHistory.length > 0 ? `
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="bg-slate-50 text-xs text-slate-500 border-b border-slate-200">
+                  <th class="px-4 py-2.5 text-center whitespace-nowrap">년월</th>
+                  <th class="px-4 py-2.5 text-left">사업명</th>
+                  <th class="px-4 py-2.5 text-left">발주기관</th>
+                  <th class="px-4 py-2.5 text-center">사업분야</th>
+                  <th class="px-4 py-2.5 text-center">감리분야</th>
+                  <th class="px-4 py-2.5 text-center">역할</th>
+                  <th class="px-4 py-2.5 text-center">단계</th>
+                  <th class="px-4 py-2.5 text-center">참여율</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">${auditRows}</tbody>
+            </table>
+          </div>` : `
+          <div class="px-4 py-8 text-center text-slate-400 text-sm">감리 실적이 없습니다</div>`}
+        </div>
+
+        <!-- 감리 이외의 IT 경력 -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="px-5 py-3 bg-indigo-700 text-white font-semibold text-sm">
+            <i class="fas fa-laptop-code mr-2"></i>감리 이외의 IT 경력 (${itCareer.length}건)
+          </div>
+          ${itCareer.length > 0 ? `
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="bg-slate-50 text-xs text-slate-500 border-b border-slate-200">
+                  <th class="px-4 py-2.5 text-center">기간(년)</th>
+                  <th class="px-4 py-2.5 text-left">경력</th>
+                  <th class="px-4 py-2.5 text-left">담당 업무</th>
+                  <th class="px-4 py-2.5 text-left">유사 경력의 근거</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">${careerRows}</tbody>
+            </table>
+          </div>` : `
+          <div class="px-4 py-8 text-center text-slate-400 text-sm">IT 경력이 없습니다</div>`}
+        </div>
+
+        <!-- 프로젝트 및 기타 경력 -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="px-5 py-3 bg-teal-700 text-white font-semibold text-sm">
+            <i class="fas fa-project-diagram mr-2"></i>프로젝트 및 기타 경력 (${projectCareer.length}건)
+          </div>
+          ${projectCareer.length > 0 ? `
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="bg-slate-50 text-xs text-slate-500 border-b border-slate-200">
+                  <th class="px-4 py-2.5 text-center whitespace-nowrap">연도</th>
+                  <th class="px-4 py-2.5 text-left">프로젝트명</th>
+                  <th class="px-4 py-2.5 text-left">주관 기관</th>
+                  <th class="px-4 py-2.5 text-left">담당 분야</th>
+                  <th class="px-4 py-2.5 text-center">역할</th>
+                  <th class="px-4 py-2.5 text-left">소속 회사</th>
+                  <th class="px-4 py-2.5 text-left">비고</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">${projectCareerRows}</tbody>
+            </table>
+          </div>` : `
+          <div class="px-4 py-8 text-center text-slate-400 text-sm">프로젝트 및 기타 경력이 없습니다</div>`}
+        </div>
+
+        <!-- 경력 요약 (career_summary가 있을 경우) -->
+        ${person.career_summary ? `
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+          <h3 class="font-bold text-slate-700 mb-3 text-sm"><i class="fas fa-align-left mr-2 text-slate-400"></i>경력 요약</h3>
+          <p class="text-sm text-slate-600 whitespace-pre-line leading-relaxed">${person.career_summary}</p>
+        </div>` : ''}
+
+      </div>
+
+      <!-- 오른쪽 사이드 -->
+      <div class="space-y-6">
+
+        <!-- 기본 정보 -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+          <h3 class="font-bold text-slate-700 mb-3 text-sm"><i class="fas fa-id-card mr-2 text-slate-400"></i>기본 정보</h3>
+          <div>
+            ${infoItem('감리자격번호', String(person.auditor_cert_no ?? '-'))}
+            ${infoItem('감리등급', String(person.auditor_grade ?? '-'))}
+            ${infoItem('기술등급', String(person.tech_grade ?? '-'))}
+            ${infoItem('감리경력', fmtCareer(dynamicStartDate ?? String(person.auditor_start_date ?? '')))}
+            ${infoItem('감리시작일', dynamicStartDate ?? String(person.auditor_start_date ?? '-'))}
+            ${infoItem('이메일', String(person.email ?? '-'))}
+            ${infoItem('연락처', String(person.phone ?? '-'))}
+            ${infoItem('생년월일', String(person.birthdate ?? '-'))}
+          </div>
+        </div>
+
+        <!-- 학력 -->
+        ${(person.school || person.major || person.degree) ? `
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+          <h3 class="font-bold text-slate-700 mb-3 text-sm"><i class="fas fa-graduation-cap mr-2 text-slate-400"></i>학력</h3>
+          <div>
+            ${infoItem('학교', String(person.school ?? '-'))}
+            ${infoItem('전공', String(person.major ?? '-'))}
+            ${infoItem('학위', String(person.degree ?? '-'))}
+          </div>
+        </div>` : ''}
+
+        <!-- 자격증 -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="px-4 py-3 bg-amber-50 border-b border-amber-100">
+            <h3 class="font-bold text-amber-700 text-sm"><i class="fas fa-certificate mr-2"></i>자격증 (${certs.length}개)</h3>
+          </div>
+          ${certs.length > 0 ? `
+          <div class="overflow-x-auto">
+            <table class="w-full">
+              <thead>
+                <tr class="bg-slate-50 text-xs text-slate-500 border-b">
+                  <th class="px-4 py-2 text-left">자격증명</th>
+                  <th class="px-4 py-2 text-center">취득연도</th>
+                  <th class="px-4 py-2 text-left">발급기관</th>
+                  <th class="px-4 py-2 text-center">구분</th>
+                  <th class="px-4 py-2 text-left">분야</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">${certRows}</tbody>
+            </table>
+          </div>` : `
+          <div class="px-4 py-6 text-center text-slate-400 text-sm">등록된 자격증이 없습니다</div>`}
+        </div>
+
+        <!-- 교육 이력 -->
+        ${(person.education_name || person.education_org) ? `
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+          <h3 class="font-bold text-slate-700 mb-3 text-sm"><i class="fas fa-chalkboard-teacher mr-2 text-slate-400"></i>교육 이력</h3>
+          <div>
+            ${infoItem('교육명', String(person.education_name ?? '-'))}
+            ${infoItem('교육기관', String(person.education_org ?? '-'))}
+            ${infoItem('교육시간', person.education_hours != null ? person.education_hours + '시간' : '-')}
+          </div>
+        </div>` : ''}
+
+        <!-- 전문 역량 -->
+        ${person.career_qualif ? `
+        <div class="bg-teal-50 rounded-2xl border border-teal-200 p-5">
+          <h3 class="font-bold text-teal-700 mb-2 text-sm"><i class="fas fa-star mr-2"></i>주요 경력 및 자격</h3>
+          <p class="text-xs text-teal-800 whitespace-pre-line leading-relaxed">${person.career_qualif}</p>
+        </div>` : ''}
+
+        ${person.career_project ? `
+        <div class="bg-orange-50 rounded-2xl border border-orange-200 p-5">
+          <h3 class="font-bold text-orange-700 mb-2 text-sm"><i class="fas fa-code mr-2"></i>시스템 개발 / 프로젝트 실무 경력</h3>
+          <p class="text-xs text-orange-800 whitespace-pre-line leading-relaxed">${person.career_project}</p>
+        </div>` : ''}
+
+        ${person.career_expert ? `
+        <div class="bg-violet-50 rounded-2xl border border-violet-200 p-5">
+          <h3 class="font-bold text-violet-700 mb-2 text-sm"><i class="fas fa-lightbulb mr-2"></i>주요 이력 (전문가용)</h3>
+          <p class="text-xs text-violet-800 whitespace-pre-line leading-relaxed">${person.career_expert}</p>
+        </div>` : ''}
+
+      </div>
+    </div>
+  </div>`;
+    return c.html(layout(String(person.name), body, 'personnel'));
+});
+// ── HTML 파일 업로드 페이지 ───────────────────────────────────
+app.get('/upload', (c) => {
+    const body = `
+  <div class="p-6 md:p-8">
+    <div class="mb-8">
+      <h1 class="text-2xl font-bold text-slate-800">HTML 파일 업로드</h1>
+      <p class="text-slate-500 text-sm mt-1">인력 프로파일 또는 사업 제안작업표 HTML을 업로드하면 자동으로 파싱하여 DB에 적재합니다.</p>
+      <p class="text-amber-600 text-xs mt-1 font-medium">
+        <i class="fas fa-exclamation-triangle mr-1"></i>동일한 이름(인력명/사업명)이 이미 존재하면 덮어씁니다.
+        <span class="ml-2 text-slate-400">· 1회 최대 <strong class="text-indigo-600">10개</strong> 파일 병렬 처리</span>
+      </p>
+    </div>
+
+    <style>
+      .drop-zone { border: 2px dashed #94a3b8; transition: border-color .2s, background .2s; }
+      .drop-zone.dragover { border-color: #6366f1; background: #eef2ff; }
+      .log-line { font-family: monospace; font-size: 13px; }
+      .log-ok   { color: #4ade80; }
+      .log-err  { color: #f87171; }
+      .log-info { color: #60a5fa; }
+    </style>
+
+    <div class="grid md:grid-cols-2 gap-6 mb-8">
+
+      <!-- 인력 업로드 카드 -->
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+        <div class="flex items-center gap-3 mb-4">
+          <div class="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center">
+            <i class="fas fa-user text-blue-600"></i>
+          </div>
+          <div>
+            <h2 class="font-bold text-slate-800">인력 프로파일</h2>
+            <p class="text-xs text-slate-400">프로파일(성명).html · 최대 10개</p>
+          </div>
+        </div>
+        <div id="drop-personnel"
+             class="drop-zone rounded-xl p-6 text-center cursor-pointer mb-3"
+             onclick="document.getElementById('file-personnel').click()">
+          <i class="fas fa-cloud-upload-alt text-3xl text-slate-300 mb-2 block"></i>
+          <p class="text-sm text-slate-500">파일을 여기에 드래그하거나 클릭하여 선택</p>
+          <p id="fname-personnel" class="text-xs text-indigo-600 mt-1 font-medium"></p>
+        </div>
+        <input type="file" id="file-personnel" accept=".html" multiple class="hidden">
+        <ul id="filelist-personnel" class="mb-3 space-y-1 max-h-32 overflow-y-auto hidden"></ul>
+        <button id="btn-personnel" onclick="uploadFiles('personnel')"
+                class="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm transition disabled:opacity-40"
+                disabled>
+          <i class="fas fa-upload mr-2"></i>인력 DB 적재
+        </button>
+        <div id="progress-personnel" class="mt-3 hidden">
+          <div class="flex justify-between text-xs text-slate-500 mb-1">
+            <span>처리 중...</span><span id="progress-personnel-text">0 / 0</span>
+          </div>
+          <div class="w-full bg-slate-200 rounded-full h-2">
+            <div id="progress-personnel-bar" class="bg-blue-500 h-2 rounded-full transition-all" style="width:0%"></div>
+          </div>
+        </div>
+        <div id="result-personnel" class="mt-4 hidden">
+          <div class="bg-slate-50 rounded-xl p-4 text-sm space-y-1" id="result-personnel-inner"></div>
+        </div>
+      </div>
+
+      <!-- 사업 업로드 카드 -->
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+        <div class="flex items-center gap-3 mb-4">
+          <div class="w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center">
+            <i class="fas fa-briefcase text-emerald-600"></i>
+          </div>
+          <div>
+            <h2 class="font-bold text-slate-800">사업 제안작업표</h2>
+            <p class="text-xs text-slate-400">[사업명] 감리 용역.html · 최대 10개</p>
+          </div>
+        </div>
+        <div id="drop-project"
+             class="drop-zone rounded-xl p-6 text-center cursor-pointer mb-3"
+             onclick="document.getElementById('file-project').click()">
+          <i class="fas fa-cloud-upload-alt text-3xl text-slate-300 mb-2 block"></i>
+          <p class="text-sm text-slate-500">파일을 여기에 드래그하거나 클릭하여 선택</p>
+          <p id="fname-project" class="text-xs text-emerald-600 mt-1 font-medium"></p>
+        </div>
+        <input type="file" id="file-project" accept=".html" multiple class="hidden">
+        <ul id="filelist-project" class="mb-3 space-y-1 max-h-32 overflow-y-auto hidden"></ul>
+        <button id="btn-project" onclick="uploadFiles('project')"
+                class="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm transition disabled:opacity-40"
+                disabled>
+          <i class="fas fa-upload mr-2"></i>사업 DB 적재
+        </button>
+        <div id="progress-project" class="mt-3 hidden">
+          <div class="flex justify-between text-xs text-slate-500 mb-1">
+            <span>처리 중...</span><span id="progress-project-text">0 / 0</span>
+          </div>
+          <div class="w-full bg-slate-200 rounded-full h-2">
+            <div id="progress-project-bar" class="bg-emerald-500 h-2 rounded-full transition-all" style="width:0%"></div>
+          </div>
+        </div>
+        <div id="result-project" class="mt-4 hidden">
+          <div class="bg-slate-50 rounded-xl p-4 text-sm space-y-1" id="result-project-inner"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 처리 로그 -->
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-bold text-slate-700 text-sm"><i class="fas fa-terminal mr-2 text-slate-400"></i>처리 로그</h3>
+        <button onclick="clearLog()" class="text-xs text-slate-400 hover:text-slate-600 transition">초기화</button>
+      </div>
+      <div id="log" class="min-h-16 max-h-64 overflow-y-auto space-y-0.5 bg-slate-900 rounded-xl p-4">
+        <p class="log-line log-info">대기 중... HTML 파일을 선택해주세요.</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  const MAX_FILES = 10
+  const state = { personnel: [], project: [] }
+
+  // ── 알럿 (카드 하단 인라인) ──────────────────────────────────
+  function showAlert(type, msg) {
+    const id = 'alert-' + type
+    let el = document.getElementById(id)
+    if (!el) {
+      el = document.createElement('div')
+      el.id = id
+      el.className = 'mt-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 flex gap-2 items-start'
+      // 카드 내부 drop-zone 위쪽에 삽입
+      const card = document.getElementById('drop-' + type).closest('.bg-white')
+      card.appendChild(el)
+    }
+    el.innerHTML = \`<i class="fas fa-exclamation-circle mt-0.5 flex-shrink-0"></i><span class="whitespace-pre-line">\${msg}</span>
+      <button onclick="document.getElementById('\${id}').remove()" class="ml-auto text-red-400 hover:text-red-600 flex-shrink-0"><i class="fas fa-times"></i></button>\`
+  }
+
+  function renderFileList(type) {
+    const files = state[type]
+    const ul = document.getElementById('filelist-' + type)
+    const nameEl = document.getElementById('fname-' + type)
+    const btn = document.getElementById('btn-' + type)
+    if (files.length === 0) {
+      ul.classList.add('hidden'); nameEl.textContent = ''; btn.disabled = true; return
+    }
+    ul.classList.remove('hidden')
+    ul.innerHTML = files.map((f, i) =>
+      \`<li class="flex items-center justify-between text-xs bg-slate-50 rounded-lg px-3 py-1.5">
+        <span class="text-slate-700 truncate max-w-[180px]"><i class="fas fa-file-code mr-1 text-slate-400"></i>\${f.name}</span>
+        <button onclick="removeFile('\${type}', \${i})" class="text-slate-300 hover:text-red-500 ml-2"><i class="fas fa-times"></i></button>
+      </li>\`
+    ).join('')
+    nameEl.textContent = files.length + '개 파일 선택됨'
+    btn.disabled = false
+  }
+
+  function removeFile(type, idx) { state[type].splice(idx, 1); renderFileList(type) }
+
+  function setupDrop(type) {
+    const zone = document.getElementById('drop-' + type)
+    const input = document.getElementById('file-' + type)
+    input.addEventListener('change', () => { handleFiles(type, Array.from(input.files)); input.value = '' })
+    zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover') })
+    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'))
+    zone.addEventListener('drop', e => { e.preventDefault(); zone.classList.remove('dragover'); handleFiles(type, Array.from(e.dataTransfer.files)) })
+  }
+
+  function handleFiles(type, newFiles) {
+    const htmlFiles = newFiles.filter(f => f.name.endsWith('.html'))
+    const nonHtml = newFiles.length - htmlFiles.length
+    if (nonHtml > 0) addLog('err', nonHtml + '개 파일은 HTML이 아니어서 제외됨')
+
+    const merged = [...state[type], ...htmlFiles]
+
+    // 10개 초과 시 알럿 + 추가 자체 차단
+    if (merged.length > MAX_FILES) {
+      const over = merged.length - MAX_FILES
+      showAlert(type,
+        \`파일은 최대 \${MAX_FILES}개까지만 업로드할 수 있습니다.\\n현재 \${state[type].length}개 선택됨 + 새 파일 \${htmlFiles.length}개 = \${merged.length}개 (초과: \${over}개)\\n\\n먼저 기존 파일을 제거하거나, 파일을 \${MAX_FILES - state[type].length}개 이하로 선택해 주세요.\`
+      )
+      addLog('err', \`❌ 파일 추가 불가: 최대 \${MAX_FILES}개 초과 (선택 \${merged.length}개)\`)
+      return  // 추가하지 않고 즉시 종료
+    }
+
+    state[type] = merged
+    if (htmlFiles.length > 0) addLog('info', htmlFiles.length + '개 파일 추가됨 (총 ' + state[type].length + '개)')
+    renderFileList(type)
+  }
+
+  setupDrop('personnel')
+  setupDrop('project')
+
+  async function uploadFiles(type) {
+    const files = state[type]
+    if (files.length === 0) return
+    const btn = document.getElementById('btn-' + type)
+    const progressEl = document.getElementById('progress-' + type)
+    const progressBar = document.getElementById('progress-' + type + '-bar')
+    const progressText = document.getElementById('progress-' + type + '-text')
+    const resultEl = document.getElementById('result-' + type)
+
+    btn.disabled = true
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>처리 중...'
+    progressEl.classList.remove('hidden')
+    resultEl.classList.add('hidden')
+
+    const total = files.length
+    let done = 0
+    const results = []
+    addLog('info', \`[\${type}] \${total}개 파일 병렬 업로드 시작\`)
+    const endpoint = type === 'personnel' ? '/api/upload/personnel' : '/api/upload/project'
+
+    await Promise.all(files.map(async (file) => {
+      const formData = new FormData()
+      formData.append('file', file)
+      try {
+        const res = await fetch(endpoint, { method: 'POST', body: formData })
+        const json = await res.json()
+        done++
+        progressBar.style.width = (done / total * 100) + '%'
+        progressText.textContent = done + ' / ' + total
+        if (json.ok) { addLog('ok', '✅ ' + file.name + ' → ' + (json.message || '완료')); results.push({ ok: true, file: file.name, data: json.data }) }
+        else          { addLog('err', '❌ ' + file.name + ' → ' + (json.error || '오류')); results.push({ ok: false, file: file.name, error: json.error }) }
+      } catch (e) {
+        done++
+        progressBar.style.width = (done / total * 100) + '%'
+        progressText.textContent = done + ' / ' + total
+        addLog('err', '❌ ' + file.name + ' → 네트워크 오류: ' + e.message)
+        results.push({ ok: false, file: file.name, error: e.message })
+      }
+    }))
+
+    const okCount = results.filter(r => r.ok).length
+    const errCount = results.length - okCount
+    addLog(errCount === 0 ? 'ok' : 'err', \`[\${type}] 완료 — 성공: \${okCount}개 / 실패: \${errCount}개\`)
+    showBatchResult(type, results)
+    btn.innerHTML = '<i class="fas fa-check mr-2"></i>완료 (재업로드 가능)'
+    btn.disabled = false
+    progressEl.classList.add('hidden')
+    state[type] = state[type].filter((f, i) => !results[i]?.ok)
+    renderFileList(type)
+    if (state[type].length > 0) addLog('info', '실패한 ' + state[type].length + '개 파일이 목록에 남아있습니다.')
+  }
+
+  function showBatchResult(type, results) {
+    const el = document.getElementById('result-' + type)
+    const inner = document.getElementById('result-' + type + '-inner')
+    el.classList.remove('hidden')
+    const okList = results.filter(r => r.ok)
+    const errList = results.filter(r => !r.ok)
+    let html = ''
+    if (okList.length > 0) {
+      html += \`<p class="text-green-600 font-semibold mb-2"><i class="fas fa-check-circle mr-1"></i>성공 \${okList.length}개</p>\`
+      html += okList.map(r => {
+        const d = r.data
+        return type === 'personnel'
+          ? \`<div class="text-xs bg-white rounded-lg px-3 py-2 mb-1 border border-slate-100"><span class="font-medium text-slate-700">\${d.name}</span><span class="text-slate-400 ml-2">자격증 \${d.certifications}건 · 감리실적 \${d.audit_history}건 · IT경력 \${d.it_career}건</span></div>\`
+          : \`<div class="text-xs bg-white rounded-lg px-3 py-2 mb-1 border border-slate-100"><span class="font-medium text-slate-700">\${d.project_name}</span><span class="text-slate-400 ml-2">키워드 \${d.keywords}개 · 단계 \${d.phases} · 인력 \${d.proposal_members}명</span></div>\`
+      }).join('')
+    }
+    if (errList.length > 0) {
+      html += \`<p class="text-red-600 font-semibold mt-2 mb-1"><i class="fas fa-times-circle mr-1"></i>실패 \${errList.length}개</p>\`
+      html += errList.map(r => \`<div class="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-1.5 mb-1">\${r.file}: \${r.error}</div>\`).join('')
+    }
+    inner.innerHTML = html
+  }
+
+  function addLog(type, msg) {
+    const log = document.getElementById('log')
+    const p = document.createElement('p')
+    const ts = new Date().toLocaleTimeString('ko-KR', {hour:'2-digit',minute:'2-digit',second:'2-digit'})
+    p.className = 'log-line log-' + type
+    p.textContent = '[' + ts + '] ' + msg
+    log.appendChild(p)
+    log.scrollTop = log.scrollHeight
+  }
+
+  function clearLog() { document.getElementById('log').innerHTML = '<p class="log-line log-info">로그 초기화됨</p>' }
+  </script>`;
+    return c.html(layout('HTML 업로드', body, 'upload'));
+});
+// ── 첨부 및 서류 생성 페이지 ───────────────────────────────────────
+app.get('/ppt-generate', (c) => {
+    const body = `
+  <div class="p-6 md:p-8 max-w-6xl space-y-8" id="pptGenRoot">
+
+    <div>
+      <h1 class="text-2xl font-bold text-slate-800 flex items-center gap-2 mb-1">
+        <i class="fas fa-file-powerpoint text-indigo-500"></i> 첨부 및 서류 생성
+      </h1>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════
+         위 섹션 — 사업 기반 첨부 생성 (제안작업표)
+    ══════════════════════════════════════════════════ -->
+    <section class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+      <div class="px-6 py-4 bg-slate-50 border-b border-slate-200 flex items-center gap-3">
+        <div class="w-7 h-7 rounded-lg bg-indigo-500 flex items-center justify-center flex-shrink-0">
+          <i class="fas fa-briefcase text-white text-xs"></i>
+        </div>
+        <div>
+          <div class="font-bold text-slate-800 text-sm">사업 기반 첨부 생성</div>
+          <div class="text-xs text-slate-400">제안작업표(사업)를 선택해 등록된 인력·키워드로 첨부PPT를 생성합니다</div>
+        </div>
+        <div class="ml-auto">
+          <input id="searchInput" type="text" placeholder="사업명 / 발주처 검색"
+                 class="w-56 px-3 py-1.5 border border-slate-200 rounded-lg text-sm
+                        focus:outline-none focus:ring-2 focus:ring-indigo-300" />
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="bg-slate-50 border-b border-slate-200">
+            <tr>
+              <th class="px-4 py-3 text-left font-semibold text-slate-500">사업명</th>
+              <th class="px-4 py-3 text-left font-semibold text-slate-500">발주처</th>
+              <th class="px-4 py-3 text-center font-semibold text-slate-500">등록연월</th>
+              <th class="px-4 py-3 text-center font-semibold text-slate-500">마감일</th>
+              <th class="px-4 py-3 text-center font-semibold text-slate-500">상태</th>
+              <th class="px-4 py-3 text-center font-semibold text-slate-500">첨부PPT 생성</th>
+            </tr>
+          </thead>
+          <tbody id="projectListBody">
+            <tr><td colspan="6" class="px-4 py-10 text-center text-slate-400">불러오는 중...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="projectListPager" class="flex items-center justify-between px-4 py-3 border-t border-slate-100 hidden">
+        <span id="projectListInfo" class="text-xs text-slate-400"></span>
+        <div id="projectListPageBtns" class="flex gap-1"></div>
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════════
+         아래 섹션 — 자유 첨부 생성 (사업 무관)
+    ══════════════════════════════════════════════════ -->
+    <section class="bg-white rounded-2xl border border-violet-200 shadow-sm overflow-hidden">
+      <div class="px-6 py-4 bg-violet-50 border-b border-violet-100 flex items-center gap-3">
+        <div class="w-7 h-7 rounded-lg bg-violet-600 flex items-center justify-center flex-shrink-0">
+          <i class="fas fa-magic text-white text-xs"></i>
+        </div>
+        <div>
+          <div class="font-bold text-slate-800 text-sm">자유 첨부 생성</div>
+          <div class="text-xs text-slate-400">사업과 무관하게 — 원하는 인력을 선택하고 키워드를 직접 입력해 첨부PPT를 생성합니다</div>
+        </div>
+      </div>
+
+      <div class="p-6">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+          <!-- 열1: 첨부 항목 선택 -->
+          <div>
+            <div class="text-xs font-bold text-slate-500 uppercase tracking-wide mb-3">
+              <i class="fas fa-list-check mr-1 text-indigo-400"></i>① 첨부 항목 선택
+            </div>
+            <div id="freeItemList" class="space-y-1.5 min-h-16">
+              <div class="text-slate-400 text-xs text-center py-4"><i class="fas fa-spinner fa-spin mr-1"></i>불러오는 중...</div>
+            </div>
+          </div>
+
+          <!-- 열2: 인력 선택 -->
+          <div>
+            <div class="text-xs font-bold text-slate-500 uppercase tracking-wide mb-3">
+              <i class="fas fa-users mr-1 text-violet-500"></i>② 인력 선택
+            </div>
+            <div class="text-[11px] text-slate-400 mb-1.5">성명:담당분야 형식으로 쉼표 또는 줄바꿈으로 구분</div>
+            <textarea id="freePersonnelInput"
+              class="w-full text-xs px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-violet-300 resize-none"
+              rows="5"
+              placeholder="김현호:기능테스트, 김태호:웹접근성"></textarea>
+            <div id="freePersonnelValidation" class="mt-1.5 space-y-0.5 text-[11px]"></div>
+          </div>
+
+          <!-- 열3: 키워드→변환 입력 -->
+          <div class="flex flex-col gap-3">
+            <div class="text-xs font-bold text-slate-500 uppercase tracking-wide">
+              <i class="fas fa-exchange-alt mr-1 text-emerald-500"></i>③ 키워드 → 변환 텍스트
+            </div>
+
+            <!-- 키워드 목록 -->
+            <div>
+              <div class="text-xs font-semibold text-slate-500 mb-1">
+                매칭 키워드
+                <span class="font-normal text-slate-400 ml-1">쉼표 또는 줄바꿈으로 구분</span>
+              </div>
+              <textarea id="freeKwInput" rows="4"
+                class="w-full text-xs px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-300 resize-none"
+                placeholder="지방세, 국민비서, 챗봇&#10;LLM, 생성형AI"></textarea>
+            </div>
+
+            <!-- 변환 규칙 -->
+            <div class="flex-1">
+              <div class="text-xs font-semibold text-slate-500 mb-1">
+                키워드 변환 규칙
+                <span class="font-normal text-slate-400 ml-1">키워드1, 키워드2 -&gt; 변환텍스트</span>
+              </div>
+              <textarea id="freeKwMappingInput" rows="6"
+                class="w-full h-40 text-xs px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-300 resize-none"
+                placeholder="공공데이터포털, 개방, 데이터바우처 -> 데이터개방&#10;건강정보, 의료데이터 -> 의료정보&#10;빅데이터 플랫폼 -> 데이터관리"></textarea>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- 재직증명서 날짜 옵션 패널 (자유 생성 전용) -->
+        <div id="freeEmploymentDeadlinePanel" class="hidden mt-4 px-5 py-3 rounded-xl border border-cyan-200 bg-cyan-50">
+          <div class="flex items-center gap-3 flex-wrap">
+            <span class="text-xs font-semibold text-cyan-700 flex items-center gap-1.5 w-28">
+              <i class="fas fa-calendar-day"></i>재직증명서 날짜
+            </span>
+            <label class="text-xs text-slate-600">
+              [제출마감하루전] 자리에 넣을 날짜
+            </label>
+            <input type="date" id="freeEmploymentDeadlineInput"
+              class="text-xs px-2 py-1 border border-cyan-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-cyan-400 bg-white">
+          </div>
+        </div>
+
+        <!-- 경력증명서 도장 옵션 패널 (자유 생성 전용) -->
+        <div id="freeCareerCertStampPanel" class="hidden mt-4 px-5 py-3 rounded-xl border border-indigo-200 bg-indigo-50">
+          <div class="flex items-center gap-4 flex-wrap">
+            <span class="text-xs font-semibold text-indigo-700 flex items-center gap-1.5 w-28">
+              <i class="fas fa-stamp"></i>경력증명서 도장
+            </span>
+            <label class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+              <input type="radio" name="freeCareerCertStampOpt" value="none" checked onchange="onFreeStampChange('career',this)">
+              도장 없음
+            </label>
+            <label class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+              <input type="radio" name="freeCareerCertStampOpt" value="원본대조필" onchange="onFreeStampChange('career',this)">
+              원본대조필
+            </label>
+            <label class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+              <input type="radio" name="freeCareerCertStampOpt" value="사실과상위없음" onchange="onFreeStampChange('career',this)">
+              사실과상위없음
+            </label>
+            <span id="freeCareerStampNumberWrap" class="hidden items-center gap-1 text-xs text-slate-600">
+              <span class="text-slate-400">번호:</span>
+              ${[1, 2, 3, 4, 5].map(n => `<label class="flex items-center gap-0.5 cursor-pointer"><input type="radio" name="freeCareerCertStampNumber" value="${n}" ${n === 1 ? 'checked' : ''}><span>${n}</span></label>`).join('')}
+            </span>
+          </div>
+        </div>
+
+        <!-- 자격증사본 도장 옵션 패널 (자유 생성 전용) -->
+        <div id="freeLicenseCertStampPanel" class="hidden mt-2 px-5 py-3 rounded-xl border border-pink-200 bg-pink-50">
+          <div class="flex items-center gap-4 flex-wrap">
+            <span class="text-xs font-semibold text-pink-700 flex items-center gap-1.5 w-28">
+              <i class="fas fa-stamp"></i>자격증사본 도장
+            </span>
+            <label class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+              <input type="radio" name="freeLicenseCertStampOpt" value="none" checked onchange="onFreeStampChange('license',this)">
+              도장 없음
+            </label>
+            <label class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+              <input type="radio" name="freeLicenseCertStampOpt" value="원본대조필" onchange="onFreeStampChange('license',this)">
+              원본대조필
+            </label>
+            <label class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+              <input type="radio" name="freeLicenseCertStampOpt" value="사실과상위없음" onchange="onFreeStampChange('license',this)">
+              사실과상위없음
+            </label>
+            <span id="freeLicenseStampNumberWrap" class="hidden items-center gap-1 text-xs text-slate-600">
+              <span class="text-slate-400">번호:</span>
+              ${[1, 2, 3, 4, 5].map(n => `<label class="flex items-center gap-0.5 cursor-pointer"><input type="radio" name="freeLicenseCertStampNumber" value="${n}" ${n === 1 ? 'checked' : ''}><span>${n}</span></label>`).join('')}
+            </span>
+          </div>
+        </div>
+
+        <!-- 생성 버튼 -->
+        <div class="mt-6 flex justify-end">
+          <button onclick="confirmFreeBundle()" id="freeBundleBtn"
+            class="px-6 py-2.5 rounded-xl bg-violet-600 hover:bg-violet-700 text-white text-sm font-bold shadow transition">
+            <i class="fas fa-magic mr-2"></i>첨부PPT 생성
+          </button>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- ── 첨부PPT 생성 모달 ── -->
+  <div id="bundleModal" class="hidden fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-xl w-full flex flex-col" style="max-width:900px;max-height:92vh">
+
+      <!-- 헤더 -->
+      <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between flex-shrink-0">
+        <div>
+          <h3 class="font-bold text-slate-800 text-lg"><i class="fas fa-paperclip mr-2 text-indigo-500"></i>첨부PPT 생성</h3>
+          <p class="text-xs text-slate-400 mt-0.5" id="bundleModalProjectName"></p>
+        </div>
+        <button onclick="closeBundleModal()" class="text-slate-400 hover:text-slate-700 text-xl w-8 h-8 flex items-center justify-center"><i class="fas fa-times"></i></button>
+      </div>
+
+      <!-- 2-column body -->
+      <div class="flex-1 overflow-hidden flex min-h-0">
+
+        <!-- ① 첨부 항목 선택 (full width) -->
+        <div class="flex-1 flex flex-col overflow-hidden">
+          <div class="px-4 py-3 bg-slate-50 border-b border-slate-100 flex-shrink-0">
+            <div class="text-xs font-bold text-slate-500 uppercase tracking-wide">① 첨부 항목 선택</div>
+          </div>
+          <div id="bundleItemList" class="flex-1 overflow-y-auto p-4 space-y-1.5"></div>
+        </div>
+
+      </div>
+
+      <!-- 경력증명서 도장 옵션 패널 -->
+      <div id="careerCertStampPanel" class="hidden px-6 py-2.5 border-t border-indigo-100 bg-indigo-50 flex-shrink-0">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-xs font-semibold text-indigo-700 flex items-center gap-1 w-28">
+            <i class="fas fa-stamp text-indigo-400"></i>경력증명서 도장
+          </span>
+          <label class="flex items-center gap-1.5 cursor-pointer text-xs text-slate-600">
+            <input type="radio" name="careerCertStampOpt" value="none" checked onchange="onCareerCertStampChange(this)">
+            도장 없음
+          </label>
+          <label class="flex items-center gap-1.5 cursor-pointer text-xs text-slate-600">
+            <input type="radio" name="careerCertStampOpt" value="원본대조필" onchange="onCareerCertStampChange(this)">
+            원본대조필
+          </label>
+          <label class="flex items-center gap-1.5 cursor-pointer text-xs text-slate-600">
+            <input type="radio" name="careerCertStampOpt" value="사실과상위없음" onchange="onCareerCertStampChange(this)">
+            사실과상위없음
+          </label>
+          <span id="careerCertStampNumberWrap" class="hidden items-center gap-1 text-xs text-slate-600">
+            <span class="text-slate-400">번호:</span>
+            ${[1, 2, 3, 4, 5].map(n => `<label class="flex items-center gap-0.5 cursor-pointer"><input type="radio" name="careerCertStampNumber" value="${n}" ${n === 1 ? 'checked' : ''}><span>${n}</span></label>`).join('')}
+          </span>
+        </div>
+      </div>
+
+      <!-- 자격증사본 도장 옵션 패널 -->
+      <div id="licenseCertStampPanel" class="hidden px-6 py-2.5 border-t border-pink-100 bg-pink-50 flex-shrink-0">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-xs font-semibold text-pink-700 flex items-center gap-1 w-28">
+            <i class="fas fa-stamp text-pink-400"></i>자격증사본 도장
+          </span>
+          <label class="flex items-center gap-1.5 cursor-pointer text-xs text-slate-600">
+            <input type="radio" name="licenseCertStampOpt" value="none" checked onchange="onLicenseCertStampChange(this)">
+            도장 없음
+          </label>
+          <label class="flex items-center gap-1.5 cursor-pointer text-xs text-slate-600">
+            <input type="radio" name="licenseCertStampOpt" value="원본대조필" onchange="onLicenseCertStampChange(this)">
+            원본대조필
+          </label>
+          <label class="flex items-center gap-1.5 cursor-pointer text-xs text-slate-600">
+            <input type="radio" name="licenseCertStampOpt" value="사실과상위없음" onchange="onLicenseCertStampChange(this)">
+            사실과상위없음
+          </label>
+          <span id="licenseCertStampNumberWrap" class="hidden items-center gap-1 text-xs text-slate-600">
+            <span class="text-slate-400">번호:</span>
+            ${[1, 2, 3, 4, 5].map(n => `<label class="flex items-center gap-0.5 cursor-pointer"><input type="radio" name="licenseCertStampNumber" value="${n}" ${n === 1 ? 'checked' : ''}><span>${n}</span></label>`).join('')}
+          </span>
+        </div>
+      </div>
+
+      <!-- 하단 버튼 -->
+      <div class="px-6 py-3 border-t border-slate-100 flex justify-end gap-2 flex-shrink-0">
+        <button onclick="closeBundleModal()" class="px-4 py-2 text-sm rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50">취소</button>
+        <button onclick="confirmGenerateBundle()" id="bundleConfirmBtn"
+          class="px-5 py-2 text-sm rounded-lg bg-violet-600 hover:bg-violet-700 text-white font-semibold">
+          <i class="fas fa-magic mr-1"></i>생성
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 첨부PPT 생성 결과 팝업 모달 ───────────────────────────── -->
+  <div id="bundleResultModal" class="hidden fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg flex flex-col max-h-[85vh]">
+      <!-- 헤더 -->
+      <div class="flex items-center gap-3 px-6 py-4 border-b border-slate-100 flex-shrink-0">
+        <div class="w-9 h-9 rounded-full bg-emerald-100 flex items-center justify-center flex-shrink-0">
+          <i class="fas fa-check text-emerald-600 text-sm"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <h3 class="text-base font-bold text-slate-800">첨부PPT 생성 완료</h3>
+          <p class="text-xs text-slate-400 mt-0.5" id="brSubtitle"></p>
+        </div>
+        <button onclick="closeBundleResultModal()" class="text-slate-400 hover:text-slate-600 text-xl leading-none flex-shrink-0">&times;</button>
+      </div>
+      <!-- 본문 -->
+      <div class="overflow-y-auto flex-1 px-6 py-5 space-y-5" id="brBody">
+        <!-- 동적 렌더링 -->
+      </div>
+      <!-- 푸터 -->
+      <div class="px-6 py-4 border-t border-slate-100 flex-shrink-0">
+        <button onclick="closeBundleResultModal()"
+          class="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold transition">
+          <i class="fas fa-download mr-1.5"></i>확인 (파일 다운로드 완료)
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function(m) {
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]
+    })
+  }
+
+  // ── 첨부PPT 생성 결과 팝업 ────────────────────────────────────
+  function showBundleResult(summaries, filename) {
+    var personBased = summaries.filter(function(s) { return s.isPersonBased })
+    var simple      = summaries.filter(function(s) { return !s.isPersonBased })
+    var totalSlides = summaries.reduce(function(acc, s) { return acc + (s.slideCount || 0) }, 0) + 1 // +1 표지
+
+    var makeRow = function(s) {
+      var skippedHtml = ''
+      if (s.skipped && s.skipped.length) {
+        skippedHtml = '<div class="mt-1.5 text-[10px] text-amber-600 bg-amber-50 rounded px-2 py-1">'
+          + '<i class="fas fa-exclamation-triangle mr-1"></i>제외: ' + s.skipped.map(escapeHtml).join(', ') + '</div>'
+      }
+      return '<div class="flex items-start gap-2.5 py-2 border-b border-slate-100 last:border-0">'
+        + '<i class="fas fa-file-powerpoint text-indigo-400 text-sm mt-0.5 flex-shrink-0"></i>'
+        + '<div class="flex-1 min-w-0">'
+        + '<div class="text-xs font-semibold text-slate-700">' + escapeHtml(s.label) + '</div>'
+        + (s.detail ? '<div class="text-[11px] text-slate-400 mt-0.5">' + escapeHtml(s.detail) + '</div>' : '')
+        + skippedHtml
+        + '</div>'
+        + '<span class="text-xs font-bold text-indigo-600 flex-shrink-0">' + (s.slideCount || 0) + '장</span>'
+        + '</div>'
+    }
+
+    var bodyHtml = ''
+
+    // ① 인력반복 섹션
+    if (personBased.length) {
+      bodyHtml += '<div>'
+        + '<div class="flex items-center gap-2 mb-2">'
+        + '<span class="text-[10px] px-2 py-0.5 rounded-full font-bold bg-violet-100 text-violet-700">인력반복</span>'
+        + '<span class="text-xs text-slate-500 font-medium">인력 데이터를 참조하는 서류</span>'
+        + '</div>'
+        + '<div class="bg-slate-50 rounded-xl px-3 py-1">'
+        + personBased.map(makeRow).join('')
+        + '</div></div>'
+    }
+
+    // ② 단순첨부 섹션
+    if (simple.length) {
+      bodyHtml += '<div>'
+        + '<div class="flex items-center gap-2 mb-2">'
+        + '<span class="text-[10px] px-2 py-0.5 rounded-full font-bold bg-sky-100 text-sky-600">단순첨부</span>'
+        + '<span class="text-xs text-slate-500 font-medium">인원 수와 무관한 단일 서류</span>'
+        + '</div>'
+        + '<div class="bg-slate-50 rounded-xl px-3 py-1">'
+        + simple.map(makeRow).join('')
+        + '</div></div>'
+    }
+
+    // ③ 합계
+    bodyHtml += '<div class="flex items-center justify-between bg-emerald-50 rounded-xl px-4 py-3 border border-emerald-200">'
+      + '<span class="text-sm font-semibold text-emerald-700">전체 슬라이드 합계</span>'
+      + '<span class="text-lg font-extrabold text-emerald-700">' + totalSlides + '장</span>'
+      + '</div>'
+
+    document.getElementById('brSubtitle').textContent = filename || '다운로드 완료'
+    document.getElementById('brBody').innerHTML = bodyHtml
+    document.getElementById('bundleResultModal').classList.remove('hidden')
+  }
+
+  function closeBundleResultModal() {
+    document.getElementById('bundleResultModal').classList.add('hidden')
+  }
+
+  // ── 사업 목록 로드 ─────────────────────────────────────────────
+  var _allProjects = []      // 전체 사업 목록 캐시
+  var _projPage = 1
+  var _projPageSize = 10
+
+  function renderProjectPage() {
+    var tbody = document.getElementById('projectListBody')
+    var pager = document.getElementById('projectListPager')
+    var info  = document.getElementById('projectListInfo')
+    var btns  = document.getElementById('projectListPageBtns')
+    var total = _allProjects.length
+    if (!total) {
+      tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-10 text-center text-slate-400">등록된 사업이 없습니다</td></tr>'
+      pager.classList.add('hidden'); return
+    }
+    var totalPages = Math.max(1, Math.ceil(total / _projPageSize))
+    if (_projPage > totalPages) _projPage = totalPages
+    var start = (_projPage - 1) * _projPageSize
+    var slice = _allProjects.slice(start, start + _projPageSize)
+    tbody.innerHTML = slice.map(function(p) {
+      return '<tr class="hover:bg-indigo-50 transition border-b border-slate-100 last:border-0">'
+        + '<td class="px-4 py-3 font-medium text-slate-700">' + escapeHtml(p.project_name || '-') + '</td>'
+        + '<td class="px-4 py-3 text-slate-600">' + escapeHtml(p.client_org || '-') + '</td>'
+        + '<td class="px-4 py-3 text-center text-slate-600">' + escapeHtml(p.registered_yearmonth || '-') + '</td>'
+        + '<td class="px-4 py-3 text-center text-slate-600">' + escapeHtml(p.bid_deadline || '-') + '</td>'
+        + '<td class="px-4 py-3 text-center"><span class="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600">' + escapeHtml(p.proposal_status || '-') + '</span></td>'
+        + '<td class="px-4 py-3 text-center"><button class="bundle-open-btn bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition" data-pid="' + p.id + '" data-pname="' + escapeHtml(p.project_name || '') + '"><i class="fas fa-paperclip"></i> 첨부PPT 생성</button></td>'
+        + '</tr>'
+    }).join('')
+    document.querySelectorAll('.bundle-open-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        activeBundleBtn = btn
+        openBundleModal(Number(btn.dataset.pid), btn.dataset.pname)
+      })
+    })
+    // 페이저 렌더
+    if (totalPages <= 1) { pager.classList.add('hidden'); return }
+    pager.classList.remove('hidden')
+    info.textContent = '총 ' + total + '건 (' + _projPage + ' / ' + totalPages + ' 페이지)'
+    var btnHtml = ''
+    if (_projPage > 1) {
+      btnHtml += '<button onclick="_projPage--; renderProjectPage()" class="px-2.5 py-1 rounded border border-slate-200 text-xs text-slate-600 hover:border-indigo-300 hover:text-indigo-600 transition"><i class="fas fa-chevron-left"></i></button>'
+    } else {
+      btnHtml += '<span class="px-2.5 py-1 rounded border border-slate-100 text-xs text-slate-300"><i class="fas fa-chevron-left"></i></span>'
+    }
+    var startPg = Math.max(1, _projPage - 2)
+    var endPg   = Math.min(totalPages, startPg + 4)
+    if (endPg - startPg < 4) startPg = Math.max(1, endPg - 4)
+    for (var pg = startPg; pg <= endPg; pg++) {
+      if (pg === _projPage) {
+        btnHtml += '<span class="px-2.5 py-1 rounded bg-indigo-600 text-white text-xs font-semibold">' + pg + '</span>'
+      } else {
+        btnHtml += '<button onclick="_projPage=' + pg + '; renderProjectPage()" class="px-2.5 py-1 rounded border border-slate-200 text-xs text-slate-600 hover:border-indigo-300 hover:text-indigo-600 transition">' + pg + '</button>'
+      }
+    }
+    if (_projPage < totalPages) {
+      btnHtml += '<button onclick="_projPage++; renderProjectPage()" class="px-2.5 py-1 rounded border border-slate-200 text-xs text-slate-600 hover:border-indigo-300 hover:text-indigo-600 transition"><i class="fas fa-chevron-right"></i></button>'
+    } else {
+      btnHtml += '<span class="px-2.5 py-1 rounded border border-slate-100 text-xs text-slate-300"><i class="fas fa-chevron-right"></i></span>'
+    }
+    btns.innerHTML = btnHtml
+  }
+
+  async function loadProjects(search) {
+    var tbody = document.getElementById('projectListBody')
+    tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-10 text-center text-slate-400">불러오는 중...</td></tr>'
+    document.getElementById('projectListPager').classList.add('hidden')
+    try {
+      var url = '/api/audit-projects' + (search ? '?search=' + encodeURIComponent(search) : '')
+      var r = await fetch(url)
+      var j = await r.json()
+      if (!j.ok) throw new Error(j.error || '조회 실패')
+      _allProjects = j.data || []
+      _projPage = 1
+      renderProjectPage()
+    } catch(e) {
+      tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-10 text-center text-red-500">' + escapeHtml(e.message) + '</td></tr>'
+    }
+  }
+
+  var searchTimer
+  document.getElementById('searchInput').addEventListener('input', function(e) {
+    clearTimeout(searchTimer)
+    searchTimer = setTimeout(function() { loadProjects(e.target.value) }, 300)
+  })
+  loadProjects('')
+
+  // ── 모달 상태 ──────────────────────────────────────────────────
+  var bundleProjectId = null
+  var activeBundleBtn = null   // 현재 생성 중인 테이블 행의 bundle-open-btn 참조
+  var bundleMenus     = []
+  var bundleItemChecked = {}
+
+  // ── 인력 관련 상태 ────────────────────────────────────────────
+  var allPersonnel = []          // 전체 인력 목록 캐시
+  var personnelChecked = {}      // { personnelId: true/false }
+  var personnelKwMap = {}        // { personnelId: [ {key,val}, ... ] }
+
+  // 인력 목록 로드 (모달 첫 열기 시 또는 캐시 없을 때)
+  async function loadPersonnelList() {
+    if (allPersonnel.length) { renderPersonnelList(''); return }
+    var area = document.getElementById('personnelListArea')
+    area.innerHTML = '<div class="text-slate-400 text-xs text-center py-4"><i class="fas fa-spinner fa-spin mr-1"></i>불러오는 중...</div>'
+    try {
+      var r = await fetch('/api/personnel')
+      var j = await r.json()
+      if (!j.ok) throw new Error(j.error || '인력 조회 실패')
+      allPersonnel = j.data || []
+      renderPersonnelList('')
+    } catch(e) {
+      area.innerHTML = '<div class="text-red-500 text-xs text-center py-4">' + escapeHtml(e.message) + '</div>'
+    }
+  }
+
+  function renderPersonnelList(search) {
+    var area = document.getElementById('personnelListArea')
+    var filtered = allPersonnel.filter(function(p) {
+      return !search || (p.name || '').toLowerCase().includes(search.toLowerCase())
+    })
+    if (!filtered.length) {
+      area.innerHTML = '<div class="text-slate-400 text-xs text-center py-3">검색 결과 없음</div>'
+      return
+    }
+    var GRADE_COLOR = {
+      '수석감리원': 'bg-blue-900 text-white',
+      '감리원': 'bg-blue-500 text-white',
+      '전문가': 'bg-purple-600 text-white',
+      '테스터': 'bg-purple-900 text-white'
+    }
+    area.innerHTML = filtered.map(function(p) {
+      var checked = !!personnelChecked[p.id]
+      var grade = p.auditor_grade || ''
+      var gradeClass = GRADE_COLOR[grade] || 'bg-slate-400 text-white'
+      // group label (오른쪽 작은 텍스트) — personnel API에서 member_group은 없으므로 position 활용
+      var groupLabel = p.position || ''
+      return '<label class="flex items-center gap-2 px-2.5 py-1.5 rounded-lg border cursor-pointer transition text-xs select-none '
+        + (checked ? 'border-violet-300 bg-violet-50' : 'border-transparent hover:bg-slate-50') + '">'
+        + '<input type="checkbox" class="w-3.5 h-3.5 accent-violet-600 flex-shrink-0 personnel-cb" data-pid="' + p.id + '" '
+        + (checked ? 'checked' : '') + ' onchange="onPersonnelChange(' + p.id + ', this.checked)">'
+        + '<span class="font-semibold text-slate-800 flex-shrink-0">' + escapeHtml(p.name || '') + '</span>'
+        + (grade ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold flex-shrink-0 ' + gradeClass + '">' + escapeHtml(grade) + '</span>' : '')
+        + (groupLabel ? '<span class="text-slate-400 truncate">' + escapeHtml(groupLabel) + '</span>' : '')
+        + '</label>'
+    }).join('')
+  }
+
+  function onPersonnelChange(pid, checked) {
+    personnelChecked[pid] = checked
+    if (!checked) {
+      delete personnelKwMap[pid]
+    } else if (!personnelKwMap[pid]) {
+      personnelKwMap[pid] = []
+    }
+    // 라벨 스타일 갱신
+    var cb = document.querySelector('.personnel-cb[data-pid="' + pid + '"]')
+    if (cb) {
+      var label = cb.closest('label')
+      if (label) {
+        label.className = label.className.replace(/border-violet-300 bg-violet-50|border-transparent hover:bg-slate-50/g, '')
+        label.className += checked ? ' border-violet-300 bg-violet-50' : ' border-transparent hover:bg-slate-50'
+      }
+    }
+    renderPersonnelKwRows()
+  }
+
+  function renderPersonnelKwRows() {
+    var section = document.getElementById('personnelKwSection')
+    var container = document.getElementById('personnelKwRows')
+    var selectedPeople = allPersonnel.filter(function(p) { return personnelChecked[p.id] })
+    if (!selectedPeople.length) {
+      section.classList.add('hidden')
+      return
+    }
+    section.classList.remove('hidden')
+
+    // 기존 입력값 보존: DOM에서 현재 값 수집
+    container.querySelectorAll('.per-kw-block').forEach(function(block) {
+      var pid = Number(block.dataset.pid)
+      var rows = []
+      block.querySelectorAll('.per-kw-row').forEach(function(row) {
+        rows.push({ key: row.querySelector('.per-kw-key').value, val: row.querySelector('.per-kw-val').value })
+      })
+      personnelKwMap[pid] = rows
+    })
+
+    container.innerHTML = selectedPeople.map(function(p) {
+      var rows = personnelKwMap[p.id] || []
+      var rowsHtml = rows.map(function(r, i) {
+        return '<div class="per-kw-row flex gap-1.5 items-center">'
+          + '<input type="text" class="per-kw-key w-40 text-xs px-2 py-1 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-violet-300" placeholder="키워드 (예: {{전문분야}})" value="' + escapeHtml(r.key) + '">'
+          + '<span class="text-slate-300 text-xs flex-shrink-0">→</span>'
+          + '<input type="text" class="per-kw-val flex-1 text-xs px-2 py-1 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-violet-300" placeholder="변환 텍스트" value="' + escapeHtml(r.val) + '">'
+          + '<button type="button" class="text-slate-300 hover:text-red-400 text-sm px-0.5 flex-shrink-0" onclick="removePerKwRow(this)"><i class="fas fa-times"></i></button>'
+          + '</div>'
+      }).join('')
+      return '<div class="per-kw-block bg-slate-50 rounded-lg p-3" data-pid="' + p.id + '">'
+        + '<div class="flex items-center justify-between mb-2">'
+        + '<span class="text-xs font-semibold text-slate-700">' + escapeHtml(p.name || '') + '</span>'
+        + '<button type="button" class="text-xs text-indigo-500 hover:text-indigo-700 flex items-center gap-1 add-per-kw-btn">'
+        + '<i class="fas fa-plus-circle text-[10px]"></i> 키워드 추가</button>'
+        + '</div>'
+        + '<div class="per-kw-rows space-y-1.5">' + rowsHtml + '</div>'
+        + '</div>'
+    }).join('')
+  }
+
+  function addPerKwRow(block) {
+    var rowsEl = block.querySelector('.per-kw-rows')
+    var div = document.createElement('div')
+    div.className = 'per-kw-row flex gap-1.5 items-center'
+    div.innerHTML = '<input type="text" class="per-kw-key w-40 text-xs px-2 py-1 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-violet-300" placeholder="키워드 (예: {{전문분야}})">'
+      + '<span class="text-slate-300 text-xs flex-shrink-0">→</span>'
+      + '<input type="text" class="per-kw-val flex-1 text-xs px-2 py-1 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-violet-300" placeholder="변환 텍스트">'
+      + '<button type="button" class="text-slate-300 hover:text-red-400 text-sm px-0.5 flex-shrink-0" onclick="removePerKwRow(this)"><i class="fas fa-times"></i></button>'
+    rowsEl.appendChild(div)
+    div.querySelector('.per-kw-key').focus()
+  }
+
+  function removePerKwRow(btn) {
+    btn.closest('.per-kw-row').remove()
+  }
+
+  // 인력별 키워드 최종 수집 { personnelId: { key: val, ... } }
+  function collectPersonnelKeywords() {
+    // 먼저 현재 DOM에서 값 갱신
+    document.querySelectorAll('.per-kw-block').forEach(function(block) {
+      var pid = Number(block.dataset.pid)
+      var rows = []
+      block.querySelectorAll('.per-kw-row').forEach(function(row) {
+        rows.push({ key: row.querySelector('.per-kw-key').value.trim(), val: row.querySelector('.per-kw-val').value.trim() })
+      })
+      personnelKwMap[pid] = rows
+    })
+    var result = {}
+    Object.keys(personnelKwMap).forEach(function(pid) {
+      var rows = personnelKwMap[pid] || []
+      var map = {}
+      rows.forEach(function(r) { if (r.key) map[r.key] = r.val })
+      if (Object.keys(map).length) result[pid] = map
+    })
+    return result
+  }
+
+  // ── 모달 열기 ─────────────────────────────────────────────────
+  async function openBundleModal(id, projectName) {
+    bundleProjectId = id
+    bundleItemChecked = {}
+    bundleMenus = []
+    personnelChecked = {}
+    personnelKwMap = {}
+    document.getElementById('bundleModalProjectName').textContent = projectName
+    document.getElementById('bundleModal').classList.remove('hidden')
+    // 도장 패널 숨기고 라디오 초기화
+    var panel = document.getElementById('careerCertStampPanel')
+    if (panel) panel.classList.add('hidden')
+    var noneRadio = document.querySelector('input[name="careerCertStampOpt"][value="none"]')
+    if (noneRadio) noneRadio.checked = true
+    var careerNumWrap = document.getElementById('careerCertStampNumberWrap')
+    if (careerNumWrap) { careerNumWrap.classList.add('hidden'); careerNumWrap.classList.remove('flex') }
+    var licensePanel = document.getElementById('licenseCertStampPanel')
+    if (licensePanel) licensePanel.classList.add('hidden')
+    var licenseNoneRadio = document.querySelector('input[name="licenseCertStampOpt"][value="none"]')
+    if (licenseNoneRadio) licenseNoneRadio.checked = true
+    var licenseNumWrap = document.getElementById('licenseCertStampNumberWrap')
+    if (licenseNumWrap) { licenseNumWrap.classList.add('hidden'); licenseNumWrap.classList.remove('flex') }
+    var listEl = document.getElementById('bundleItemList')
+    listEl.innerHTML = '<div class="text-slate-400 text-xs text-center py-4"><i class="fas fa-spinner fa-spin mr-1"></i>항목 불러오는 중...</div>'
+    try {
+      var r = await fetch('/api/ppt-menus?category=attachment')
+      var j = await r.json()
+      if (!j.ok) throw new Error(j.error || '항목 조회 실패')
+      var allMenus = j.data || []
+      bundleMenus = []
+      allMenus.forEach(function(m) {
+        if (m.children && m.children.length) { m.children.forEach(function(c) { bundleMenus.push(c) }) }
+        else { bundleMenus.push(m) }
+      })
+      renderBundleItemList()
+    } catch(e) {
+      listEl.innerHTML = '<div class="text-red-500 text-xs text-center py-4">' + escapeHtml(e.message) + '</div>'
+    }
+  }
+
+  function renderBundleItemList() {
+    var listEl = document.getElementById('bundleItemList')
+    listEl.innerHTML = bundleMenus.map(function(m) {
+      var checked = !!bundleItemChecked[m.id]
+      var hasTemplate = m.templates && m.templates.length > 0 && !!m.templates[0].pptx_b64_key
+      return '<label class="flex items-center gap-2 px-2.5 py-2 rounded-lg border cursor-pointer transition text-xs '
+        + (checked ? 'border-violet-300 bg-violet-50' : 'border-slate-200 hover:bg-slate-50') + '">'
+        + '<input type="checkbox" class="w-3.5 h-3.5 accent-violet-600 flex-shrink-0" '
+        + (checked ? 'checked' : '') + ' onchange="onBundleItemChange(' + m.id + ', this.checked)">'
+        + '<span class="flex-1 font-medium text-slate-700">' + escapeHtml(m.menu_name) + '</span>'
+        + (hasTemplate
+          ? '<i class="fas fa-check-circle text-emerald-500"></i>'
+          : '<i class="fas fa-exclamation-circle text-amber-400"></i>')
+        + '</label>'
+    }).join('')
+  }
+
+  function onBundleItemChange(menuId, checked) {
+    bundleItemChecked[menuId] = checked
+    renderBundleItemList()
+    updateCareerCertStampPanel()
+  }
+
+  // 경력증명서 / 자격증사본 도장 패널 각각 독립 표시
+  function updateCareerCertStampPanel() {
+    var hasCareerCert = bundleMenus.some(function(m) {
+      return m.menu_code === 'ATT_CAREER_CERT' && !!bundleItemChecked[m.id]
+    })
+    var hasLicenseCert = bundleMenus.some(function(m) {
+      return m.menu_code === 'ATT_LICENSE_CERT' && !!bundleItemChecked[m.id]
+    })
+    var careerPanel = document.getElementById('careerCertStampPanel')
+    if (careerPanel) {
+      if (hasCareerCert) { careerPanel.classList.remove('hidden') }
+      else { careerPanel.classList.add('hidden'); var r = document.querySelector('input[name="careerCertStampOpt"][value="none"]'); if (r) r.checked = true }
+    }
+    var licensePanel = document.getElementById('licenseCertStampPanel')
+    if (licensePanel) {
+      if (hasLicenseCert) { licensePanel.classList.remove('hidden') }
+      else { licensePanel.classList.add('hidden'); var r2 = document.querySelector('input[name="licenseCertStampOpt"][value="none"]'); if (r2) r2.checked = true }
+    }
+  }
+
+  function onCareerCertStampChange(radio) {
+    var wrap = document.getElementById('careerCertStampNumberWrap')
+    if (wrap) {
+      // 도장 없음 선택 시만 번호 wrap 숨김 — 원본대조필/사실과상위없음 모두 번호 선택 필요
+      if (radio.value === 'none') { wrap.classList.add('hidden'); wrap.classList.remove('flex') }
+      else { wrap.classList.remove('hidden'); wrap.classList.add('flex') }
+    }
+  }
+
+  function onLicenseCertStampChange(radio) {
+    var wrap = document.getElementById('licenseCertStampNumberWrap')
+    if (wrap) {
+      if (radio.value === 'none') { wrap.classList.add('hidden'); wrap.classList.remove('flex') }
+      else { wrap.classList.remove('hidden'); wrap.classList.add('flex') }
+    }
+  }
+
+  function onFreeStampChange(kind, radio) {
+    var wrapId = kind === 'career' ? 'freeCareerStampNumberWrap' : 'freeLicenseStampNumberWrap'
+    var wrap = document.getElementById(wrapId)
+    if (wrap) {
+      if (radio.value === 'none') { wrap.classList.add('hidden'); wrap.classList.remove('flex') }
+      else { wrap.classList.remove('hidden'); wrap.classList.add('flex') }
+    }
+  }
+
+  // ── 키워드 행 추가/수집 ────────────────────────────────────────
+  function addGlobalKwRow() {
+    var container = document.getElementById('kwGlobalRows')
+    var div = document.createElement('div')
+    div.className = 'kw-row flex gap-2 items-center'
+    div.innerHTML = '<input type="text" placeholder="키워드 (예: {{사업명}})" class="kw-key w-44 text-xs px-2.5 py-1.5 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-violet-300">'
+      + '<span class="text-slate-300 text-xs flex-shrink-0">→</span>'
+      + '<input type="text" placeholder="변환 텍스트" class="kw-val flex-1 text-xs px-2.5 py-1.5 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-violet-300">'
+      + '<button type="button" class="text-slate-300 hover:text-red-400 text-sm px-1 flex-shrink-0 rm-row-btn" data-rm=".kw-row"><i class="fas fa-times"></i></button>'
+    container.appendChild(div)
+    div.querySelector('.kw-key').focus()
+  }
+
+  function collectKeywords() {
+    var rows = document.querySelectorAll('#kwGlobalRows .kw-row')
+    var result = {}
+    rows.forEach(function(row) {
+      var key = row.querySelector('.kw-key').value.trim()
+      var val = row.querySelector('.kw-val').value.trim()
+      if (key) result[key] = val
+    })
+    return result
+  }
+
+  function closeBundleModal() {
+    document.getElementById('bundleModal').classList.add('hidden')
+  }
+
+  // ── menu_code → ATTACHMENT_TYPES 키 매핑 ─────────────────────
+  var MENU_CODE_TO_TYPE = {
+    'ATT_COVER':        'cover',
+    'ATT_SCHEDULE':     'schedule',
+    'ATT_CAREER':       'career',
+    'ATT_CONSENT':      'consent',
+    'ATT_STAMP_NO':     null,
+    'ATT_STAMP_YES':    null,
+    'ATT_EMPLOYMENT':   'employmentCert',
+    'ATT_CAREER_CERT':  'careerCert',
+    'ATT_STAFFING':     'staffingStatus',
+    'ATT_LICENSE_CERT': 'licenseCert'
+  }
+  var STAMP_TYPES = ['bizreg','taxcert','localtaxcert','corpregistry','insurance']
+  var PPTX_MIME   = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+
+  function b64ToFile(b64, name) {
+    var bin = atob(b64)
+    var arr = new Uint8Array(bin.length)
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i)
+    return new File([arr], name, { type: PPTX_MIME })
+  }
+
+  // ── 키워드 치환 — base64 내부 텍스트 변환 ────────────────────
+  // 단순 치환: pptx_b64_key(base64)를 디코딩 → 텍스트 치환 → 다시 인코딩
+  // pptx 내부 XML에서 plain text 치환 (pptx는 zip이므로 JSZip 없이는 불가)
+  // → 서버 API가 keywords를 FormData로 받아 처리하도록 전달
+  async function confirmGenerateBundle() {
+    if (!bundleProjectId) return
+    var selected = bundleMenus.filter(function(m) { return bundleItemChecked[m.id] })
+    if (!selected.length) { alert('생성할 항목을 하나 이상 체크해주세요.'); return }
+
+    // 표지 확인
+    var coverMenu = bundleMenus.find(function(m) { return m.menu_code === 'ATT_COVER' })
+    if (!coverMenu || !coverMenu.templates || !coverMenu.templates[0] || !coverMenu.templates[0].pptx_b64_key) {
+      alert('표지(ATT_COVER) 템플릿이 등록되지 않았습니다.\\nPPT 템플릿 관리 → 첨부 탭에서 먼저 등록해주세요.')
+      return
+    }
+
+    // 항목별 타입키 + 템플릿 유효성 검사
+    var order = []
+    var missing = []
+    var unsupported = []
+    selected.forEach(function(m) {
+      if (m.menu_code === 'ATT_COVER') return
+      var typeKey = MENU_CODE_TO_TYPE[m.menu_code]
+      if (!typeKey) { unsupported.push(m.menu_name); return }
+      if (!m.templates || !m.templates[0] || !m.templates[0].pptx_b64_key) { missing.push(m.menu_name); return }
+      order.push({ key: typeKey, menu: m })
+    })
+
+    if (missing.length) {
+      alert('템플릿 미등록 항목:\\n' + missing.join('\\n') + '\\n\\nPPT 템플릿 관리 → 첨부 탭에서 먼저 등록해주세요.')
+      return
+    }
+    if (!order.length && !unsupported.length) {
+      alert('생성할 수 있는 항목이 없습니다.')
+      return
+    }
+    if (unsupported.length && !order.length) {
+      alert('선택한 항목(' + unsupported.join(', ') + ')은 현재 API에서 지원되지 않습니다.')
+      return
+    }
+
+    var btn = document.getElementById('bundleConfirmBtn')
+    btn.disabled = true
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>생성 중...'
+    // 테이블 행의 버튼도 생성 중 상태로 변경
+    if (activeBundleBtn) {
+      activeBundleBtn.disabled = true
+      activeBundleBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>생성 중...'
+    }
+    closeBundleModal()
+
+    try {
+      var fd = new FormData()
+      fd.append('cover', b64ToFile(coverMenu.templates[0].pptx_b64_key, 'cover.pptx'))
+      fd.append('order', JSON.stringify(order.map(function(o) { return o.key })))
+
+      // 키워드 치환 맵 전달
+      var kwMap = collectKeywords()
+      if (Object.keys(kwMap).length) {
+        fd.append('keywords', JSON.stringify(kwMap))
+      }
+
+      // 인력별 키워드 치환 맵 전달
+      var perKwMap = collectPersonnelKeywords()
+      if (Object.keys(perKwMap).length) {
+        fd.append('personnelKeywords', JSON.stringify(perKwMap))
+      }
+
+      // 선택된 인력 ID 목록 전달
+      var selectedPersonnelIds = Object.keys(personnelChecked).filter(function(id) { return personnelChecked[id] })
+      if (selectedPersonnelIds.length) {
+        fd.append('personnelIds', JSON.stringify(selectedPersonnelIds.map(Number)))
+      }
+
+      order.forEach(function(o) {
+        fd.append(o.key, b64ToFile(o.menu.templates[0].pptx_b64_key, o.key + '.pptx'))
+      })
+
+      // 경력증명서 도장 옵션 전달 (독립)
+      var careerCertStampRadio = document.querySelector('input[name="careerCertStampOpt"]:checked')
+      var careerCertStampVal = careerCertStampRadio ? careerCertStampRadio.value : 'none'
+      fd.append('careerCertWithStamp', careerCertStampVal !== 'none' ? 'true' : 'false')
+      if (careerCertStampVal !== 'none') {
+        fd.append('careerCertStampType', careerCertStampVal)
+        var careerStampNumRadio = document.querySelector('input[name="careerCertStampNumber"]:checked')
+        fd.append('careerCertStampNumber', careerStampNumRadio ? careerStampNumRadio.value : '1')
+      }
+
+      // 자격증사본 도장 옵션 전달 (독립)
+      var licenseCertStampRadio = document.querySelector('input[name="licenseCertStampOpt"]:checked')
+      var licenseCertStampVal = licenseCertStampRadio ? licenseCertStampRadio.value : 'none'
+      fd.append('licenseCertWithStamp', licenseCertStampVal !== 'none' ? 'true' : 'false')
+      if (licenseCertStampVal !== 'none') {
+        fd.append('licenseCertStampType', licenseCertStampVal)
+        var licenseStampNumRadio = document.querySelector('input[name="licenseCertStampNumber"]:checked')
+        fd.append('licenseCertStampNumber', licenseStampNumRadio ? licenseStampNumRadio.value : '1')
+      }
+
+      var r = await fetch('/api/ppt-attachment-bundle/' + bundleProjectId, { method: 'POST', body: fd })
+      if (!r.ok) {
+        var ej = await r.json().catch(function() { return {} })
+        throw new Error(ej.error || ('생성 실패 (' + r.status + ')'))
+      }
+      // 결과 요약 헤더 파싱
+      var summaryRaw = r.headers.get('X-Bundle-Summary')
+      var summaries = []
+      if (summaryRaw) { try { summaries = JSON.parse(decodeURIComponent(summaryRaw)) } catch(_) {} }
+
+      var blob = await r.blob()
+      var cd = r.headers.get('Content-Disposition') || ''
+      var m2 = cd.match(/filename\*?=["']?(?:UTF-8'')?([^"';]+)/i)
+      var filename = m2 ? decodeURIComponent(m2[1]) : ('첨부PPT_' + bundleProjectId + '.pptx')
+      var url = URL.createObjectURL(blob)
+      var a = document.createElement('a'); a.href = url; a.download = filename
+      document.body.appendChild(a); a.click(); a.remove()
+      URL.revokeObjectURL(url)
+      // 생성 결과 팝업
+      if (summaries.length) showBundleResult(summaries, filename)
+    } catch(e) {
+      alert('첨부PPT 생성 실패: ' + e.message)
+    } finally {
+      btn.disabled = false
+      btn.innerHTML = '<i class="fas fa-magic mr-1"></i>생성'
+      // 테이블 행의 버튼 원상 복원
+      if (activeBundleBtn) {
+        activeBundleBtn.disabled = false
+        activeBundleBtn.innerHTML = '<i class="fas fa-paperclip"></i> 첨부PPT 생성'
+        activeBundleBtn = null
+      }
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  //  아래 섹션 — 자유 첨부 생성 로직
+  // ══════════════════════════════════════════════════════════════
+
+  var freeAllMenus      = []    // 전체 attachment 메뉴
+  var freeItemChecked   = {}    // { menuId: true/false }
+  var freeAllPersonnelNames = [] // 전체 인력 이름 캐시 (검증용)
+
+  // ── 자유생성: 첨부 항목 로드 ──────────────────────────────────
+  async function loadFreeItems() {
+    var el = document.getElementById('freeItemList')
+    try {
+      var r = await fetch('/api/ppt-menus?category=attachment')
+      var j = await r.json()
+      if (!j.ok) throw new Error(j.error || '항목 조회 실패')
+      var raw = j.data || []
+      freeAllMenus = []
+      raw.forEach(function(m) {
+        if (m.children && m.children.length) { m.children.forEach(function(c) { freeAllMenus.push(c) }) }
+        else { freeAllMenus.push(m) }
+      })
+      renderFreeItemList()
+    } catch(e) {
+      el.innerHTML = '<div class="text-red-500 text-xs py-2">' + escapeHtml(e.message) + '</div>'
+    }
+  }
+
+  function renderFreeItemList() {
+    var el = document.getElementById('freeItemList')
+    var GRADE_BG = { cover:'bg-slate-400', schedule:'bg-blue-500', career:'bg-blue-600', consent:'bg-amber-500',
+      financial:'bg-green-600', bizreg:'bg-orange-500', taxcert:'bg-orange-600', localtaxcert:'bg-orange-700',
+      corpregistry:'bg-red-600', insurance:'bg-teal-600', employmentCert:'bg-cyan-600', careerCert:'bg-indigo-500', staffingStatus:'bg-violet-600', licenseCert:'bg-pink-600' }
+    el.innerHTML = freeAllMenus.map(function(m) {
+      var checked = !!freeItemChecked[m.id]
+      var hasT = m.templates && m.templates.length > 0 && !!m.templates[0].pptx_b64_key
+      return '<label class="flex items-center gap-2 px-3 py-2 rounded-lg border cursor-pointer transition text-xs select-none '
+        + (checked ? 'border-violet-300 bg-violet-50' : 'border-slate-200 hover:bg-slate-50') + '">'
+        + '<input type="checkbox" class="w-3.5 h-3.5 accent-violet-600 flex-shrink-0" '
+        + (checked ? 'checked' : '') + ' onchange="onFreeItemChange(' + m.id + ', this.checked)">'
+        + '<span class="flex-1 font-medium text-slate-700">' + escapeHtml(m.menu_name) + '</span>'
+        + (hasT ? '<i class="fas fa-check-circle text-emerald-500 text-[11px]"></i>'
+                : '<i class="fas fa-exclamation-circle text-amber-400 text-[11px]" title="템플릿 미등록"></i>')
+        + '</label>'
+    }).join('')
+  }
+
+  function onFreeItemChange(menuId, checked) {
+    freeItemChecked[menuId] = checked
+    renderFreeItemList()
+    updateFreeCareerCertStampPanel()
+  }
+
+  function updateFreeCareerCertStampPanel() {
+    var hasEmploymentCert = freeAllMenus.some(function(m) {
+      return m.menu_code === 'ATT_EMPLOYMENT' && !!freeItemChecked[m.id]
+    })
+    var hasCareerCert = freeAllMenus.some(function(m) {
+      return m.menu_code === 'ATT_CAREER_CERT' && !!freeItemChecked[m.id]
+    })
+    var hasLicenseCert = freeAllMenus.some(function(m) {
+      return m.menu_code === 'ATT_LICENSE_CERT' && !!freeItemChecked[m.id]
+    })
+    // 재직증명서 날짜 패널
+    var empDeadlinePanel = document.getElementById('freeEmploymentDeadlinePanel')
+    if (empDeadlinePanel) {
+      if (hasEmploymentCert) {
+        empDeadlinePanel.classList.remove('hidden')
+        // 날짜 기본값: 오늘
+        var dateInput = document.getElementById('freeEmploymentDeadlineInput')
+        if (dateInput && !dateInput.value) {
+          var today = new Date()
+          dateInput.value = today.toISOString().slice(0, 10)
+        }
+      } else {
+        empDeadlinePanel.classList.add('hidden')
+      }
+    }
+    var careerPanel = document.getElementById('freeCareerCertStampPanel')
+    if (careerPanel) {
+      if (hasCareerCert) {
+        careerPanel.classList.remove('hidden')
+      } else {
+        careerPanel.classList.add('hidden')
+        var r = document.querySelector('input[name="freeCareerCertStampOpt"][value="none"]')
+        if (r) r.checked = true
+        var cw = document.getElementById('freeCareerStampNumberWrap')
+        if (cw) { cw.classList.add('hidden'); cw.classList.remove('flex') }
+      }
+    }
+    var licensePanel = document.getElementById('freeLicenseCertStampPanel')
+    if (licensePanel) {
+      if (hasLicenseCert) {
+        licensePanel.classList.remove('hidden')
+      } else {
+        licensePanel.classList.add('hidden')
+        var r2 = document.querySelector('input[name="freeLicenseCertStampOpt"][value="none"]')
+        if (r2) r2.checked = true
+        var lw = document.getElementById('freeLicenseStampNumberWrap')
+        if (lw) { lw.classList.add('hidden'); lw.classList.remove('flex') }
+      }
+    }
+  }
+
+  // ── 자유생성: 인력 목록 로드 ──────────────────────────────────
+  // ── 자유생성: 인력 이름 목록 로드 (검증용) ─────────────────
+  async function loadFreePersonnel() {
+    if (freeAllPersonnelNames.length) return
+    try {
+      var r = await fetch('/api/personnel')
+      var j = await r.json()
+      if (!j.ok) throw new Error(j.error || '인력 조회 실패')
+      freeAllPersonnelNames = (j.data || []).map(function(p) { return p.name })
+    } catch(e) {
+      // 검증 실패 시 조용히 넘김 (텍스트박스 입력은 계속 가능)
+    }
+  }
+
+  // ── 자유생성: 인력 입력 파싱 (성명:담당분야 형식) ──────────
+  function parseFreePersonnel(raw) {
+    // 쉼표 또는 줄바꿈으로 구분
+    return raw.split(/[,\\n]/).map(function(item) {
+      var parts = item.split(':')
+      var name = parts[0].trim()
+      var domain = parts.slice(1).join(':').trim()
+      return name ? { name: name, domain: domain } : null
+    }).filter(Boolean)
+  }
+
+  // ── 자유생성: 인력 입력 실시간 검증 ──────────────────────────
+  var _freePersonnelTimer = null
+  function validateFreePersonnel() {
+    clearTimeout(_freePersonnelTimer)
+    _freePersonnelTimer = setTimeout(function() {
+      var raw = (document.getElementById('freePersonnelInput').value || '').trim()
+      var validEl = document.getElementById('freePersonnelValidation')
+      if (!raw) { validEl.innerHTML = ''; return }
+      var parsed = parseFreePersonnel(raw)
+      if (!freeAllPersonnelNames.length) { validEl.innerHTML = ''; return }
+      var html = parsed.map(function(p) {
+        var exists = freeAllPersonnelNames.indexOf(p.name) >= 0
+        if (exists) {
+          return '<span class="inline-flex items-center gap-1 text-emerald-600">'
+            + '<i class="fas fa-check-circle text-[10px]"></i>' + escapeHtml(p.name)
+            + (p.domain ? '<span class="text-slate-400">:' + escapeHtml(p.domain) + '</span>' : '')
+            + '</span>'
+        } else {
+          return '<span class="inline-flex items-center gap-1 text-red-500">'
+            + '<i class="fas fa-exclamation-circle text-[10px]"></i>' + escapeHtml(p.name)
+            + ' <span class="text-red-400">(없는 인력)</span>'
+            + '</span>'
+        }
+      }).join('<span class="text-slate-300 mx-1">·</span>')
+      validEl.innerHTML = html
+    }, 400)
+  }
+
+  // ── 자유생성: 공통 키워드 행 ──────────────────────────────────
+  function addFreeGlobalKwRow() {
+    var container = document.getElementById('freeGlobalKwRows')
+    var div = document.createElement('div')
+    div.className = 'free-gkw-row flex gap-1.5 items-center'
+    div.innerHTML = '<input type="text" class="free-gkw-key w-36 text-xs px-2 py-1.5 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-300" placeholder="{{키워드}}">'
+      + '<span class="text-slate-300 text-xs flex-shrink-0">→</span>'
+      + '<input type="text" class="free-gkw-val flex-1 text-xs px-2 py-1.5 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-300" placeholder="변환 텍스트">'
+      + '<button type="button" class="text-slate-300 hover:text-red-400 text-sm px-0.5 flex-shrink-0 rm-row-btn" data-rm=".free-gkw-row"><i class="fas fa-times"></i></button>'
+    container.appendChild(div)
+    div.querySelector('.free-gkw-key').focus()
+  }
+
+  function collectFreeGlobalKw() {
+    var result = {}
+    document.querySelectorAll('#freeGlobalKwRows .free-gkw-row').forEach(function(row) {
+      var k = row.querySelector('.free-gkw-key').value.trim()
+      var v = row.querySelector('.free-gkw-val').value.trim()
+      if (k) result[k] = v
+    })
+    return result
+  }
+
+  function collectFreePersonnelKw() {
+    return {}
+  }
+
+  // ── 자유생성: 생성 실행 ───────────────────────────────────────
+  async function confirmFreeBundle() {
+    var selected = freeAllMenus.filter(function(m) { return freeItemChecked[m.id] })
+    if (!selected.length) { alert('생성할 항목을 하나 이상 선택해주세요.'); return }
+
+    var coverMenu = freeAllMenus.find(function(m) { return m.menu_code === 'ATT_COVER' })
+    if (!coverMenu || !coverMenu.templates || !coverMenu.templates[0] || !coverMenu.templates[0].pptx_b64_key) {
+      alert('표지(ATT_COVER) 템플릿이 등록되지 않았습니다.\\nPPT 템플릿 관리 → 첨부 탭에서 먼저 등록해주세요.')
+      return
+    }
+
+    var MENU_TO_TYPE = {
+      'ATT_COVER':'cover','ATT_SCHEDULE':'schedule','ATT_CAREER':'career','ATT_CONSENT':'consent',
+      'ATT_EMPLOYMENT':'employmentCert','ATT_CAREER_CERT':'careerCert','ATT_STAFFING':'staffingStatus',
+      'ATT_LICENSE_CERT':'licenseCert'
+    }
+    var order = [], missing = [], unsupported = []
+    selected.forEach(function(m) {
+      if (m.menu_code === 'ATT_COVER') return
+      var typeKey = MENU_TO_TYPE[m.menu_code]
+      if (!typeKey) { unsupported.push(m.menu_name); return }
+      if (!m.templates || !m.templates[0] || !m.templates[0].pptx_b64_key) { missing.push(m.menu_name); return }
+      order.push({ key: typeKey, menu: m })
+    })
+    if (missing.length) { alert('템플릿 미등록:\\n' + missing.join('\\n') + '\\n\\nPPT 템플릿 관리 → 첨부 탭에서 등록해주세요.'); return }
+    if (!order.length) { alert('생성 가능한 항목이 없습니다.'); return }
+
+    var btn = document.getElementById('freeBundleBtn')
+    btn.disabled = true
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>생성 중...'
+
+    try {
+      var fd = new FormData()
+      fd.append('cover', b64ToFile(coverMenu.templates[0].pptx_b64_key, 'cover.pptx'))
+      fd.append('order', JSON.stringify(order.map(function(o) { return o.key })))
+
+      // ── 키워드 목록 파싱 (쉼표/줄바꿈 구분) ──────────────────
+      var kwRaw = (document.getElementById('freeKwInput').value || '').trim()
+      var kwList = kwRaw
+        ? kwRaw.split(/[\\n,]/).map(function(s) { return s.trim() }).filter(Boolean)
+        : []
+      if (kwList.length) fd.append('freeKeywords', JSON.stringify(kwList))
+
+      // ── 변환 규칙 파싱 ("키워드1, 키워드2 -> 변환텍스트" 한 줄씩) ──
+      var mappingRaw = (document.getElementById('freeKwMappingInput').value || '').trim()
+      var mappingList = []
+      if (mappingRaw) {
+        mappingRaw.split('\\n').forEach(function(line) {
+          line = line.trim()
+          if (!line) return
+          var parts = line.split(/->/)
+          if (parts.length < 2) return
+          var keys = parts[0].split(',').map(function(s) { return s.trim() }).filter(Boolean)
+          var val = parts.slice(1).join('->').trim()
+          if (keys.length && val) mappingList.push({ keys: keys, value: val })
+        })
+      }
+      if (mappingList.length) fd.append('freeMappings', JSON.stringify(mappingList))
+
+      // 인력 목록 파싱 (성명:담당분야 형식)
+      var personnelRaw = (document.getElementById('freePersonnelInput').value || '').trim()
+      var personnelList = personnelRaw ? parseFreePersonnel(personnelRaw) : []
+      if (personnelList.length) fd.append('personnelNames', JSON.stringify(personnelList))
+
+      order.forEach(function(o) {
+        fd.append(o.key, b64ToFile(o.menu.templates[0].pptx_b64_key, o.key + '.pptx'))
+      })
+
+      // 재직증명서 날짜 전달 (자유 생성) — [제출마감하루전] 플레이스홀더에 들어갈 날짜
+      var hasEmploymentCert = order.some(function(o) { return o.key === 'employmentCert' })
+      if (hasEmploymentCert) {
+        var deadlineInput = document.getElementById('freeEmploymentDeadlineInput')
+        var deadlineVal = deadlineInput ? deadlineInput.value : ''
+        if (deadlineVal) fd.append('freeDeadlineDate', deadlineVal)
+      }
+
+      // 경력증명서 도장 옵션 전달 (자유 생성, 독립)
+      var freeCareerStampRadio = document.querySelector('input[name="freeCareerCertStampOpt"]:checked')
+      var freeCareerStampVal = freeCareerStampRadio ? freeCareerStampRadio.value : 'none'
+      fd.append('careerCertWithStamp', freeCareerStampVal !== 'none' ? 'true' : 'false')
+      if (freeCareerStampVal !== 'none') {
+        fd.append('careerCertStampType', freeCareerStampVal)
+        var freeCareerStampNumRadio = document.querySelector('input[name="freeCareerCertStampNumber"]:checked')
+        fd.append('careerCertStampNumber', freeCareerStampNumRadio ? freeCareerStampNumRadio.value : '1')
+      }
+
+      // 자격증사본 도장 옵션 전달 (자유 생성, 독립)
+      var freeLicenseStampRadio = document.querySelector('input[name="freeLicenseCertStampOpt"]:checked')
+      var freeLicenseStampVal = freeLicenseStampRadio ? freeLicenseStampRadio.value : 'none'
+      fd.append('licenseCertWithStamp', freeLicenseStampVal !== 'none' ? 'true' : 'false')
+      if (freeLicenseStampVal !== 'none') {
+        fd.append('licenseCertStampType', freeLicenseStampVal)
+        var freeLicenseStampNumRadio = document.querySelector('input[name="freeLicenseCertStampNumber"]:checked')
+        fd.append('licenseCertStampNumber', freeLicenseStampNumRadio ? freeLicenseStampNumRadio.value : '1')
+      }
+
+      // 자유생성은 projectId=0 (서버에서 별도 처리 또는 무시)
+      var r = await fetch('/api/ppt-attachment-bundle/0', { method: 'POST', body: fd })
+      if (!r.ok) {
+        var ej = await r.json().catch(function(){return{}})
+        throw new Error(ej.error || ('생성 실패 (' + r.status + ')'))
+      }
+      // 결과 요약 헤더 파싱
+      var summaryRaw = r.headers.get('X-Bundle-Summary')
+      var summaries = []
+      if (summaryRaw) { try { summaries = JSON.parse(decodeURIComponent(summaryRaw)) } catch(_) {} }
+
+      var blob = await r.blob()
+      var cd = r.headers.get('Content-Disposition') || ''
+      var m2 = cd.match(/filename\*?=["']?(?:UTF-8'')?([^"';]+)/i)
+      var filename = m2 ? decodeURIComponent(m2[1]) : '자유첨부PPT.pptx'
+      var url = URL.createObjectURL(blob)
+      var a = document.createElement('a'); a.href = url; a.download = filename
+      document.body.appendChild(a); a.click(); a.remove()
+      URL.revokeObjectURL(url)
+      // 생성 결과 팝업
+      if (summaries.length) showBundleResult(summaries, filename)
+    } catch(e) {
+      alert('첨부PPT 생성 실패: ' + e.message)
+    } finally {
+      btn.disabled = false
+      btn.innerHTML = '<i class="fas fa-magic mr-2"></i>첨부PPT 생성'
+    }
+  }
+
+  // ── 자유생성 초기 로드 ────────────────────────────────────────
+  loadFreeItems()
+  loadFreePersonnel()
+
+  document.getElementById('freePersonnelInput').addEventListener('input', validateFreePersonnel)
+
+  // ── 이벤트 위임: 인력별 키워드 추가 버튼 + 행 삭제 버튼 (onclick 따옴표 충돌 회피) ──
+  document.addEventListener('click', function(e) {
+    var btn = e.target.closest('.add-per-kw-btn')
+    if (btn) { addPerKwRow(btn.closest('.per-kw-block')); return }
+    var rmBtn = e.target.closest('.rm-row-btn')
+    if (rmBtn) { var sel = rmBtn.getAttribute('data-rm'); if (sel) rmBtn.closest(sel).remove(); return }
+  })
+  </script>
+  `;
+    return c.html(layout('첨부 및 서류 생성', body, 'ppt-generate'));
+});
+// ── PPT 템플릿 관리 페이지 ─────────────────────────────────────
+app.get('/ppt-templates', async (c) => {
+    const body = `
+  <div class="p-6 md:p-8" id="pptMgrRoot">
+
+    <!-- 헤더 -->
+    <div class="mb-5 flex items-center justify-between gap-4 flex-wrap">
+      <div>
+        <h1 class="text-2xl font-bold text-slate-800 flex items-center gap-2">
+          <i class="fas fa-layer-group text-indigo-500"></i> PPT 템플릿 관리
+        </h1>
+        <p class="text-slate-500 text-sm mt-1">제안서 목차별 / 첨부·서류 템플릿을 관리합니다.</p>
+      </div>
+      <div class="flex gap-2" id="headerButtons">
+        <!-- 탭별로 동적 렌더링 -->
+      </div>
+    </div>
+
+    <div id="pptAlert" class="hidden mb-4 p-3 rounded-lg text-sm font-medium"></div>
+
+    <!-- 탭 네비 -->
+    <div class="flex gap-1 mb-5 border-b border-slate-200">
+      <button id="tabBtn-proposal"
+        onclick="switchTab('proposal')"
+        class="px-5 py-2.5 text-sm font-semibold rounded-t-lg transition border border-b-0 -mb-px
+               bg-white text-indigo-600 border-slate-200">
+        <i class="fas fa-clipboard-list mr-1.5"></i>제안서
+      </button>
+      <button id="tabBtn-attachment"
+        onclick="switchTab('attachment')"
+        class="px-5 py-2.5 text-sm font-semibold rounded-t-lg transition border border-b-0 -mb-px
+               bg-slate-50 text-slate-500 border-transparent hover:text-slate-700">
+        <i class="fas fa-paperclip mr-1.5"></i>첨부
+      </button>
+    </div>
+
+    <!-- 2-panel layout (양쪽 탭 공통 구조) -->
+    <div class="flex gap-5" style="min-height:600px">
+
+      <!-- LEFT: 메뉴 트리 -->
+      <div class="w-72 flex-shrink-0">
+        <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+          <div class="px-4 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+            <span class="text-sm font-semibold text-slate-700" id="treeLabel">
+              <i class="fas fa-sitemap mr-2 text-indigo-400"></i>목차 메뉴
+            </span>
+            <button onclick="loadTree()" class="text-xs text-slate-400 hover:text-indigo-500"><i class="fas fa-sync-alt"></i></button>
+          </div>
+          <div id="menuTree" class="p-2 overflow-y-auto" style="max-height:560px">
+            <div class="text-center text-slate-400 text-sm py-6"><i class="fas fa-spinner fa-spin mr-1"></i>로딩 중...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: 상세 설정 패널 -->
+      <div class="flex-1 min-w-0">
+        <div id="detailPanel" class="bg-white rounded-xl shadow-sm border border-slate-200 h-full flex items-center justify-center text-slate-400">
+          <div class="text-center">
+            <i class="fas fa-mouse-pointer text-4xl mb-3 opacity-30"></i>
+            <p class="text-sm">왼쪽 트리에서 메뉴를 선택하세요</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- 마스터 템플릿 모달 -->
+    <div id="masterModal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+        <!-- 헤더 -->
+        <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between flex-shrink-0">
+          <div>
+            <h3 class="font-bold text-slate-800 text-base"><i class="fas fa-layer-group mr-2 text-violet-500"></i>마스터 템플릿 관리</h3>
+            <p class="text-xs text-slate-400 mt-0.5">PPT 생성 시 활성화된 마스터의 슬라이드 마스터·테마·레이아웃이 전체 슬라이드에 적용됩니다</p>
+          </div>
+          <button onclick="closeMasterModal()" class="text-slate-400 hover:text-slate-700 ml-4"><i class="fas fa-times text-lg"></i></button>
+        </div>
+
+        <div class="flex flex-1 min-h-0">
+          <!-- LEFT: 업로드 폼 -->
+          <div class="w-64 flex-shrink-0 border-r border-slate-100 px-5 py-4 space-y-3 overflow-y-auto">
+            <div class="text-xs font-semibold text-violet-700 uppercase tracking-wide mb-2"><i class="fas fa-upload mr-1"></i>새 마스터 추가</div>
+            <div>
+              <label class="text-xs text-slate-500 mb-1 block">이름 <span class="text-red-400">*</span></label>
+              <input id="masterNameInput" type="text" placeholder="예: 2026 표준 마스터"
+                class="w-full border border-slate-300 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-violet-300">
+            </div>
+            <div>
+              <label class="text-xs text-slate-500 mb-1 block">설명 (선택)</label>
+              <input id="masterDescInput" type="text" placeholder="예: 파란 헤더 + 회사 로고"
+                class="w-full border border-slate-300 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-violet-300">
+            </div>
+            <div>
+              <label class="text-xs text-slate-500 mb-1 block">PPTX 파일 <span class="text-red-400">*</span></label>
+              <input id="masterFileInput" type="file" accept=".pptx"
+                class="w-full text-xs text-slate-500 file:mr-2 file:py-1 file:px-2 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-violet-50 file:text-violet-700 hover:file:bg-violet-100 cursor-pointer">
+            </div>
+            <div class="flex items-center gap-2">
+              <input id="masterSetActive" type="checkbox" checked class="w-3.5 h-3.5 accent-violet-600">
+              <label class="text-xs text-slate-600">업로드 후 바로 활성화</label>
+            </div>
+            <button id="masterUploadBtn" onclick="uploadMasterTemplate()"
+              class="w-full py-2 text-xs rounded-lg bg-violet-600 text-white hover:bg-violet-700 font-medium transition">
+              <i class="fas fa-cloud-upload-alt mr-1"></i>업로드
+            </button>
+            <div id="masterUploadInfo" class="hidden text-xs text-violet-700 bg-violet-50 rounded-lg p-2 space-y-1">
+              <div class="font-semibold">추출된 레이아웃:</div>
+              <div id="masterUploadLayouts" class="text-slate-600"></div>
+            </div>
+          </div>
+
+          <!-- RIGHT: 저장된 마스터 목록 -->
+          <div class="flex-1 px-5 py-4 overflow-y-auto">
+            <div class="flex items-center justify-between mb-3">
+              <div class="text-xs font-semibold text-slate-700"><i class="fas fa-layer-group mr-1 text-violet-400"></i>저장된 마스터 템플릿</div>
+              <button onclick="loadMasterList()" class="text-xs text-slate-400 hover:text-violet-500"><i class="fas fa-sync-alt"></i></button>
+            </div>
+            <div id="masterList" class="space-y-2">
+              <div class="text-center text-slate-400 text-xs py-6"><i class="fas fa-spinner fa-spin mr-1"></i>로딩 중...</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="px-6 py-3 border-t border-slate-100 flex justify-end flex-shrink-0">
+          <button onclick="closeMasterModal()" class="px-4 py-1.5 text-xs rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50">닫기</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 프리셋 저장/불러오기 모달 -->
+    <div id="presetModal" class="hidden fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl shadow-xl w-full max-w-lg">
+        <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+          <h3 class="font-bold text-slate-800"><i class="fas fa-bookmark mr-2 text-emerald-500"></i>규칙 설정 프리셋</h3>
+          <button onclick="closePresetModal()" class="text-slate-400 hover:text-slate-700"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="px-6 py-4">
+          <!-- 현재 설정 저장 -->
+          <div class="mb-4 bg-emerald-50 rounded-xl p-4 border border-emerald-200">
+            <div class="text-xs font-semibold text-emerald-700 mb-2"><i class="fas fa-save mr-1"></i>현재 규칙 설정 저장</div>
+            <div class="text-xs text-slate-500 mb-3">현재 선택된 메뉴의 규칙 설정값을 이름을 붙여 저장합니다.</div>
+            <div class="flex gap-2">
+              <input id="presetNameInput" type="text" placeholder="프리셋 이름 (예: 표준 사진장표 규칙)" class="flex-1 border border-slate-300 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-emerald-300">
+              <button id="presetSaveBtn" onclick="savePreset()" class="px-3 py-1.5 text-xs rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed">
+                <i class="fas fa-save mr-1"></i>저장
+              </button>
+            </div>
+          </div>
+          <!-- 저장된 프리셋 목록 -->
+          <div>
+            <div class="text-xs font-semibold text-slate-700 mb-2"><i class="fas fa-list mr-1"></i>저장된 프리셋</div>
+            <div id="presetList" class="space-y-2 max-h-72 overflow-y-auto">
+              <div class="text-center text-slate-400 text-xs py-4">저장된 프리셋이 없습니다</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 팝오버 요소 (툴팁) -->
+    <div id="tipPopover" class="hidden fixed z-[100] bg-slate-800 text-white text-xs rounded-xl shadow-2xl p-4 w-72 pointer-events-none">
+      <div id="tipTitle" class="font-bold text-sm mb-1 text-emerald-300"></div>
+      <div id="tipDesc" class="text-slate-200 leading-relaxed mb-2"></div>
+      <div id="tipExample" class="bg-slate-700 rounded-lg px-3 py-2 text-slate-300 font-mono text-xs"></div>
+    </div>
+
+    <!-- 메뉴 추가/수정 모달 -->
+    <div id="menuModal" class="hidden fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl shadow-xl w-full max-w-md">
+        <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+          <h3 class="font-bold text-slate-800" id="menuModalTitle">메뉴 추가</h3>
+          <button onclick="closeMenuModal()" class="text-slate-400 hover:text-slate-700"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="px-6 py-4 space-y-3">
+          <input type="hidden" id="modalMenuId">
+          <div>
+            <label class="text-xs text-slate-500 font-medium mb-1 block">상위 메뉴 ID (선택)</label>
+            <input id="modalParentId" type="number" placeholder="없으면 비워두기" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+          </div>
+          <div>
+            <label class="text-xs text-slate-500 font-medium mb-1 block">메뉴 코드 <span class="text-red-500">*</span></label>
+            <input id="modalMenuCode" type="text" placeholder="예: DETAIL_SCHEDULE" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+          </div>
+          <div>
+            <label class="text-xs text-slate-500 font-medium mb-1 block">메뉴명 <span class="text-red-500">*</span></label>
+            <input id="modalMenuName" type="text" placeholder="예: 세부 감리 일정" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="text-xs text-slate-500 font-medium mb-1 block">목차 번호</label>
+              <input id="modalMenuNumber" type="text" placeholder="예: 다-2" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+            </div>
+            <div>
+              <label class="text-xs text-slate-500 font-medium mb-1 block">정렬 순서</label>
+              <input id="modalSortOrder" type="number" value="100" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <input id="modalIsEnabled" type="checkbox" checked class="w-4 h-4 accent-indigo-600">
+            <label class="text-sm text-slate-600">사용 여부</label>
+          </div>
+        </div>
+        <div class="px-6 py-4 border-t border-slate-100 flex justify-end gap-2">
+          <button onclick="closeMenuModal()" class="px-4 py-2 text-sm rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50">취소</button>
+          <button onclick="saveMenu()" class="px-4 py-2 text-sm rounded-lg bg-indigo-600 text-white hover:bg-indigo-700">저장</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+  // ── 상태 ──────────────────────────────────────────────────────
+  let _selectedMenuId = null
+  let _treeData = []
+  let _activeTab = 'proposal'
+  let _loadTreeSeq = 0  // race condition 방지용 시퀀스 번호
+
+  const TAB_ACTIVE   = 'px-5 py-2.5 text-sm font-semibold rounded-t-lg transition border border-b-0 -mb-px bg-white text-indigo-600 border-slate-200'
+  const TAB_INACTIVE = 'px-5 py-2.5 text-sm font-semibold rounded-t-lg transition border border-b-0 -mb-px bg-slate-50 text-slate-500 border-transparent hover:text-slate-700'
+
+  const HDR_PROPOSAL = '<button onclick=\\"runMigrate()\\" class=\\"px-3 py-1.5 text-xs rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition\\"><i class=\\"fas fa-database mr-1\\"></i>테이블 생성</button>'
+    + '<button onclick=\\"runSeed()\\" class=\\"px-3 py-1.5 text-xs rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-300 transition\\"><i class=\\"fas fa-seedling mr-1\\"></i>기본 메뉴 시드</button>'
+    + '<button onclick=\\"openMasterModal()\\" class=\\"px-3 py-1.5 text-xs rounded-lg bg-violet-600 hover:bg-violet-700 text-white transition\\"><i class=\\"fas fa-layer-group mr-1\\"></i>마스터 템플릿</button>'
+  const HDR_ATTACHMENT = '<button onclick=\\"runMigrate()\\" class=\\"px-3 py-1.5 text-xs rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition\\"><i class=\\"fas fa-database mr-1\\"></i>테이블 생성</button>'
+    + '<button onclick=\\"runAttachmentSeed()\\" class=\\"px-3 py-1.5 text-xs rounded-lg bg-teal-50 hover:bg-teal-100 text-teal-700 border border-teal-300 transition\\"><i class=\\"fas fa-paperclip mr-1\\"></i>첨부 항목 초기화</button>'
+
+  function switchTab(tab) {
+    _activeTab = tab
+    document.getElementById('tabBtn-proposal').className   = tab === 'proposal'   ? TAB_ACTIVE : TAB_INACTIVE
+    document.getElementById('tabBtn-attachment').className = tab === 'attachment' ? TAB_ACTIVE : TAB_INACTIVE
+    document.getElementById('headerButtons').innerHTML = tab === 'proposal' ? HDR_PROPOSAL : HDR_ATTACHMENT
+    document.getElementById('treeLabel').innerHTML = tab === 'proposal'
+      ? '<i class=\\"fas fa-sitemap mr-2 text-indigo-400\\"></i>목차 메뉴'
+      : '<i class=\\"fas fa-paperclip mr-2 text-teal-400\\"></i>첨부·서류 항목'
+    const dp = document.getElementById('detailPanel')
+    dp.innerHTML = '<div class=\\"text-center\\"><i class=\\"fas fa-mouse-pointer text-4xl mb-3 opacity-30\\"></i><p class=\\"text-sm\\">왼쪽 트리에서 메뉴를 선택하세요</p></div>'
+    dp.className = 'bg-white rounded-xl shadow-sm border border-slate-200 h-full flex items-center justify-center text-slate-400'
+    _selectedMenuId = null
+    loadTree()
+  }
+
+
+  // ── 알림 ──────────────────────────────────────────────────────
+  function showAlert(msg, ok) {
+    const el = document.getElementById('pptAlert')
+    el.className = 'mb-4 p-3 rounded-lg text-sm font-medium ' + (ok ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-red-50 text-red-700 border border-red-200')
+    el.textContent = msg
+    el.classList.remove('hidden')
+    setTimeout(() => el.classList.add('hidden'), 4000)
+  }
+
+  // ── 마이그레이션 / 시드 ────────────────────────────────────────
+  async function runMigrate() {
+    const r = await fetch('/api/ppt-menus/migrate', { method: 'POST' })
+    const j = await r.json()
+    showAlert(j.ok ? '✅ ' + j.message : '❌ ' + j.error, j.ok)
+  }
+
+  async function runSeed() {
+    const r = await fetch('/api/ppt-menus/seed', { method: 'POST' })
+    const j = await r.json()
+    showAlert(j.ok ? '✅ ' + j.message : '❌ ' + j.error, j.ok)
+    if (j.ok) loadTree()
+  }
+
+  async function runAttachmentSeed() {
+    if (!confirm('첨부 템플릿 항목 9종을 DB에 초기화합니다. 기존 항목명은 업데이트됩니다. 계속할까요?')) return
+    const r = await fetch('/api/ppt-menus/attachment-seed', { method: 'POST' })
+    const j = await r.json()
+    showAlert(j.ok ? '✅ 첨부 항목 초기화 완료' : '❌ ' + j.error, j.ok)
+    if (j.ok) loadTree()
+  }
+
+  // ── 트리 로드 ─────────────────────────────────────────────────
+  async function loadTree() {
+    const seq = ++_loadTreeSeq          // 이 요청의 고유 번호
+    const tabAtRequest = _activeTab     // 요청 시점의 탭 고정
+    document.getElementById('menuTree').innerHTML =
+      '<div class="text-center text-slate-400 text-sm py-6"><i class="fas fa-spinner fa-spin mr-1"></i>로딩 중...</div>'
+    try {
+      const catParam = '?category=' + tabAtRequest
+      const r = await fetch('/api/ppt-menus' + catParam)
+      const j = await r.json()
+      // 응답이 도착했을 때 탭이 바뀌었거나 더 최신 요청이 있으면 무시
+      if (seq !== _loadTreeSeq || tabAtRequest !== _activeTab) return
+      if (!j.ok) throw new Error(j.error)
+      _treeData = j.data
+      renderTree(j.data)
+    } catch (e) {
+      if (seq !== _loadTreeSeq || tabAtRequest !== _activeTab) return
+      document.getElementById('menuTree').innerHTML =
+        '<div class="text-center text-red-400 text-xs py-6">' + e.message + '</div>'
+    }
+  }
+
+  function renderTree(nodes, depth = 0) {
+    if (depth === 0) document.getElementById('menuTree').innerHTML = ''
+    const container = depth === 0 ? document.getElementById('menuTree') : null
+    let html = ''
+    const isAttachmentTab = (_activeTab === 'attachment')
+    nodes.forEach(n => {
+      // attachment 탭은 parent_id 관계없이 모두 직접 클릭 가능한 항목으로 취급
+      const isSection = isAttachmentTab ? false : !n.parent_id
+      const hasTemplate = isAttachmentTab && n.templates && n.templates[0] && !!n.templates[0].pptx_b64_key
+      const hasRule = !!n.rule
+      const badgeColor = isAttachmentTab
+        ? (hasTemplate ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-400')
+        : (n.is_enabled ? (hasRule ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-600') : 'bg-slate-100 text-slate-400')
+      const badge = isAttachmentTab
+        ? (hasTemplate ? '등록' : '미등록')
+        : (hasRule ? '규칙' : (isSection ? '섹션' : '미설정'))
+      // attachment 탭 전용: 인력반복/단순첨부 유형 배지
+      const repeatBadge = isAttachmentTab
+        ? (n.repeat_per_person
+            ? \`<span class="text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-violet-100 text-violet-600 flex-shrink-0">인력반복</span>\`
+            : \`<span class="text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-sky-50 text-sky-500 flex-shrink-0">단순첨부</span>\`)
+        : ''
+      const iconCls = isAttachmentTab
+        ? (hasTemplate ? 'fa-file-powerpoint text-teal-400' : 'fa-file text-slate-300')
+        : (isSection ? 'fa-folder text-amber-400' : (hasRule ? 'fa-file-powerpoint text-indigo-400' : 'fa-file text-slate-300'))
+      const selectedCls = _selectedMenuId === n.id
+        ? (isAttachmentTab ? 'bg-teal-50 border border-teal-200' : 'bg-indigo-50 border border-indigo-200')
+        : 'hover:bg-slate-50 border border-transparent'
+      html += \`
+        <div class="menu-item rounded-lg mb-0.5 \${selectedCls} cursor-pointer transition-all"
+             style="padding-left:\${depth * 14 + 8}px"
+             onclick="selectMenu(\${n.id})">
+          <div class="flex items-center gap-1.5 py-1.5 pr-2">
+            <i class="fas \${iconCls} text-xs flex-shrink-0"></i>
+            <span class="text-xs \${n.is_enabled ? 'text-slate-700' : 'text-slate-400 line-through'} flex-1 min-w-0 truncate" title="\${n.menu_name}">
+              \${n.menu_number ? '<span class=\\"text-slate-400\\">' + n.menu_number + '</span> ' : ''}\${n.menu_name}
+            </span>
+            \${repeatBadge}
+            <span class="text-xs px-1.5 py-0.5 rounded-full font-medium \${badgeColor} flex-shrink-0">\${badge}</span>
+          </div>
+        </div>
+        \${n.children && n.children.length ? renderTreeChildren(n.children, depth + 1) : ''}
+      \`
+    })
+    if (container) container.innerHTML = html
+    return html
+  }
+
+  function renderTreeChildren(nodes, depth) {
+    let html = ''
+    nodes.forEach(n => {
+      const hasRule = !!n.rule
+      const badgeColor = n.is_enabled ? (hasRule ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-600') : 'bg-slate-100 text-slate-400'
+      const badge = hasRule ? '규칙' : '미설정'
+      html += \`
+        <div class="menu-item rounded-lg mb-0.5 \${_selectedMenuId === n.id ? 'bg-indigo-50 border border-indigo-200' : 'hover:bg-slate-50 border border-transparent'} cursor-pointer transition-all"
+             style="padding-left:\${depth * 14 + 8}px"
+             onclick="selectMenu(\${n.id})">
+          <div class="flex items-center gap-1.5 py-1.5 pr-2">
+            <i class="fas \${hasRule ? 'fa-file-powerpoint text-indigo-400' : 'fa-file text-slate-300'} text-xs flex-shrink-0"></i>
+            <span class="text-xs \${n.is_enabled ? 'text-slate-700' : 'text-slate-400 line-through'} flex-1 min-w-0 truncate" title="\${n.menu_name}">
+              \${n.menu_number ? '<span class=\\"text-slate-400\\">' + n.menu_number + '</span> ' : ''}\${n.menu_name}
+            </span>
+            <span class="text-xs px-1.5 py-0.5 rounded-full font-medium \${badgeColor} flex-shrink-0">\${badge}</span>
+          </div>
+        </div>
+        \${n.children && n.children.length ? renderTreeChildren(n.children, depth + 1) : ''}
+      \`
+    })
+    return html
+  }
+
+  // ── 메뉴 선택 → 상세 패널 ─────────────────────────────────────
+  function findMenuById(nodes, id) {
+    for (const n of nodes) {
+      if (n.id === id) return n
+      if (n.children) { const f = findMenuById(n.children, id); if (f) return f }
+    }
+    return null
+  }
+
+  async function selectMenu(id) {
+    _selectedMenuId = id
+    renderTree(_treeData)  // 선택 상태 갱신
+    const menu = findMenuById(_treeData, id)
+    if (!menu) return
+
+    // 템플릿 목록 로드
+    let templates = []
+    try {
+      const r = await fetch('/api/ppt-menus/' + id + '/templates')
+      const j = await r.json()
+      if (j.ok) templates = j.data
+    } catch (_) {}
+
+    if (_activeTab === 'attachment') {
+      renderAttachmentDetail(menu, templates)
+      return
+    }
+    renderDetail(menu, templates)
+  }
+
+  function renderDetail(menu, templates) {
+    const rule = menu.rule || {}
+    const isSection = !menu.parent_id
+
+    // 섹션(대분류)이면 간단히 표시
+    if (isSection) {
+      document.getElementById('detailPanel').innerHTML = \`
+        <div class="p-6 h-full flex items-center justify-center text-slate-400">
+          <div class="text-center">
+            <i class="fas fa-folder-open text-4xl mb-3 text-amber-300"></i>
+            <p class="text-sm font-medium text-slate-600">\${menu.menu_number || ''} \${menu.menu_name}</p>
+            <p class="text-xs mt-1">하위 메뉴를 선택하세요</p>
+          </div>
+        </div>
+      \`
+      return
+    }
+
+    // ── 첨부 탭: 템플릿 업로드/관리만 간소하게 표시 ─────────────
+    if (_activeTab === 'attachment') {
+      renderAttachmentDetail(menu, templates)
+      return
+    }
+
+    // ── 제안서 탭: 기존 규칙 + 템플릿 상세 패널 ─────────────────
+    // variant별로 슬롯 고정 여부 판단 (PERSON_N 패턴이 있으면 슬롯별 개별 업로드)
+    const PERSON_SLOT_RE = new RegExp('^PERSON_[0-9]+$', 'i')
+    const hasVariantSlots = templates.some(t => PERSON_SLOT_RE.test(t.variant_code))
+
+    // 템플릿 목록
+    const tplCards = templates.map(t => {
+      const hasFile  = !!t.pptx_b64_key
+      const fileName = t.pptx_file_path || (hasFile ? '업로드됨' : null)
+      const isSlot   = PERSON_SLOT_RE.test(t.variant_code)
+      const fileInputId = 'tplFile_' + t.variant_code
+      const fileLabelId = 'tplLabel_' + t.variant_code
+      return \`
+        <div class="bg-white border border-slate-200 rounded-lg px-3 py-2.5">
+          <div class="flex items-center gap-2">
+            <i class="fas fa-file-powerpoint \${hasFile ? 'text-emerald-500' : 'text-slate-300'} flex-shrink-0"></i>
+            <span class="text-xs truncate flex-1 \${hasFile ? 'text-slate-700 font-medium' : 'text-slate-400'}">
+              \${hasFile ? (fileName || '파일 업로드됨') : '파일 없음'}
+            </span>
+            \${t.variant_code !== 'DEFAULT' ? '<span class="text-xs font-mono bg-indigo-50 text-indigo-500 px-1.5 py-0.5 rounded flex-shrink-0">' + t.variant_code + '</span>' : ''}
+            \${isSlot ? \`
+              <input id="\${fileInputId}" type="file" accept=".pptx" class="hidden"
+                onchange="onSlotFileChange('\${t.variant_code}', this)">
+              <span id="\${fileLabelId}" class="text-xs text-slate-400 truncate max-w-[90px] flex-shrink-0"></span>
+              <button onclick="document.getElementById('\${fileInputId}').click()"
+                class="text-xs px-2 py-1 rounded bg-slate-100 hover:bg-indigo-100 text-slate-600 hover:text-indigo-700 border border-slate-200 transition flex-shrink-0">
+                <i class="fas fa-folder-open"></i>
+              </button>
+              <button onclick="uploadSlotTemplate(\${menu.id}, '\${t.variant_code}')"
+                class="text-xs px-2 py-1 rounded bg-amber-500 hover:bg-amber-600 text-white font-medium transition flex-shrink-0">
+                <i class="fas fa-upload"></i>
+              </button>
+            \` : ''}
+            \${hasFile ? \`
+              <button onclick="deleteTplConfirm(\${t.id}, \${menu.id})"
+                class="text-xs px-2 py-1 rounded bg-red-50 hover:bg-red-100 text-red-400 hover:text-red-600 border border-red-200 transition flex-shrink-0" title="파일 삭제">
+                <i class="fas fa-trash"></i>
+              </button>
+            \` : ''}
+          </div>
+        </div>
+      \`
+    }).join('')
+
+    document.getElementById('detailPanel').innerHTML = \`
+      <div class="p-5 h-full overflow-y-auto">
+
+        <!-- 헤더 -->
+        <div class="flex items-start justify-between mb-4">
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              \${menu.menu_number ? '<span class="text-xs bg-slate-100 text-slate-500 px-2 py-0.5 rounded font-mono">' + menu.menu_number + '</span>' : ''}
+              <h2 class="text-base font-bold text-slate-800">\${menu.menu_name}</h2>
+            </div>
+            <code class="text-xs bg-indigo-50 text-indigo-400 px-2 py-0.5 rounded">\${menu.menu_code}</code>
+          </div>
+
+        </div>
+
+        <!-- 켜고/끄기 -->
+        <div class="mb-4 flex items-center justify-between bg-slate-50 rounded-xl px-4 py-3 border border-slate-200">
+          <div>
+            <div class="text-sm font-semibold text-slate-700">장표 사용 여부</div>
+            <div class="text-xs text-slate-400 mt-0.5">제안서 생성 시 이 장표를 포함할지 설정합니다</div>
+          </div>
+          <label class="relative inline-flex items-center cursor-pointer">
+            <input type="checkbox" id="toggleEnabled" \${menu.is_enabled ? 'checked' : ''}
+              onchange="toggleMenuEnabled(\${menu.id}, this.checked)"
+              class="sr-only peer">
+            <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer
+              peer-checked:after:translate-x-full peer-checked:after:border-white
+              after:content-[''] after:absolute after:top-[2px] after:left-[2px]
+              after:bg-white after:border-gray-300 after:border after:rounded-full
+              after:h-5 after:w-5 after:transition-all
+              peer-checked:bg-emerald-500"></div>
+          </label>
+        </div>
+
+        <!-- 템플릿 파일 -->
+        <div class="mb-4">
+          <div class="text-sm font-bold text-slate-700 mb-2 flex items-center gap-2">
+            <i class="fas fa-file-powerpoint text-amber-400"></i>템플릿 파일
+            <span class="text-xs font-normal text-slate-400">(총 \${templates.length}개)</span>
+          </div>
+
+          \${templates.length > 0 ? \`
+            <div class="space-y-1.5 mb-3">\${tplCards}</div>
+          \` : \`
+            <div class="mb-3 text-xs text-slate-400 bg-slate-50 rounded-lg px-4 py-3 border border-slate-200">
+              <i class="fas fa-info-circle mr-1"></i>업로드된 템플릿 파일이 없습니다
+            </div>
+          \`}
+
+          <!-- 업로드 폼: PERSON 슬롯이 없는 일반 메뉴에만 표시 -->
+          \${!hasVariantSlots ? \`
+          <div class="bg-amber-50 rounded-xl p-3 border border-amber-200">
+            <label class="block">
+              <div id="tplFileDropZone"
+                class="flex items-center gap-3 border-2 border-dashed border-amber-300 rounded-lg px-4 py-3 cursor-pointer hover:border-amber-500 hover:bg-amber-100 transition"
+                onclick="document.getElementById('newTplFile').click()">
+                <i class="fas fa-file-powerpoint text-amber-400 text-xl flex-shrink-0"></i>
+                <span id="tplFileLabel" class="text-xs text-slate-500 truncate">
+                  클릭하거나 파일을 여기에 끌어다 놓으세요 (.pptx)
+                </span>
+              </div>
+              <input id="newTplFile" type="file"
+                accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                class="hidden" onchange="onTplFileChange(this)">
+            </label>
+            <input type="hidden" id="newTplName" value="">
+            <input type="hidden" id="newTplVariant" value="DEFAULT">
+            <input type="hidden" id="newTplCapacity" value="">
+            <button onclick="addTemplate(\${menu.id})"
+              class="mt-2 w-full py-1.5 text-xs rounded-lg bg-amber-500 text-white hover:bg-amber-600 font-medium transition">
+              <i class="fas fa-upload mr-1"></i>업로드 & 추가
+            </button>
+          </div>
+          \` : ''}
+        </div>
+
+      </div>
+    \`
+  }
+
+  // ── 첨부 탭 전용 상세 패널: 템플릿 파일 업로드/관리만 ──────────
+  function renderAttachmentDetail(menu, templates) {
+    const hasFile = templates.length > 0 && !!templates[0].pptx_b64_key
+    const tpl     = templates[0] || null
+    const fileName = tpl ? (tpl.pptx_file_path || (tpl.pptx_b64_key ? '업로드됨' : null)) : null
+
+    // 유형 정보 (repeat_per_person 기반)
+    const isRepeat = !!menu.repeat_per_person
+    const typeLabel = isRepeat ? '인력별 반복 서류' : '단순 첨부 서류'
+    const typeDesc  = isRepeat
+      ? (menu.menu_code === 'ATT_CONSENT'
+          ? '비상근 인력 1명당 슬라이드 1장씩 복제됩니다.'
+          : menu.menu_code === 'ATT_SCHEDULE' || menu.menu_code === 'ATT_STAFFING'
+            ? '인력 데이터를 표 행으로 채우며, 인원이 많으면 슬라이드가 분할됩니다.'
+            : menu.menu_code === 'ATT_CAREER_CERT'
+              ? 'NAS 경력증명서(감리협회) 폴더에서 이름이 포함된 PDF를 찾아 슬라이드로 삽입합니다. 도장 첨부 여부는 생성 시 선택합니다.'
+              : '투입 인력 전원에 대해 슬라이드가 복제됩니다.')
+      : '인원 수와 무관하게 단일 문서로 첨부됩니다.'
+    const typeBgCls  = isRepeat ? 'bg-violet-50 border-violet-200' : 'bg-sky-50 border-sky-200'
+    const typeIconCls = isRepeat ? 'fa-users text-violet-400' : 'fa-file-alt text-sky-400'
+    const typeBadgeCls = isRepeat ? 'bg-violet-100 text-violet-700' : 'bg-sky-100 text-sky-600'
+
+    document.getElementById('detailPanel').innerHTML = \`
+      <div class="p-6 h-full overflow-y-auto">
+
+        <!-- 항목 이름 -->
+        <div class="flex items-center gap-2 mb-4">
+          <i class="fas fa-paperclip text-teal-400 text-lg"></i>
+          <h2 class="text-base font-bold text-slate-800">\${menu.menu_name}</h2>
+          <code class="text-xs bg-teal-50 text-teal-500 px-2 py-0.5 rounded ml-auto">\${menu.menu_code}</code>
+        </div>
+
+        <!-- 서류 유형 안내 -->
+        <div class="mb-4 p-3 rounded-xl border \${typeBgCls} flex items-start gap-2.5">
+          <i class="fas \${typeIconCls} text-base mt-0.5 flex-shrink-0"></i>
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2 mb-0.5">
+              <span class="text-xs font-semibold text-slate-700">\${typeLabel}</span>
+              <span class="text-[10px] px-1.5 py-0.5 rounded-full font-medium \${typeBadgeCls}">\${isRepeat ? '인력반복' : '단순첨부'}</span>
+            </div>
+            <p class="text-xs text-slate-500">\${typeDesc}</p>
+          </div>
+        </div>
+
+        <!-- 현재 템플릿 상태 -->
+        <div class="mb-5 p-4 rounded-xl border \${hasFile ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-200'}">
+          <div class="flex items-center gap-2">
+            <i class="fas \${hasFile ? 'fa-check-circle text-emerald-500' : 'fa-exclamation-circle text-slate-400'} text-lg"></i>
+            <div class="flex-1">
+              <div class="text-sm font-semibold \${hasFile ? 'text-emerald-700' : 'text-slate-500'}">
+                \${hasFile ? '템플릿 등록됨' : '템플릿 없음'}
+              </div>
+              <div class="text-xs \${hasFile ? 'text-emerald-600' : 'text-slate-400'} mt-0.5 truncate">
+                \${hasFile ? (fileName || '파일 업로드됨') : '아래에서 .pptx 파일을 업로드하세요'}
+              </div>
+            </div>
+            \${hasFile && tpl ? \`
+            <button onclick="deleteAttachmentTemplate(\${tpl.id}, \${menu.id})"
+              class="text-xs px-2.5 py-1.5 rounded-lg bg-red-50 hover:bg-red-100 text-red-500 hover:text-red-700 border border-red-200 transition flex-shrink-0">
+              <i class="fas fa-trash mr-1"></i>삭제
+            </button>
+            \` : ''}
+          </div>
+        </div>
+
+        <!-- 업로드 폼 -->
+        <div class="bg-teal-50 rounded-xl p-4 border border-teal-200">
+          <div class="text-xs font-semibold text-teal-700 mb-2 flex items-center gap-1.5">
+            <i class="fas fa-upload"></i>
+            \${hasFile ? '템플릿 교체' : '템플릿 업로드'}
+          </div>
+          <div id="attTplDropZone"
+            class="flex items-center gap-3 border-2 border-dashed border-teal-300 rounded-lg px-4 py-4 cursor-pointer hover:border-teal-500 hover:bg-teal-100 transition mb-2"
+            onclick="document.getElementById('attNewTplFile').click()"
+            ondragover="attTplDzOver(event)" ondragleave="attTplDzLeave(event)" ondrop="attTplDzDrop(event, \${menu.id})">
+            <i class="fas fa-file-powerpoint text-teal-400 text-2xl flex-shrink-0"></i>
+            <div>
+              <span id="attTplFileLabel" class="text-sm text-slate-600 font-medium">
+                클릭하거나 파일을 여기에 끌어다 놓으세요
+              </span>
+              <div class="text-xs text-slate-400 mt-0.5">.pptx 파일</div>
+            </div>
+          </div>
+          <input id="attNewTplFile" type="file"
+            accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            class="hidden" onchange="onAttTplFileChange(this, \${menu.id})">
+          <button id="attTplUploadBtn" onclick="uploadAttachmentTemplate(\${menu.id})"
+            class="w-full py-2 text-sm rounded-lg bg-teal-600 text-white hover:bg-teal-700 font-medium transition disabled:opacity-50"
+            disabled>
+            <i class="fas fa-cloud-upload-alt mr-1"></i>업로드 & 저장
+          </button>
+        </div>
+
+      </div>
+    \`
+  }
+
+  // ── 첨부 탭 템플릿 업로드 함수들 ────────────────────────────────
+  var _attTplFile = null
+
+  function onAttTplFileChange(input, menuId) {
+    _attTplFile = input.files && input.files[0] ? input.files[0] : null
+    const label = document.getElementById('attTplFileLabel')
+    const btn   = document.getElementById('attTplUploadBtn')
+    if (label) label.textContent = _attTplFile ? _attTplFile.name : '클릭하거나 파일을 여기에 끌어다 놓으세요'
+    if (btn)   btn.disabled = !_attTplFile
+  }
+
+  function attTplDzOver(ev) {
+    ev.preventDefault()
+    document.getElementById('attTplDropZone').classList.add('ring-2','ring-teal-400','bg-teal-100')
+  }
+  function attTplDzLeave(ev) {
+    document.getElementById('attTplDropZone').classList.remove('ring-2','ring-teal-400','bg-teal-100')
+  }
+  function attTplDzDrop(ev, menuId) {
+    ev.preventDefault()
+    document.getElementById('attTplDropZone').classList.remove('ring-2','ring-teal-400','bg-teal-100')
+    const f = ev.dataTransfer.files && ev.dataTransfer.files[0]
+    if (f) {
+      _attTplFile = f
+      const label = document.getElementById('attTplFileLabel')
+      const btn   = document.getElementById('attTplUploadBtn')
+      if (label) label.textContent = f.name
+      if (btn)   btn.disabled = false
+    }
+  }
+
+  async function uploadAttachmentTemplate(menuId) {
+    if (!_attTplFile) return
+    const btn = document.getElementById('attTplUploadBtn')
+    btn.disabled = true
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>업로드 중...'
+    try {
+      const fd = new FormData()
+      fd.append('pptx_file', _attTplFile)
+      fd.append('template_name', _attTplFile.name.replace(/\\.pptx$/i,''))
+      fd.append('variant_code', 'DEFAULT')
+      const r = await fetch('/api/ppt-menus/' + menuId + '/templates', { method: 'POST', body: fd })
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.error || '업로드 실패')
+      showAlert('✅ 템플릿 저장 완료', true)
+      _attTplFile = null
+      // 갱신
+      const tr = await fetch('/api/ppt-menus/' + menuId + '/templates')
+      const tj = await tr.json()
+      const menu = findMenuById(_treeData, menuId)
+      if (menu) renderAttachmentDetail(menu, tj.ok ? tj.data : [])
+      loadTree()
+    } catch(e) {
+      showAlert('❌ ' + e.message, false)
+      btn.disabled = false
+      btn.innerHTML = '<i class="fas fa-cloud-upload-alt mr-1"></i>업로드 & 저장'
+    }
+  }
+
+  async function deleteAttachmentTemplate(tplId, menuId) {
+    if (!confirm('이 템플릿 파일을 삭제할까요?')) return
+    const r = await fetch('/api/ppt-menus/templates/' + tplId, { method: 'DELETE' })
+    const j = await r.json()
+    if (!j.ok) { showAlert('❌ ' + j.error, false); return }
+    showAlert('✅ 삭제 완료', true)
+    const tr = await fetch('/api/ppt-menus/' + menuId + '/templates')
+    const tj = await tr.json()
+    const menu = findMenuById(_treeData, menuId)
+    if (menu) renderAttachmentDetail(menu, tj.ok ? tj.data : [])
+    loadTree()
+  }
+
+  // ── mode 변경 시 관련 필드 활성/비활성 처리 ───────────────────
+  function onRuleModeChange(mode) {
+    // CLONE_SLIDE: 템플릿만 그대로 사용 → 계산/렌더/분할/후처리 불필요
+    // REPLACE: 변수치환만 → 렌더 함수 불필요
+    // BUILD_TABLE / BUILD_OBJECTS / HYBRID: 모두 활성
+    const isTemplateOnly = (mode === 'CLONE_SLIDE')
+    const isReplace      = (mode === 'REPLACE')
+
+    function setWrap(id, disabled) {
+      const el = document.getElementById(id)
+      if (!el) return
+      el.style.opacity   = disabled ? '0.38' : '1'
+      el.style.pointerEvents = disabled ? 'none' : ''
+      const inp = el.querySelector('input,select,textarea')
+      if (inp) inp.disabled = disabled
+    }
+
+    setWrap('wrap-ruleCalc',       isTemplateOnly)
+    setWrap('wrap-ruleRenderer',   isTemplateOnly || isReplace)
+    setWrap('wrap-rulePagination', isTemplateOnly)
+    setWrap('wrap-rulePostprocess',isTemplateOnly)
+  }
+
+  // ── 규칙 저장 ──────────────────────────────────────────────────
+  async function saveRule(menuId) {
+    const body = {
+      generation_mode:   document.getElementById('ruleMode').value,
+      template_strategy: document.getElementById('ruleStrategy').value,
+      calculator_code:   document.getElementById('ruleCalc').value,
+      renderer_code:     document.getElementById('ruleRenderer').value,
+      pagination_mode:   document.getElementById('rulePagination').value,
+      postprocess_mode:  document.getElementById('rulePostprocess').value,
+      merge_strategy:    document.getElementById('ruleMerge').value,
+      rule_config:       document.getElementById('ruleConfig').value,
+    }
+    const r = await fetch('/api/ppt-menus/' + menuId + '/rule', { method: 'PUT', headers: { 'Content-Type':'application/json' }, body: JSON.stringify(body) })
+    const j = await r.json()
+    showAlert(j.ok ? '✅ 규칙 저장 완료' : '❌ ' + j.error, j.ok)
+    if (j.ok) { await loadTree(); selectMenu(menuId) }
+  }
+
+  // ── 템플릿 파일 선택 핸들러 ───────────────────────────────────
+  function onTplFileChange(input) {
+    const label = document.getElementById('tplFileLabel')
+    if (input.files && input.files[0]) {
+      label.textContent = input.files[0].name
+      label.classList.add('text-amber-700', 'font-semibold')
+      // 이름 자동 채우기
+      const nameEl = document.getElementById('newTplName')
+      if (nameEl) nameEl.value = input.files[0].name.replace(/\.pptx$/i, '')
+    } else {
+      label.textContent = '클릭하거나 파일을 여기에 끌어다 놓으세요 (.pptx)'
+      label.classList.remove('text-amber-700', 'font-semibold')
+    }
+  }
+
+  // ── 켜고/끄기 토글 ────────────────────────────────────────────
+  async function toggleMenuEnabled(menuId, enabled) {
+    const r = await fetch('/api/ppt-menus/' + menuId, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_enabled: enabled ? 1 : 0 })
+    })
+    const j = await r.json()
+    if (!j.ok) {
+      showAlert('❌ ' + j.error, false)
+      // 실패 시 토글 원복
+      document.getElementById('toggleEnabled').checked = !enabled
+    } else {
+      await loadTree()
+      _selectedMenuId = menuId
+      renderTree(_treeData)
+    }
+  }
+
+  // ── 템플릿 추가 (파일 업로드) ────────────────────────────────
+  // ── 슬롯별 파일 선택 표시 ────────────────────────────────────
+  function onSlotFileChange(variantCode, input) {
+    const labelEl = document.getElementById('tplLabel_' + variantCode)
+    if (!labelEl) return
+    labelEl.textContent = input.files && input.files[0] ? input.files[0].name : '파일 선택...'
+  }
+
+  // ── 슬롯별 템플릿 업로드 (기존 레코드 덮어쓰기) ───────────────
+  async function uploadSlotTemplate(menuId, variantCode) {
+    const fileEl = document.getElementById('tplFile_' + variantCode)
+    const file   = fileEl && fileEl.files && fileEl.files[0]
+    if (!file) { showAlert('파일을 먼저 선택하세요', false); return }
+
+    const formData = new FormData()
+    formData.append('template_name', variantCode)
+    formData.append('variant_code',  variantCode)
+    formData.append('pptx_file',     file)
+
+    const r = await fetch('/api/ppt-menus/' + menuId + '/templates', { method: 'POST', body: formData })
+    const j = await r.json()
+    if (j.ok) {
+      showAlert('✅ ' + variantCode + ' 업로드 완료', true)
+      if (fileEl) fileEl.value = ''
+      const labelEl = document.getElementById('tplLabel_' + variantCode)
+      if (labelEl) labelEl.textContent = '파일 선택...'
+      selectMenu(menuId)
+    } else {
+      showAlert('❌ ' + j.error, false)
+    }
+  }
+
+  async function addTemplate(menuId) {
+    const name     = document.getElementById('newTplName').value.trim()
+    const variant  = document.getElementById('newTplVariant').value.trim() || 'DEFAULT'
+    const capacity = document.getElementById('newTplCapacity').value
+    const fileEl   = document.getElementById('newTplFile')
+    const file     = fileEl && fileEl.files && fileEl.files[0]
+
+    if (!name) { showAlert('템플릿 이름을 입력하세요', false); return }
+
+    const formData = new FormData()
+    formData.append('template_name', name)
+    formData.append('variant_code',  variant)
+    if (capacity) formData.append('capacity', capacity)
+    if (file)     formData.append('pptx_file', file)
+
+    const r = await fetch('/api/ppt-menus/' + menuId + '/templates', { method: 'POST', body: formData })
+    const j = await r.json()
+    if (j.ok) {
+      showAlert('✅ 템플릿 추가 완료' + (j.file_name ? ' — ' + j.file_name : ''), true)
+      // 폼 초기화
+      document.getElementById('newTplName').value = ''
+      document.getElementById('newTplVariant').value = 'DEFAULT'
+      document.getElementById('newTplCapacity').value = ''
+      if (fileEl) fileEl.value = ''
+      const label = document.getElementById('tplFileLabel')
+      if (label) { label.textContent = '클릭하거나 파일을 여기에 끌어다 놓으세요 (.pptx)'; label.classList.remove('text-amber-700','font-semibold') }
+      selectMenu(menuId)
+    } else {
+      showAlert('❌ ' + j.error, false)
+    }
+  }
+
+  // ── 템플릿 파일 삭제 (pptx_b64_key만 지움, 슬롯 레코드 유지) ──
+  async function deleteTplConfirm(tid, menuId) {
+    if (!confirm('업로드된 파일을 삭제하시겠습니까?\\n(슬롯은 유지됩니다)')) return
+    const r = await fetch('/api/ppt-menus/templates/' + tid + '/file', { method: 'DELETE' })
+    const j = await r.json()
+    showAlert(j.ok ? '✅ 파일 삭제 완료' : '❌ ' + j.error, j.ok)
+    if (j.ok) selectMenu(menuId)
+  }
+
+  // ── 템플릿 삭제 ────────────────────────────────────────────────
+  async function deleteTpl(tid) {
+    if (!confirm('템플릿을 삭제하시겠습니까?')) return
+    const r = await fetch('/api/ppt-menus/templates/' + tid, { method: 'DELETE' })
+    const j = await r.json()
+    showAlert(j.ok ? '✅ 삭제 완료' : '❌ ' + j.error, j.ok)
+    if (j.ok && _selectedMenuId) selectMenu(_selectedMenuId)
+  }
+
+  // ── 메뉴 추가/편집 모달 ────────────────────────────────────────
+  function openAddMenu() {
+    document.getElementById('menuModalTitle').textContent = '메뉴 추가'
+    document.getElementById('modalMenuId').value = ''
+    document.getElementById('modalParentId').value = ''
+    document.getElementById('modalMenuCode').value = ''
+    document.getElementById('modalMenuName').value = ''
+    document.getElementById('modalMenuNumber').value = ''
+    document.getElementById('modalSortOrder').value = '100'
+    document.getElementById('modalIsEnabled').checked = true
+    document.getElementById('menuModal').classList.remove('hidden')
+  }
+
+  function openEditMenu(id) {
+    const menu = findMenuById(_treeData, id)
+    if (!menu) return
+    document.getElementById('menuModalTitle').textContent = '메뉴 편집'
+    document.getElementById('modalMenuId').value = id
+    document.getElementById('modalParentId').value = menu.parent_id || ''
+    document.getElementById('modalMenuCode').value = menu.menu_code
+    document.getElementById('modalMenuName').value = menu.menu_name
+    document.getElementById('modalMenuNumber').value = menu.menu_number || ''
+    document.getElementById('modalSortOrder').value = menu.sort_order
+    document.getElementById('modalIsEnabled').checked = !!menu.is_enabled
+    document.getElementById('menuModal').classList.remove('hidden')
+  }
+
+  function closeMenuModal() { document.getElementById('menuModal').classList.add('hidden') }
+
+  async function saveMenu() {
+    const id   = document.getElementById('modalMenuId').value
+    const body = {
+      parent_id:   parseInt(document.getElementById('modalParentId').value) || null,
+      menu_code:   document.getElementById('modalMenuCode').value,
+      menu_name:   document.getElementById('modalMenuName').value,
+      menu_number: document.getElementById('modalMenuNumber').value || null,
+      sort_order:  parseInt(document.getElementById('modalSortOrder').value) || 0,
+      is_enabled:  document.getElementById('modalIsEnabled').checked ? 1 : 0,
+    }
+    if (!body.menu_code || !body.menu_name) { showAlert('메뉴 코드와 이름은 필수입니다', false); return }
+    const url    = id ? '/api/ppt-menus/' + id : '/api/ppt-menus'
+    const method = id ? 'PUT' : 'POST'
+    const r = await fetch(url, { method, headers: { 'Content-Type':'application/json' }, body: JSON.stringify(body) })
+    const j = await r.json()
+    showAlert(j.ok ? '✅ 저장 완료' : '❌ ' + j.error, j.ok)
+    if (j.ok) { closeMenuModal(); loadTree() }
+  }
+
+  // ── 메뉴 삭제 ─────────────────────────────────────────────────
+  async function deleteMenu(id) {
+    if (!confirm('메뉴를 삭제하면 하위 템플릿/규칙도 모두 삭제됩니다. 계속하시겠습니까?')) return
+    const r = await fetch('/api/ppt-menus/' + id, { method: 'DELETE' })
+    const j = await r.json()
+    showAlert(j.ok ? '✅ 삭제 완료' : '❌ ' + j.error, j.ok)
+    if (j.ok) {
+      _selectedMenuId = null
+      document.getElementById('detailPanel').innerHTML =
+        '<div class="flex items-center justify-center h-full text-slate-400"><div class="text-center"><i class="fas fa-mouse-pointer text-4xl mb-3 opacity-30"></i><p class="text-sm">왼쪽 트리에서 메뉴를 선택하세요</p></div></div>'
+      loadTree()
+    }
+  }
+
+  // ── 마스터 템플릿 관리 ───────────────────────────────────────
+  async function openMasterModal() {
+    document.getElementById('masterModal').classList.remove('hidden')
+    await loadMasterList()
+  }
+  function closeMasterModal() {
+    document.getElementById('masterModal').classList.add('hidden')
+  }
+
+  async function loadMasterList() {
+    const el = document.getElementById('masterList')
+    el.innerHTML = '<div class="text-center text-slate-400 text-xs py-6"><i class="fas fa-spinner fa-spin mr-1"></i>로딩 중...</div>'
+    try {
+      const r = await fetch('/api/ppt-menus/master-templates')
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.error)
+      if (!j.data.length) {
+        el.innerHTML = '<div class="text-center text-slate-400 text-xs py-8"><i class="fas fa-inbox text-2xl mb-2 block opacity-30"></i>저장된 마스터가 없습니다<br><span class="text-slate-300">왼쪽에서 PPTX를 업로드하세요</span></div>'
+        return
+      }
+      el.innerHTML = j.data.map(m => {
+        const layouts = Array.isArray(m.layouts) ? m.layouts : (typeof m.layouts === 'string' ? JSON.parse(m.layouts || '[]') : [])
+        const isActive = m.is_active == 1
+        const createdAt = new Date(m.created_at).toLocaleDateString('ko-KR', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+        return \`
+        <div data-master-id="\${m.id}" class="rounded-xl border-2 \${isActive ? 'border-violet-400 bg-violet-50' : 'border-slate-200 bg-white'} p-3 transition-all">
+          <div class="flex items-start justify-between gap-2">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 mb-0.5">
+                \${isActive ? '<span class="inline-flex items-center px-1.5 py-0.5 rounded-md bg-violet-600 text-white text-xs font-bold"><i class="fas fa-check mr-1"></i>활성</span>' : ''}
+                <span class="text-sm font-semibold text-slate-800 truncate">\${m.name}</span>
+              </div>
+              \${m.description ? \`<div class="text-xs text-slate-400 mb-1">\${m.description}</div>\` : ''}
+              <div class="text-xs text-slate-300">\${createdAt}</div>
+            </div>
+            <div class="flex items-center gap-1 flex-shrink-0">
+              \${!isActive ? \`<button onclick="activateMaster(\${m.id})" class="px-2.5 py-1 rounded-lg bg-violet-600 text-white text-xs font-medium hover:bg-violet-700 transition"><i class="fas fa-play mr-1"></i>활성화</button>\` : ''}
+              <button onclick="deleteMaster(\${m.id})" class="p-1.5 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 transition"><i class="fas fa-trash-alt"></i></button>
+            </div>
+          </div>
+          \${layouts.length ? \`
+          <div class="mt-2 pt-2 border-t border-slate-100">
+            <div class="text-xs text-slate-400 mb-1"><i class="fas fa-th-list mr-1"></i>레이아웃 \${layouts.length}개</div>
+            <div class="flex flex-wrap gap-1">
+              \${layouts.map(l => \`<span class="px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 text-xs">\${l}</span>\`).join('')}
+            </div>
+          </div>\` : ''}
+        </div>\`
+      }).join('')
+    } catch (e) {
+      el.innerHTML = \`<div class="text-red-400 text-xs text-center py-4"><i class="fas fa-exclamation-circle mr-1"></i>로드 실패: \${e.message}</div>\`
+    }
+  }
+
+  async function uploadMasterTemplate() {
+    const name = document.getElementById('masterNameInput').value.trim()
+    const desc = document.getElementById('masterDescInput').value.trim()
+    const fileInput = document.getElementById('masterFileInput')
+    const setActive = document.getElementById('masterSetActive').checked
+    if (!name) { alert('이름을 입력하세요'); return }
+    if (!fileInput.files?.length) { alert('PPTX 파일을 선택하세요'); return }
+
+    const fd = new FormData()
+    fd.append('file', fileInput.files[0])
+    fd.append('name', name)
+    fd.append('description', desc)
+    fd.append('set_active', setActive ? '1' : '0')
+
+    const btn = document.getElementById('masterUploadBtn')
+    btn.disabled = true
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>업로드 중...'
+    document.getElementById('masterUploadInfo').classList.add('hidden')
+    try {
+      const r = await fetch('/api/ppt-menus/master-templates', { method: 'POST', body: fd })
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.error)
+
+      // 업로드 성공 — 레이아웃 표시
+      const layouts = Array.isArray(j.layouts) ? j.layouts : []
+      if (layouts.length) {
+        document.getElementById('masterUploadLayouts').textContent = layouts.join(' · ')
+        document.getElementById('masterUploadInfo').classList.remove('hidden')
+      }
+
+      showAlert('✅ "' + name + '" 업로드 완료' + (layouts.length ? ' (' + layouts.length + '개 레이아웃 추출)' : ''), true)
+      document.getElementById('masterNameInput').value = ''
+      document.getElementById('masterDescInput').value = ''
+      fileInput.value = ''
+      await loadMasterList()
+    } catch (e) {
+      showAlert('❌ 업로드 실패: ' + e.message, false)
+    } finally {
+      btn.disabled = false
+      btn.innerHTML = '<i class="fas fa-cloud-upload-alt mr-1"></i>업로드'
+    }
+  }
+
+  async function activateMaster(id) {
+    const r = await fetch('/api/ppt-menus/master-templates/' + id + '/activate', { method: 'PUT' })
+    const j = await r.json()
+    if (j.ok) {
+      showAlert('✅ 마스터 템플릿이 활성화되었습니다', true)
+      await loadMasterList()
+    } else showAlert('❌ 활성화 실패: ' + j.error, false)
+  }
+
+  async function deleteMaster(id) {
+    const row = document.querySelector('[data-master-id="' + id + '"]')
+    const name = row?.querySelector('.font-semibold')?.textContent?.trim() || '이 마스터'
+    if (!confirm('"' + name + '"을 삭제하시겠습니까?')) return
+    const r = await fetch('/api/ppt-menus/master-templates/' + id, { method: 'DELETE' })
+    const j = await r.json()
+    if (j.ok) { showAlert('✅ 삭제 완료', true); await loadMasterList() }
+    else showAlert('❌ 삭제 실패: ' + j.error, false)
+  }
+
+  // ── 프리셋 저장/불러오기 (DB 기반) ──────────────────────────
+
+  function savePresets(_list) {}  // 하위호환 stub (사용 안 함)
+
+  async function openPresetModal() {
+    document.getElementById('presetNameInput').value = ''
+    document.getElementById('presetModal').classList.remove('hidden')
+    await renderPresetList()
+  }
+
+  function closePresetModal() {
+    document.getElementById('presetModal').classList.add('hidden')
+  }
+
+  // ── 전체 목차 스냅샷 저장 (DB) ──────────────────────────────
+  async function savePreset() {
+    const name = document.getElementById('presetNameInput').value.trim()
+    if (!name) { alert('프리셋 이름을 입력하세요'); return }
+
+    const btn = document.getElementById('presetSaveBtn')
+    btn.disabled = true
+    btn.textContent = '저장 중...'
+    try {
+      // 1) 전체 메뉴 트리 (rules 포함) 조회
+      const r = await fetch('/api/ppt-menus')
+      const j = await r.json()
+      if (!j.ok) throw new Error(j.error)
+
+      // 2) 트리 평탄화
+      const snapshot = []
+      function flattenTree(nodes) {
+        nodes.forEach(n => {
+          snapshot.push({
+            menu_id:     n.id,
+            parent_id:   n.parent_id ?? null,
+            menu_code:   n.menu_code,
+            menu_name:   n.menu_name,
+            menu_number: n.menu_number ?? null,
+            sort_order:  n.sort_order ?? 0,
+            is_enabled:  n.is_enabled ?? 1,
+            rule: n.rule ? {
+              generation_mode:   n.rule.generation_mode,
+              template_strategy: n.rule.template_strategy,
+              pagination_mode:   n.rule.pagination_mode,
+              merge_strategy:    n.rule.merge_strategy,
+              calculator_code:   n.rule.calculator_code,
+              renderer_code:     n.rule.renderer_code,
+              postprocess_mode:  n.rule.postprocess_mode,
+              rule_config:       n.rule.rule_config,
+            } : null,
+            templates: []
+          })
+          if (n.children && n.children.length) flattenTree(n.children)
+        })
+      }
+      flattenTree(j.data)
+
+      // 3) 각 메뉴의 템플릿 목록 병렬 조회 (pptx_b64_key 포함)
+      await Promise.all(snapshot.map(async (item) => {
+        try {
+          const tr = await fetch('/api/ppt-menus/' + item.menu_id + '/templates')
+          const tj = await tr.json()
+          if (tj.ok && Array.isArray(tj.data)) {
+            item.templates = tj.data.map(t => ({
+              template_name: t.template_name,
+              variant_code:  t.variant_code,
+              capacity:      t.capacity ?? null,
+              is_default:    t.is_default ?? 0,
+              is_active:     t.is_active ?? 1,
+              pptx_b64_key:  t.pptx_b64_key ?? null,
+              pptx_file_path: t.pptx_file_path ?? null,
+            }))
+          }
+        } catch(_) {}
+      }))
+
+      // 4) DB에 저장
+      const sr = await fetch('/api/ppt-menus/presets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, snapshot })
+      })
+      const sj = await sr.json()
+      if (!sj.ok) throw new Error(sj.error)
+
+      document.getElementById('presetNameInput').value = ''
+      await renderPresetList()
+      const tplCount = snapshot.reduce((s, m) => s + (m.templates ? m.templates.length : 0), 0)
+      showAlert('✅ 프리셋 "' + name + '" 저장 완료 (메뉴 ' + snapshot.length + '개, 템플릿 ' + tplCount + '개)', true)
+    } catch(e) {
+      alert('저장 실패: ' + e.message)
+    } finally {
+      btn.disabled = false
+      btn.innerHTML = '<i class="fas fa-save mr-1"></i>저장'
+    }
+  }
+
+  // ── 전체 목차 스냅샷 적용 (완전 덮어쓰기, DB) ───────────────
+  async function applyPreset(presetId) {
+    // 프리셋 snapshot 전체 조회
+    const pr = await fetch('/api/ppt-menus/presets/' + presetId)
+    const pj = await pr.json()
+    if (!pj.ok) { alert('프리셋을 찾을 수 없습니다'); return }
+    const preset = pj.data
+
+    if (!confirm('"' + preset.name + '" 프리셋을 적용하시겠습니까?\\n\\n· 스냅샷의 ' + preset.menu_count + '개 메뉴로 완전히 덮어씁니다\\n· 이후 추가된 메뉴는 삭제됩니다\\n· 이 작업은 되돌릴 수 없습니다')) return
+
+    closePresetModal()
+    showAlert('⏳ 프리셋 복원 중...', true)
+
+    try {
+      const snapshot = Array.isArray(preset.snapshot) ? preset.snapshot : JSON.parse(preset.snapshot)
+
+      // 1) 현재 전체 메뉴 id 목록 조회
+      const curR = await fetch('/api/ppt-menus')
+      const curJ = await curR.json()
+      const curIds = new Set()
+      function collectIds(nodes) {
+        nodes.forEach(n => { curIds.add(n.id); if (n.children) collectIds(n.children) })
+      }
+      collectIds(curJ.data || [])
+
+      const snapIds = new Set(snapshot.map(item => item.menu_id))
+
+      // 2) 스냅샷에 없는 메뉴 삭제
+      const toDelete = [...curIds].filter(id => !snapIds.has(id))
+      for (const id of toDelete) {
+        await fetch('/api/ppt-menus/' + id, { method: 'DELETE' })
+      }
+
+      // 3) 스냅샷 메뉴+룰 upsert (부모 먼저)
+      const sorted = [...snapshot].sort((a, b) => {
+        if (!a.parent_id && b.parent_id) return -1
+        if (a.parent_id && !b.parent_id) return 1
+        return 0
+      })
+      let ok = 0, fail = 0
+      for (const item of sorted) {
+        try {
+          const r = await fetch('/api/ppt-menus/restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id:          item.menu_id,
+              parent_id:   item.parent_id ?? null,
+              menu_code:   item.menu_code,
+              menu_name:   item.menu_name,
+              menu_number: item.menu_number ?? null,
+              sort_order:  item.sort_order ?? 0,
+              is_enabled:  item.is_enabled ?? 1,
+              rule:        item.rule ?? null,
+            })
+          })
+          const rj = await r.json()
+          if (rj.ok) ok++; else fail++
+        } catch(_) { fail++ }
+      }
+
+      // 4) 템플릿 복원 — 메뉴별 기존 템플릿 전부 삭제 후 재삽입
+      let tplOk = 0, tplFail = 0
+      for (const item of snapshot) {
+        if (!item.templates || !item.templates.length) continue
+        try {
+          // 기존 템플릿 삭제 (메뉴 단위)
+          const existing = await fetch('/api/ppt-menus/' + item.menu_id + '/templates')
+          const ej = await existing.json()
+          if (ej.ok && Array.isArray(ej.data)) {
+            for (const t of ej.data) {
+              await fetch('/api/ppt-menus/templates/' + t.id, { method: 'DELETE' })
+            }
+          }
+          // 스냅샷 템플릿 재삽입
+          for (const t of item.templates) {
+            const tr = await fetch('/api/ppt-menus/' + item.menu_id + '/templates', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(t)
+            })
+            const tj = await tr.json()
+            if (tj.ok) tplOk++; else tplFail++
+          }
+        } catch(_) { tplFail++ }
+      }
+
+      await loadTree()
+      if (_selectedMenuId && snapIds.has(_selectedMenuId)) {
+        selectMenu(_selectedMenuId)
+      } else {
+        _selectedMenuId = null
+      }
+
+      const delNote = toDelete.length ? ', 불필요 메뉴 ' + toDelete.length + '개 삭제' : ''
+      const tplNote = (tplOk + tplFail) > 0 ? ', 템플릿 ' + tplOk + '개 복원' : ''
+      const failNote = (fail + tplFail) ? ' (실패 ' + (fail + tplFail) + '개)' : ''
+      showAlert('✅ 프리셋 "' + preset.name + '" 복원 완료 — 메뉴 ' + ok + '개' + tplNote + delNote + failNote, (fail + tplFail) === 0)
+    } catch(e) {
+      showAlert('❌ 복원 중 오류: ' + e.message, false)
+    }
+  }
+
+  async function deletePreset(presetId) {
+    const name = document.querySelector('[data-preset-id="' + presetId + '"] .preset-name')?.textContent || '이 프리셋'
+    if (!confirm('"' + name + '" 프리셋을 삭제하시겠습니까?')) return
+    const r = await fetch('/api/ppt-menus/presets/' + presetId, { method: 'DELETE' })
+    const j = await r.json()
+    if (j.ok) await renderPresetList()
+    else alert('삭제 실패: ' + j.error)
+  }
+
+  async function renderPresetList() {
+    const container = document.getElementById('presetList')
+    container.innerHTML = '<div class="text-center text-slate-400 text-xs py-4"><i class="fas fa-spinner fa-spin mr-1"></i>불러오는 중...</div>'
+    try {
+      const r = await fetch('/api/ppt-menus/presets')
+      const j = await r.json()
+      const list = j.data || []
+      if (!list.length) {
+        container.innerHTML = '<div class="text-center text-slate-400 text-xs py-4">저장된 프리셋이 없습니다</div>'
+        return
+      }
+      container.innerHTML = list.map(p => {
+        const dt = new Date(p.created_at)
+        const dtStr = dt.getFullYear() + '.' + String(dt.getMonth()+1).padStart(2,'0') + '.' + String(dt.getDate()).padStart(2,'0') + ' ' + String(dt.getHours()).padStart(2,'0') + ':' + String(dt.getMinutes()).padStart(2,'0')
+        return '<div class="flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2 border border-slate-200" data-preset-id="' + p.id + '">' +
+          '<div class="flex-1 min-w-0">' +
+            '<div class="text-xs font-semibold text-slate-800 truncate preset-name">' + p.name + '</div>' +
+            '<div class="text-xs text-slate-400 mt-0.5">메뉴 ' + p.menu_count + '개 · ' + dtStr + '</div>' +
+          '</div>' +
+          '<button onclick="applyPreset(' + p.id + ')" class="px-2 py-1 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-700 whitespace-nowrap"><i class="fas fa-check mr-1"></i>적용</button>' +
+          '<button onclick="deletePreset(' + p.id + ')" class="px-2 py-1 text-xs rounded bg-red-50 text-red-500 hover:bg-red-100 border border-red-200 whitespace-nowrap"><i class="fas fa-trash"></i></button>' +
+        '</div>'
+      }).join('')
+    } catch(e) {
+      container.innerHTML = '<div class="text-center text-red-400 text-xs py-4">불러오기 실패: ' + e.message + '</div>'
+    }
+  }
+
+  // ── 툴팁 팝오버 ──────────────────────────────────────────────────
+  const TIP_DATA = {
+    mode: {
+      title: '슬라이드 생성 방식 (Generation Mode)',
+      desc: '데이터를 슬라이드로 변환하는 핵심 알고리즘을 선택합니다. 장표 유형에 따라 적합한 방식이 다릅니다.',
+      example: ['BUILD_TABLE: 인원 배정표, 감리 일정', 'BUILD_OBJECTS: 사진/프로필 장표', 'CLONE_SLIDE: 반복 구조 장표', 'REPLACE: 표지/고정 양식', 'HYBRID: 표+사진 복합'].join(' | '),
+    },
+    strategy: {
+      title: '템플릿 종류 (Template Strategy)',
+      desc: '슬라이드 생성 시 사용하는 템플릿 파일/구조의 종류입니다.',
+      example: ['PPTX_TEMPLATE: .pptx 파일을 직접 사용', 'PPTX_XML_TEMPLATE: XML 조각 조합', 'FRAME_TEMPLATE: 프레임 레이아웃 기반', 'VARIANT_TEMPLATE: 인원수별 변형 템플릿'].join(' | '),
+    },
+    pagination: {
+      title: '페이지 분할 방식 (Pagination Mode)',
+      desc: '데이터가 많아 슬라이드를 여러 장으로 나눠야 할 때 분할 기준을 지정합니다.',
+      example: 'NONE: 분할없음 | ROW_LIMIT: 행수기준(maxRowsPerSlide) | SECTION: 섹션단위 | CUSTOM: 커스텀함수',
+    },
+    merge: {
+      title: '합본(병합) 방식 (Merge Strategy)',
+      desc: '여러 장표를 하나의 PPTX 파일로 합칠 때 사용하는 방식입니다.',
+      example: 'STANDARD: 현재 파일에 슬라이드 추가 | FOREIGN_TEMPLATE: 외부 템플릿 파일에 슬라이드를 복사하여 병합',
+    },
+    calc: {
+      title: '데이터 계산 함수명 (Calculator Code)',
+      desc: '슬라이드에 들어갈 데이터를 준비/가공하는 JS 함수명입니다. ppt-engine.js 또는 proposal-detail.js에 정의된 함수명을 입력합니다.',
+      example: 'computeAssignRows | computeScheduleRows | computeComplianceRows (없으면 빈칸)',
+    },
+    renderer: {
+      title: '슬라이드 렌더 함수명 (Renderer Code)',
+      desc: '계산된 데이터를 PPTX 슬라이드 XML로 변환하는 JS 함수명입니다.',
+      example: 'renderAssignTable | renderPhotoSlide | renderScheduleTable (없으면 빈칸)',
+    },
+    postprocess: {
+      title: '후처리 방식 (Postprocess Mode)',
+      desc: '슬라이드 생성 완료 후 추가로 수행하는 처리 단계를 지정합니다.',
+      example: 'NONE: 없음 | WATERMARK: 워터마크 | COMPRESS: 이미지압축 | SIGN: 전자서명 | CUSTOM: 커스텀',
+    },
+    config: {
+      title: '추가 설정값 (Rule Config)',
+      desc: '위 설정으로 표현할 수 없는 세부 동작을 JSON 형식으로 지정합니다.',
+      example: '{"maxRowsPerSlide":15} | {"variants":[2,4,6,9]} | {"photoSize":"large","nameFontSize":14}',
+    },
+  }
+
+  let _activeTipKey = null
+  const tipEl = document.getElementById('tipPopover')
+
+  document.addEventListener('click', function(e) {
+    const icon = e.target.closest('.tip-icon')
+    if (icon) {
+      e.stopPropagation()
+      const key = icon.dataset.tip
+      if (_activeTipKey === key) {
+        tipEl.classList.add('hidden')
+        _activeTipKey = null
+        return
+      }
+      const data = TIP_DATA[key]
+      if (!data) return
+      document.getElementById('tipTitle').textContent = data.title
+      document.getElementById('tipDesc').textContent = data.desc
+      document.getElementById('tipExample').textContent = data.example
+      const rect = icon.getBoundingClientRect()
+      const scrollY = window.scrollY || document.documentElement.scrollTop
+      const scrollX = window.scrollX || document.documentElement.scrollLeft
+      tipEl.classList.remove('hidden')
+      tipEl.style.pointerEvents = 'none'
+      const tipW = 288
+      const tipH = tipEl.offsetHeight || 200
+      let left = rect.right + scrollX + 8
+      let top  = rect.top  + scrollY
+      if (left + tipW > window.innerWidth + scrollX - 10) left = rect.left + scrollX - tipW - 8
+      if (top + tipH > window.innerHeight + scrollY - 10) top = window.innerHeight + scrollY - tipH - 10
+      if (top < scrollY) top = scrollY + 8
+      tipEl.style.left = left + 'px'
+      tipEl.style.top  = top  + 'px'
+      _activeTipKey = key
+      return
+    }
+    if (!e.target.closest('#tipPopover')) {
+      tipEl.classList.add('hidden')
+      _activeTipKey = null
+    }
+  })
+
+  // ── 드래그앤드롭 파일 업로드 ──────────────────────────────────
+  document.addEventListener('dragover', function(e) {
+    const zone = e.target.closest('#tplFileDropZone')
+    if (zone) { e.preventDefault(); zone.classList.add('border-amber-500','bg-amber-100') }
+  })
+  document.addEventListener('dragleave', function(e) {
+    const zone = e.target.closest('#tplFileDropZone')
+    if (zone) { zone.classList.remove('border-amber-500','bg-amber-100') }
+  })
+  document.addEventListener('drop', function(e) {
+    const zone = e.target.closest('#tplFileDropZone')
+    if (!zone) return
+    e.preventDefault()
+    zone.classList.remove('border-amber-500','bg-amber-100')
+    const files = e.dataTransfer && e.dataTransfer.files
+    if (!files || !files.length) return
+    const fileEl = document.getElementById('newTplFile')
+    if (!fileEl) return
+    // DataTransfer로 파일 세팅
+    try {
+      const dt = new DataTransfer()
+      dt.items.add(files[0])
+      fileEl.files = dt.files
+      onTplFileChange(fileEl)
+    } catch (_) {}
+  })
+
+  // ── 초기 로드 ─────────────────────────────────────────────────
+  switchTab('proposal')  // 제안서 탭으로 초기화 (헤더 버튼 + 트리 로드)
+  </script>`;
+    return c.html(layout('PPT 템플릿 관리', body, 'ppt-templates'));
+});
+export default app;
