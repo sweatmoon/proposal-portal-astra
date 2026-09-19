@@ -462,13 +462,18 @@ export type ClientLogoResult = { ok: boolean; dataUri?: string; filename?: strin
 const logoKey = (s: string) => s.normalize('NFKC').toLowerCase().replace(/[\s._-]+/g, '')
 const legalLogoKey = (s: string) => logoKey(s).replace(/^(?:\((?:재|사|주)\)|재단법인|사단법인|주식회사)/, '')
 
-// 부분 문자열/약칭/숫자 접미사를 추정하지 않는다. 동일 점수 후보가 여러 개면 명시적 오류.
+// 정확 일치 → 기존 법인 접두사 정리 일치 → 기관명 전체 포함 순서.
+// 같은 우선순위에서 여러 후보가 나오면 임의 선택하지 않는다.
 export function matchClientLogo(org: string, files: { name: string; isdir: boolean }[]): ClientLogoResult {
-  if (!validPhotoName(org)) return { ok: false, error: 'invalid_client_org' }
+  if (!validPhotoName(org) || !logoKey(org)) return { ok: false, error: 'invalid_client_org' }
   const names = [...new Set(files.filter(f => !f.isdir && typeof f.name === 'string' && validPhotoName(f.name) && /\.(png|jpe?g)$/i.test(f.name)).map(f => f.name))]
   const base = (n: string) => n.replace(/\.(png|jpe?g)$/i, '')
-  const exact = names.filter(n => logoKey(base(n)) === logoKey(org))
-  const candidates = exact.length ? exact : names.filter(n => legalLogoKey(base(n)) === legalLogoKey(org))
+  const orgKey = logoKey(org)
+  const exact = names.filter(n => logoKey(base(n)) === orgKey)
+  const legalKey = legalLogoKey(org)
+  const legal = legalKey ? names.filter(n => legalLogoKey(base(n)) === legalKey) : []
+  const candidates = exact.length ? exact : legal.length ? legal
+    : names.filter(n => logoKey(base(n)).includes(orgKey))
   return candidates.length === 1 ? { ok: true, filename: candidates[0] }
     : { ok: false, error: candidates.length ? 'client_logo_ambiguous' : 'client_logo_not_found' }
 }

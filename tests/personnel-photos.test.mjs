@@ -39,11 +39,49 @@ test('client logo matches exact normalized institution names without choosing ot
   const { mod } = await nas(t);
   const files = ['강원대학교.png', '강원대학교2.png', '강원대학교병원.png', '(재)한국정보문화산업진흥원.png', '경기도 과천시.png'].map(name => ({ name, isdir: false }));
   assert.equal(mod.matchClientLogo('강원대학교', files).filename, '강원대학교.png');
-  assert.equal(mod.matchClientLogo('강원대', files).error, 'client_logo_not_found');
+  assert.equal(mod.matchClientLogo('강원대', files).error, 'client_logo_ambiguous');
   assert.equal(mod.matchClientLogo('한국정보문화산업진흥원', files).filename, '(재)한국정보문화산업진흥원.png');
   assert.equal(mod.matchClientLogo('경기도 과천시', files).filename, '경기도 과천시.png');
   assert.equal(mod.matchClientLogo('강원대학교', [...files, { name: '강원대학교.jpg', isdir: false }]).error, 'client_logo_ambiguous');
   assert.equal(mod.matchClientLogo('../비밀', files).error, 'invalid_client_org');
+});
+test('client logo contains the full normalized organization name only after exact matches', async t => {
+  const { mod } = await nas(t);
+  const org = '한국지능정보사회진흥원';
+  const files = names => names.map(name => ({ name, isdir: false }));
+  for (const name of [`${org}(NIA).png`, `${org}_로고.JPG`, `로고_${org}_최종.jpeg`, '한국 지능정보사회진흥원(NIA).png']) {
+    assert.equal(mod.matchClientLogo(org, files([name])).filename, name);
+  }
+  assert.equal(mod.matchClientLogo(org, files([`${org}(NIA).png`, `${org}.png`])).filename, `${org}.png`);
+  assert.equal(mod.matchClientLogo(org, files([`${org}(NIA).png`, `(재)${org}.png`])).filename, `(재)${org}.png`);
+  assert.equal(mod.matchClientLogo(org, files([`${org}(NIA).png`, `(재)${org}.png`, `${org}.png`])).filename, `${org}.png`);
+  assert.equal(mod.matchClientLogo('Example Org', files(['logo_EXAMPLE-ORG_final.PNG'])).filename, 'logo_EXAMPLE-ORG_final.PNG');
+});
+test('client logo inclusion keeps ambiguity, extension, directory and empty-name safeguards', async t => {
+  const { mod } = await nas(t);
+  const org = '한국지능정보사회진흥원';
+  const files = names => names.map(name => ({ name, isdir: false }));
+  assert.equal(mod.matchClientLogo(org, files([`${org}(NIA).png`, `${org}_로고.png`])).error, 'client_logo_ambiguous');
+  assert.equal(mod.matchClientLogo(org, files([`${org}.png`, `${org}.jpg`, `${org}(NIA).png`])).error, 'client_logo_ambiguous');
+  assert.equal(mod.matchClientLogo(org, files([`(재)${org}.png`, `재단법인${org}.jpg`, `${org}(NIA).png`])).error, 'client_logo_ambiguous');
+  assert.equal(mod.matchClientLogo(org, files(['NIA.png', '한국지능정보사회.png'])).error, 'client_logo_not_found');
+  assert.equal(mod.matchClientLogo(org, [...files([`${org}.svg`, `${org}.png.txt`]), { name: `${org}.png`, isdir: true }]).error, 'client_logo_not_found');
+  assert.equal(mod.matchClientLogo(org, files([`${org}(NIA).png`, `${org}(NIA).png`])).filename, `${org}(NIA).png`);
+  assert.equal(mod.matchClientLogo('---_ .', files(['임의기관.png'])).error, 'invalid_client_org');
+  assert.equal(mod.matchClientLogo('', files(['임의기관.png'])).error, 'invalid_client_org');
+});
+test('client logo included-name lookup downloads original filename and skips ambiguous candidates', async t => {
+  const org = '한국지능정보사회진흥원', filename = `${org}(NIA).png`;
+  let ambiguous = false;
+  const { mod, calls } = await nas(t, p => p.method === 'list' && Response.json({ success: true, data: { files: (ambiguous ? [filename, `${org}_로고.png`] : [filename]).map(name => ({ name, isdir: false })) } }));
+  const result = await mod.fetchClientLogo(org);
+  assert.equal(result.ok, true); assert.equal(result.filename, filename);
+  assert.equal(result.dataUri, 'data:image/png;base64,' + png.toString('base64'));
+  assert(JSON.parse(calls.find(c => c.method === 'download').path)[0].endsWith('/' + filename));
+  ambiguous = true;
+  assert.equal((await mod.fetchClientLogo(org)).error, 'client_logo_ambiguous');
+  assert.equal(calls.filter(c => c.method === 'download').length, 1);
+  assert.equal(calls.filter(c => c.method === 'logout').length, 2);
 });
 test('client logo reads only designated folder with pagination then downloads one PNG and logs out', async t => {
   const { mod, calls } = await nas(t, p => {
