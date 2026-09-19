@@ -3276,7 +3276,7 @@ app.get('/ppt-templates', async (c) => {
         <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between flex-shrink-0">
           <div>
             <h3 class="font-bold text-slate-800 text-base"><i class="fas fa-layer-group mr-2 text-violet-500"></i>마스터 템플릿 관리</h3>
-            <p class="text-xs text-slate-400 mt-0.5">PPT 생성 시 활성화된 마스터의 슬라이드 마스터·테마·레이아웃이 전체 슬라이드에 적용됩니다</p>
+            <p class="text-xs text-slate-400 mt-0.5">생성 시 목차에 맞는 활성 마스터 레이아웃과 사업명·주관기관 로고를 적용합니다. 매칭 실패·로고 누락은 생성 보고서에 표시됩니다.</p>
           </div>
           <button onclick="closeMasterModal()" class="text-slate-400 hover:text-slate-700 ml-4"><i class="fas fa-times text-lg"></i></button>
         </div>

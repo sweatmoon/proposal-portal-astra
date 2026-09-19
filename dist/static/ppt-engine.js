@@ -129,6 +129,193 @@ const PptMenuRegistry = (() => {
  * @param {Array<{zip: JSZip, mergeStrategy?: string, slideCount?: number}>} parts
  * @returns {Promise<JSZip>} 합본된 JSZip 객체
  */
+const MASTER_P = 'http://schemas.openxmlformats.org/presentationml/2006/main';
+const MASTER_A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+const MASTER_R = 'http://schemas.openxmlformats.org/package/2006/relationships';
+const MASTER_OR = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+const masterNodes = (root, name, ns = MASTER_P) => Array.from(root.getElementsByTagNameNS(ns, name));
+const masterXml = doc => new XMLSerializer().serializeToString(doc);
+function masterResolvePath(owner, target) {
+  if (!target || /^[a-z][a-z0-9+.-]*:/i.test(target)) throw new Error('외부 PPT 관계를 내부 경로로 사용할 수 없습니다.');
+  const path = target.startsWith('/') ? target.slice(1) : owner.slice(0, owner.lastIndexOf('/') + 1) + target;
+  const out = [];
+  for (const part of path.split('/')) {
+    if (part === '..') { if (!out.length) throw new Error('잘못된 PPT 관계 경로입니다.'); out.pop(); }
+    else if (part && part !== '.') out.push(part);
+  }
+  return out.join('/');
+}
+const masterRelsPath = path => path.replace(/([^/]+)$/, '_rels/$1.rels');
+async function masterDoc(zip, path) {
+  const file = zip.file(path);
+  if (!file) throw new Error('PPT 관계 파일 누락: ' + path);
+  return ProposalTemplate.parse(await file.async('string'));
+}
+function logoImageInfo(dataUri) {
+  const m = /^data:image\/(png|jpeg);base64,([A-Za-z0-9+/=]+)$/.exec(dataUri || '');
+  if (!m || m[2].length > 12 * 1024 * 1024) throw new Error('로고 이미지 형식 또는 크기가 올바르지 않습니다.');
+  const bytes = Uint8Array.from(atob(m[2]), c => c.charCodeAt(0));
+  let width = 0, height = 0;
+  if (m[1] === 'png' && bytes.length >= 24 && [137, 80, 78, 71, 13, 10, 26, 10].every((v, i) => bytes[i] === v)) {
+    const view = new DataView(bytes.buffer); width = view.getUint32(16); height = view.getUint32(20);
+  } else if (m[1] === 'jpeg' && bytes[0] === 255 && bytes[1] === 216) {
+    for (let i = 2; i + 8 < bytes.length;) {
+      if (bytes[i++] !== 255) break;
+      const marker = bytes[i++], len = bytes[i] * 256 + bytes[i + 1];
+      if (marker === 218 || marker === 217 || len < 2 || i + len > bytes.length) break;
+      if ([192, 193, 194, 195, 197, 198, 199, 201, 202, 203, 205, 206, 207].includes(marker)) {
+        height = bytes[i + 3] * 256 + bytes[i + 4]; width = bytes[i + 5] * 256 + bytes[i + 6]; break;
+      }
+      i += len;
+    }
+  }
+  if (!width || !height || width > 30000 || height > 30000) throw new Error('로고 이미지 크기를 확인할 수 없습니다.');
+  return { bytes, width, height, extension: m[1] === 'png' ? 'png' : 'jpg' };
+}
+async function prepareActiveMaster(zip, vm) {
+  const warnings = [], pd = vm._raw || vm;
+  const pres = await masterDoc(zip, 'ppt/presentation.xml'), size = masterNodes(pres, 'sldSz')[0];
+  if (!size) throw new Error('활성 마스터의 슬라이드 크기가 없습니다.');
+  const rels = await masterDoc(zip, 'ppt/_rels/presentation.xml.rels');
+  const masters = masterNodes(rels, 'Relationship', MASTER_R).filter(r => r.getAttribute('Type').endsWith('/slideMaster') && r.getAttribute('TargetMode') !== 'External')
+    .map(r => masterResolvePath('ppt/presentation.xml', r.getAttribute('Target')));
+  if (!masters.length) throw new Error('활성 파일에 슬라이드 마스터가 없습니다.');
+  const parts = new Set(masters), layouts = [];
+  for (const path of masters) {
+    const mr = await masterDoc(zip, masterRelsPath(path));
+    for (const rel of masterNodes(mr, 'Relationship', MASTER_R).filter(r => r.getAttribute('Type').endsWith('/slideLayout'))) {
+      const target = masterResolvePath(path, rel.getAttribute('Target')), doc = await masterDoc(zip, target);
+      const lr = await masterDoc(zip, masterRelsPath(target));
+      const parent = masterNodes(lr, 'Relationship', MASTER_R).find(r => r.getAttribute('Type').endsWith('/slideMaster'));
+      if (!parent || masterResolvePath(target, parent.getAttribute('Target')) !== path) throw new Error('활성 레이아웃의 마스터 연결이 올바르지 않습니다.');
+      parts.add(target); layouts.push({ path: target, name: masterNodes(doc, 'cSld')[0]?.getAttribute('name') || '' });
+    }
+  }
+  const docs = [], slots = [];
+  const signatures = new Map();
+  for (const path of parts) {
+    const doc = await masterDoc(zip, path), rd = await masterDoc(zip, masterRelsPath(path));
+    const unresolved = ProposalTemplate.replace(doc, token => token === '[감리사업명]' ? (pd.projectTitle || vm.project?.title || undefined) : undefined);
+    if (unresolved.includes('[감리사업명]')) warnings.push('마스터 [감리사업명]: 저장된 감리사업명이 없어 미치환 상태로 남겼습니다.');
+    for (const pic of masterNodes(doc, 'pic')) {
+      const nv = masterNodes(pic, 'cNvPr')[0], blip = masterNodes(pic, 'blip', MASTER_A)[0];
+      const rid = blip?.getAttributeNS(MASTER_OR, 'embed');
+      const rel = masterNodes(rd, 'Relationship', MASTER_R).find(r => r.getAttribute('Id') === rid && r.getAttribute('Type').endsWith('/image') && r.getAttribute('TargetMode') !== 'External');
+      if (!rel) continue;
+      const target = masterResolvePath(path, rel.getAttribute('Target')), file = zip.file(target);
+      if (!file) throw new Error('마스터 이미지 관계의 파일이 없습니다.');
+      const named = [nv?.getAttribute('name'), nv?.getAttribute('descr')].some(s => /^(?:\[)?주관기관\s*로고(?:\])?$/.test((s || '').trim()));
+      let placeholder = named;
+      if (!placeholder) {
+        if (!signatures.has(target)) {
+          const bytes = await file.async('uint8array');
+          // 사용자 제공 빨간 안내 그림의 정확한 SHA256. 임의 위치/색상/회사 로고는 추정하지 않는다.
+          const hash = bytes.length === 735 ? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))).map(b => b.toString(16).padStart(2, '0')).join('') : '';
+          signatures.set(target, hash === 'bb954afa50472268925f0035fdbad85896e71397fb14a814d9c6d1237a9bea58');
+        }
+        placeholder = signatures.get(target);
+      }
+      if (placeholder) slots.push({ pic, blip, rd });
+    }
+    docs.push({ path, doc, rd });
+  }
+  if (slots.length) {
+    try {
+      const id = Number(pd.proposalId);
+      if (!Number.isSafeInteger(id) || id <= 0) throw new Error('사업 ID가 없습니다.');
+      const response = await fetch(`/api/projects/${id}/client-logo`, { cache: 'no-store' });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error([result.error || '조회 실패', result.stage, result.code].filter(v => v !== undefined).join(' / '));
+      if (result.projectId !== id || result.clientOrg !== String(pd.clientOrg || vm.project?.client || '').trim()) throw new Error('로고 응답의 사업/주관기관이 일치하지 않습니다.');
+      const image = logoImageInfo(result.dataUri);
+      let filename = `active-client-logo.${image.extension}`, i = 1;
+      while (zip.file('ppt/media/' + filename)) filename = `active-client-logo-${i++}.${image.extension}`;
+      const ct = await masterDoc(zip, '[Content_Types].xml'), ns = ct.documentElement.namespaceURI;
+      for (const { pic } of slots) {
+        const xf = masterNodes(pic, 'xfrm', MASTER_A)[0], off = xf && masterNodes(xf, 'off', MASTER_A)[0], ext = xf && masterNodes(xf, 'ext', MASTER_A)[0];
+        if (!off || !ext || ![+off.getAttribute('x'), +off.getAttribute('y'), +ext.getAttribute('cx'), +ext.getAttribute('cy')].every(Number.isFinite) || +ext.getAttribute('cx') <= 0 || +ext.getAttribute('cy') <= 0) throw new Error('주관기관 로고 도형의 위치·크기가 올바르지 않습니다.');
+      }
+      zip.file('ppt/media/' + filename, image.bytes);
+      for (const { pic, blip, rd } of slots) {
+        const xf = masterNodes(pic, 'xfrm', MASTER_A)[0], off = xf && masterNodes(xf, 'off', MASTER_A)[0], ext = xf && masterNodes(xf, 'ext', MASTER_A)[0];
+        if (!off || !ext) throw new Error('주관기관 로고 도형의 위치·크기가 없습니다.');
+        const w = +ext.getAttribute('cx'), h = +ext.getAttribute('cy'), scale = Math.min(w / image.width, h / image.height);
+        const nw = Math.round(image.width * scale), nh = Math.round(image.height * scale);
+        off.setAttribute('x', String(Math.round(+off.getAttribute('x') + (w - nw) / 2)));
+        off.setAttribute('y', String(Math.round(+off.getAttribute('y') + (h - nh) / 2)));
+        ext.setAttribute('cx', String(nw)); ext.setAttribute('cy', String(nh));
+        masterNodes(pic, 'srcRect', MASTER_A).forEach(n => n.parentNode.removeChild(n));
+        const ids = new Set(masterNodes(rd, 'Relationship', MASTER_R).map(r => r.getAttribute('Id')));
+        let n = 1; while (ids.has(`rIdClientLogo${n}`)) n++;
+        const rel = rd.createElementNS(MASTER_R, 'Relationship');
+        rel.setAttribute('Id', `rIdClientLogo${n}`); rel.setAttribute('Type', MASTER_OR + '/image'); rel.setAttribute('Target', '../media/' + filename);
+        rd.documentElement.appendChild(rel); blip.setAttributeNS(MASTER_OR, 'r:embed', `rIdClientLogo${n}`);
+      }
+      if (!Array.from(ct.getElementsByTagNameNS(ns, 'Default')).some(n => n.getAttribute('Extension') === image.extension)) {
+        const d = ct.createElementNS(ns, 'Default'); d.setAttribute('Extension', image.extension); d.setAttribute('ContentType', image.extension === 'png' ? 'image/png' : 'image/jpeg'); ct.documentElement.appendChild(d);
+        zip.file('[Content_Types].xml', masterXml(ct));
+      }
+    } catch (error) { warnings.push('주관기관 로고 미치환: ' + error.message + ' — 안내 그림을 유지했습니다.'); }
+  }
+  for (const { path, doc, rd } of docs) {
+    zip.file(path, masterXml(doc)); zip.file(masterRelsPath(path), masterXml(rd));
+  }
+  return { zip, layouts, size: { w: +size.getAttribute('cx'), h: +size.getAttribute('cy') }, warnings: [...new Set(warnings)] };
+}
+const SECTION_MASTER_LAYOUTS = {
+  SECTION_SCHEDULE: ['1. 감리 수행 일정', '2. 감리 수행 절차', '3. 시정조치확인 절차'],
+  SECTION_MANPOWER: ['1. 감리 인력 구성', '2. 총괄 감리원', '3. 분야별 감리 인력'],
+  SECTION_QUALITY: ['1. 감리 품질보증 방안', '2. 감리 자동화 도구 적용 계획', '3. 감리 지원 사항'],
+  SECTION_COMPANY: ['1. 일반 현황', '2. 조직 및 인원 현황', '3. 보유 기술 및 사업 실적'],
+};
+async function planActiveLayouts(part, menu, menus, master) {
+  const warnings = part.warnings || (part.warnings = []), planned = {};
+  const pres = await masterDoc(part.zip, 'ppt/presentation.xml'), size = masterNodes(pres, 'sldSz')[0];
+  if (!size || +size.getAttribute('cx') !== master.size.w || +size.getAttribute('cy') !== master.size.h) {
+    warnings.push('활성 마스터와 본문 장표 크기가 달라 원본 레이아웃을 유지했습니다. 임의 확대·축소하지 않습니다.'); return;
+  }
+  let parent = menu, section, seen = new Set();
+  while (parent && !seen.has(parent.id)) {
+    seen.add(parent.id); if (SECTION_MASTER_LAYOUTS[parent.menu_code]) { section = parent.menu_code; break; }
+    parent = menus.find(m => String(m.id) === String(parent.parent_id));
+  }
+  const number = String(menu.menu_number || '').replace(/^[가-힣][.\s]+/, '').match(/^(\d+)/)?.[1];
+  const explicit = String(menu.rule?.target_layout_name || '').trim();
+  const configured = explicit || (section && SECTION_MASTER_LAYOUTS[section][Number(number) - 1]);
+  const key = name => String(name || '').replace(/\s+/g, '');
+  for (const path of await ProposalTemplate.slidePaths(part.zip)) {
+    const rd = await masterDoc(part.zip, masterRelsPath(path));
+    const rel = masterNodes(rd, 'Relationship', MASTER_R).find(r => r.getAttribute('Type').endsWith('/slideLayout') && r.getAttribute('TargetMode') !== 'External');
+    let name = configured;
+    if (!name && rel) {
+      const layout = await masterDoc(part.zip, masterResolvePath(path, rel.getAttribute('Target')));
+      name = masterNodes(layout, 'cSld')[0]?.getAttribute('name');
+    }
+    const candidates = name ? master.layouts.filter(l => key(l.name) === key(name)) : [];
+    if (candidates.length !== 1) {
+      const msg = `활성 마스터 레이아웃 ${name || '(미지정)'}: ${candidates.length ? '동일 이름 중복' : '매칭 없음'}`;
+      if (explicit) throw new Error(msg + '. 목차의 지정 레이아웃을 확인하세요.');
+      warnings.push(msg + '. 원본 레이아웃을 유지했습니다.'); continue;
+    }
+    planned[path] = candidates[0].path;
+  }
+  part.activeLayouts = planned;
+}
+async function reconnectActiveLayout(zip, slidePath, layoutPath) {
+  if (!zip.file(layoutPath)) throw new Error('활성 레이아웃 파일이 없습니다.');
+  const relPath = masterRelsPath(slidePath), rd = await masterDoc(zip, relPath);
+  const layouts = masterNodes(rd, 'Relationship', MASTER_R).filter(r => r.getAttribute('Type').endsWith('/slideLayout'));
+  if (layouts.length !== 1) throw new Error('본문의 슬라이드 레이아웃 연결이 단일하지 않습니다.');
+  layouts[0].setAttribute('Target', '../slideLayouts/' + layoutPath.split('/').pop());
+  layouts[0].removeAttribute('TargetMode'); zip.file(relPath, masterXml(rd));
+  const doc = await masterDoc(zip, slidePath);
+  // 슬라이드 자체 배경/숨김 플래그가 새 마스터를 가리지 않게 하되 본문 도형/표는 그대로 둔다.
+  doc.documentElement.setAttribute('showMasterSp', '1');
+  const cs = masterNodes(doc, 'cSld')[0];
+  if (cs) Array.from(cs.childNodes).filter(n => n.localName === 'bg').forEach(n => cs.removeChild(n));
+  zip.file(slidePath, masterXml(doc));
+}
+
 async function mergePresentationZips(parts) {
   const usable = parts.filter(p => p && p.zip);
   if (!usable.length) throw new Error('병합할 슬라이드가 없습니다.');
@@ -137,11 +324,11 @@ async function mergePresentationZips(parts) {
   // 맨 앞 파트가 MASTER_ONLY면 해당 ZIP을 baseZip으로 사용하고
   // 기존 슬라이드(sldIdLst)를 비운 뒤 콘텐츠 파트 전체를
   // FOREIGN_TEMPLATE 방식으로 병합한다.
-  // 이렇게 하면 마스터의 slideMaster/Theme/Layout은 그대로 유지되고
-  // 콘텐츠 슬라이드들은 _mergeForeign()의 검증된 로직으로 안전하게 추가된다.
+  // 활성 디자인은 보존하고 본문은 안전하게 복사한다.
+  // 매칭된 본문 슬라이드의 layout 관계는 _mergeForeign()에서 활성 레이아웃으로 다시 연결한다.
   const isMasterFirst = usable[0].mergeStrategy === 'MASTER_ONLY';
-  const baseZip       = isMasterFirst ? usable[0].zip : usable[0].zip;
-  const contentParts  = isMasterFirst ? usable.slice(1) : usable.slice(1);
+  const baseZip = usable[0].zip;
+  const contentParts = usable.slice(1);
   // contentParts[0] = baseZip의 원본 (마스터 없는 경우 index 0, 마스터 있는 경우 index 1)
   // 단, 마스터가 없으면 usable[0]이 그대로 baseZip이므로
   // 아래 루프는 항상 index 0 부터 (baseZip 슬라이드 포함 여부 다름)
@@ -155,8 +342,8 @@ async function mergePresentationZips(parts) {
   // MASTER_ONLY: baseZip(마스터)의 기존 슬라이드 목록을 비운다
   // → slideMaster/Theme/Layout 체인은 유지, 슬라이드만 제거
   if (isMasterFirst) {
-    presXml     = presXml.replace(/<p:sldIdLst>[\s\S]*?<\/p:sldIdLst>/, '<p:sldIdLst></p:sldIdLst>');
-    presRelsXml = presRelsXml.replace(/<Relationship\b[^/]*Type="[^"]*\/slide"[^/]*\/>/g, '');
+    presXml = presXml.replace(/<p:sldIdLst\b[^>]*(?:\/>|>[\s\S]*?<\/p:sldIdLst>)/, '<p:sldIdLst></p:sldIdLst>');
+    presRelsXml = presRelsXml.replace(/<Relationship\b[^>]*\/>/g, tag => /Type="[^"]*\/slide"/.test(tag) ? '' : tag);
     console.log('[PptEngine] 마스터 baseZip 슬라이드 초기화 완료');
   }
 
@@ -190,7 +377,7 @@ async function mergePresentationZips(parts) {
     if (isForeign) {
       // ── FOREIGN_TEMPLATE: master/theme/layout/media까지 복사 ──
       await _mergeForeign({
-        baseZip, srcZip, srcPresXml, srcPresRels,
+        baseZip, srcZip, srcPresXml, srcPresRels, activeLayouts: isMasterFirst ? part.activeLayouts : null,
         presXmlRef: { val: presXml },
         presRelsXmlRef: { val: presRelsXml },
         ctXmlRef: { val: ctXml },
@@ -250,15 +437,13 @@ async function mergePresentationZips(parts) {
     }
   }
 
-  // sldIdLst 태그가 없으면 삽입 (마스터 전용 PPTX는 sldIdLst 자체가 없을 수 있음)
+  // 빈 목록도 확장하고 OOXML 순서(마스터/노트/유인물 → 슬라이드 목록 → 크기)를 지킨다.
+  presXml = presXml.replace(/<p:sldIdLst\s*\/>/, '<p:sldIdLst></p:sldIdLst>');
   if (!presXml.includes('</p:sldIdLst>')) {
-    // sldMasterIdLst 뒤에 삽입
-    if (presXml.includes('</p:sldMasterIdLst>')) {
-      presXml = presXml.replace('</p:sldMasterIdLst>', '</p:sldMasterIdLst><p:sldIdLst></p:sldIdLst>');
-    } else {
-      // fallback: </p:presentation> 바로 앞에 삽입
-      presXml = presXml.replace('</p:presentation>', '<p:sldIdLst></p:sldIdLst></p:presentation>');
-    }
+    const doc = ProposalTemplate.parse(presXml), list = doc.createElementNS(MASTER_P, 'p:sldIdLst');
+    const anchor = Array.from(doc.documentElement.childNodes).find(n => ['sldSz', 'notesSz', 'smartTags', 'embeddedFontLst', 'custShowLst', 'photoAlbum', 'custDataLst', 'kinsoku', 'defaultTextStyle', 'modifyVerifier', 'extLst'].includes(n.localName));
+    doc.documentElement.insertBefore(list, anchor || null);
+    presXml = masterXml(doc).replace(/<p:sldIdLst\s*\/>/, '<p:sldIdLst></p:sldIdLst>');
   }
 
   presRelsXml = presRelsXml.replace('</Relationships>', newRels + '</Relationships>');
@@ -405,7 +590,7 @@ async function _injectMaster({ baseZip, masterZip, presXmlRef, presRelsXmlRef, c
  *   - 파일명 충돌이 구조적으로 불가능
  *   - rels XML 교체도 단순 문자열 치환 한 방법으로 완결
  */
-async function _mergeForeign({ baseZip, srcZip, srcPresXml, srcPresRels, counters,
+async function _mergeForeign({ baseZip, srcZip, srcPresXml, srcPresRels, activeLayouts, counters,
                                 foreignPathMap, presXmlRef, presRelsXmlRef, ctXmlRef,
                                 newRels_ref, newIds_ref, newCt_ref }) {
   let { maxRid, maxSldId, sc } = counters;
@@ -541,6 +726,11 @@ async function _mergeForeign({ baseZip, srcZip, srcPresXml, srcPresRels, counter
     //  presentation.xml에는 slides/ 상대경로로 등록해야 함)
     // → 이미 복사된 파일을 그대로 사용, newName은 등록용만
 
+    const activeLayout = activeLayouts?.[masterResolvePath('ppt/presentation.xml', tgt)];
+    if (activeLayout) {
+      const destSlide = masterResolvePath('ppt/presentation.xml', prefixedTgt);
+      await reconnectActiveLayout(baseZip, destSlide, activeLayout);
+    }
     // presentation.xml.rels에 slide 등록
     const rid   = `rId${++maxRid}`;
     const sldId = ++maxSldId;
@@ -771,11 +961,15 @@ async function generateProposalPpt(vm, selectedCodes = null) {
   if (!enabledMenus.length) throw new Error('활성화된 본문 목차가 없습니다.');
   let masterPart = null;
   try {
-    const response = await fetch('/api/ppt-menus/master-templates/active');
+    const response = await fetch('/api/ppt-menus/master-templates/active', { cache: 'no-store' });
     if (!response.ok) throw new Error('마스터 조회 실패');
     const json = await response.json();
     if (!json.ok) throw new Error(json.error || '마스터 조회 실패');
-    if (json.data?.pptx_b64) masterPart = { zip: await JSZip.loadAsync(json.data.pptx_b64, { base64: true }), mergeStrategy: 'MASTER_ONLY' };
+    if (json.data?.pptx_b64) {
+      const prepared = await prepareActiveMaster(await JSZip.loadAsync(json.data.pptx_b64, { base64: true }), vm);
+      masterPart = { ...prepared, mergeStrategy: 'MASTER_ONLY' };
+      report.warnings.push(...prepared.warnings);
+    }
     else report.warnings.push('활성 마스터가 없습니다. 각 템플릿의 디자인을 유지합니다.');
   } catch (error) { report.warnings.push('마스터 로드 실패: ' + error.message); }
   const parts = [];
@@ -788,6 +982,7 @@ async function generateProposalPpt(vm, selectedCodes = null) {
       showAutoAlert(`본문 생성 중: ${report.entries.length}/${enabledMenus.length}`, false);
       const part = await generateMenuPpt(menu, vm);
       if (!part?.zip || !part.slideCount) throw new Error('생성된 슬라이드가 없습니다. 인력·데이터·템플릿을 확인하세요.');
+      if (masterPart) await planActiveLayouts(part, menu, registry.list, masterPart);
       entry.warnings = part.warnings || [];
       entry.slides = part.slideCount;
       entry.status = entry.warnings.length ? '검토 필요' : '생성됨';

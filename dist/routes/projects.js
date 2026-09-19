@@ -5,6 +5,7 @@
  */
 import { Hono } from 'hono';
 import { query, queryOne } from '../db/client.js';
+import { fetchClientLogo } from '../lib/nas-client.js';
 const app = new Hono();
 // ── 목록 ──────────────────────────────────────────────────────
 app.get('/', async (c) => {
@@ -51,6 +52,26 @@ app.get('/stats', async (c) => {
   `);
     const total = await queryOne('SELECT COUNT(*) AS cnt FROM audit_projects');
     return c.json({ ok: true, total: Number(total?.cnt ?? 0), byStatus: rows });
+});
+// 주관기관명은 요청 문자열이 아니라 저장된 사업 정보에서 읽는다. 지정 NAS 폴더만 조회.
+app.get('/:id/client-logo', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (!Number.isSafeInteger(id) || id <= 0)
+        return c.json({ ok: false, error: 'invalid_id' }, 400);
+    c.header('Cache-Control', 'no-store');
+    try {
+        const project = await queryOne('SELECT client_org FROM audit_projects WHERE id = $1', [id]);
+        if (!project)
+            return c.json({ ok: false, error: 'project_not_found' }, 404);
+        const clientOrg = String(project.client_org ?? '').trim();
+        if (!clientOrg)
+            return c.json({ ok: false, error: 'client_org_missing' }, 422);
+        const result = await fetchClientLogo(clientOrg);
+        return c.json({ ...result, projectId: id, clientOrg });
+    }
+    catch {
+        return c.json({ ok: false, error: 'client_logo_unavailable' }, 503);
+    }
 });
 // ── 상세 ──────────────────────────────────────────────────────
 app.get('/:id', async (c) => {

@@ -448,6 +448,66 @@ export function fetchPersonnelPhotoResults(personNames: string[]): Promise<Perso
   return task
 }
 
+const CLIENT_LOGO_FOLDER = '/activo/04.제안팀/99.악티보포털참조용/01.제안서 작성용 로고, 도장/주관기관 로고(누끼 딴거)'
+export type ClientLogoResult = { ok: boolean; dataUri?: string; filename?: string; error?: string; stage?: string; code?: number }
+const logoKey = (s: string) => s.normalize('NFKC').toLowerCase().replace(/[\s._-]+/g, '')
+const legalLogoKey = (s: string) => logoKey(s).replace(/^(?:\((?:재|사|주)\)|재단법인|사단법인|주식회사)/, '')
+
+// 부분 문자열/약칭/숫자 접미사를 추정하지 않는다. 동일 점수 후보가 여러 개면 명시적 오류.
+export function matchClientLogo(org: string, files: { name: string; isdir: boolean }[]): ClientLogoResult {
+  if (!validPhotoName(org)) return { ok: false, error: 'invalid_client_org' }
+  const names = [...new Set(files.filter(f => !f.isdir && typeof f.name === 'string' && validPhotoName(f.name) && /\.(png|jpe?g)$/i.test(f.name)).map(f => f.name))]
+  const base = (n: string) => n.replace(/\.(png|jpe?g)$/i, '')
+  const exact = names.filter(n => logoKey(base(n)) === logoKey(org))
+  const candidates = exact.length ? exact : names.filter(n => legalLogoKey(base(n)) === legalLogoKey(org))
+  return candidates.length === 1 ? { ok: true, filename: candidates[0] }
+    : { ok: false, error: candidates.length ? 'client_logo_ambiguous' : 'client_logo_not_found' }
+}
+
+export function fetchClientLogo(org: string): Promise<ClientLogoResult> {
+  // 사진 조회와 같은 FileStation 세션 잠금 사용. 데이터는 요청 사이에 보관하지 않는다.
+  const task = photoQueue.then(() => loadClientLogo(org))
+  photoQueue = task.catch(() => {})
+  return task
+}
+async function loadClientLogo(org: string): Promise<ClientLogoResult> {
+  if (!validPhotoName(org)) return { ok: false, error: 'invalid_client_org' }
+  if (!NAS_BASE_URL || !NAS_USERNAME || !NAS_PASSWORD) return { ok: false, error: 'nas_not_configured', stage: 'configuration' }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let sid: string | undefined
+    try {
+      const auth = photoJson(await photoRequest({ api: 'SYNO.API.Auth', version: '6', method: 'login', account: NAS_USERNAME, passwd: NAS_PASSWORD, session: 'FileStation', format: 'sid' }, 'login'), 'login')
+      if (typeof auth.data?.sid !== 'string' || !auth.data.sid) throw new PhotoNasError('login', undefined, 'nas_invalid_response')
+      sid = auth.data.sid
+      const files: { name: string; isdir: boolean }[] = []
+      let offset = 0
+      while (true) {
+        const list = photoJson(await photoRequest({ api: 'SYNO.FileStation.List', version: '2', method: 'list', folder_path: CLIENT_LOGO_FOLDER, offset: String(offset), limit: '500', _sid: sid! }, 'list'), 'list')
+        if (!Array.isArray(list.data?.files)) throw new PhotoNasError('list', undefined, 'nas_invalid_response')
+        files.push(...list.data.files); offset += list.data.files.length
+        const total = list.data.total
+        if (typeof total === 'number' ? offset >= total : list.data.files.length < 500) break
+        if (!list.data.files.length || offset >= 20000) throw new PhotoNasError('list', undefined, 'nas_incomplete_listing')
+      }
+      const match = matchClientLogo(org, files)
+      if (!match.ok) return match
+      const buf = await photoRequest({ api: 'SYNO.FileStation.Download', version: '2', method: 'download', mode: 'open', path: JSON.stringify([`${CLIENT_LOGO_FOLDER}/${match.filename}`]), _sid: sid! }, 'download')
+      if (buf.length > 8 * 1024 * 1024) throw new PhotoNasError('download', undefined, 'client_logo_too_large')
+      const png = buf.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+      const jpg = buf.length > 3 && buf[0] === 255 && buf[1] === 216 && buf[2] === 255
+      if (!png && !jpg) { photoJson(buf, 'download'); throw new PhotoNasError('download', undefined, 'nas_invalid_image') }
+      return { ok: true, filename: match.filename, dataUri: `data:image/${png ? 'png' : 'jpeg'};base64,${buf.toString('base64')}` }
+    } catch (e) {
+      const err = e instanceof PhotoNasError ? e : new PhotoNasError('lookup', undefined, 'nas_invalid_response')
+      if (attempt === 0 && (err.kind === 'nas_connection_error' || [106, 107, 119].includes(err.code ?? 0))) continue
+      return { ok: false, error: err.kind, stage: err.stage, code: err.code }
+    } finally {
+      if (sid) await photoRequest({ api: 'SYNO.API.Auth', version: '6', method: 'logout', session: 'FileStation', _sid: sid }, 'logout').catch(() => {})
+    }
+  }
+  return { ok: false, error: 'nas_connection_error' }
+}
+
 async function loadPersonnelPhotoResults(names: string[]): Promise<PersonnelPhotoResult[]> {
   const results = new Map<string, PersonnelPhotoResult>()
   for (const name of names) {

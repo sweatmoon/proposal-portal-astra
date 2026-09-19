@@ -47,6 +47,117 @@ function data() {
 }
 const docText = (c, xml) => c.ProposalTemplate.text(c.ProposalTemplate.parse(xml));
 
+const activeMasterB64 = readFileSync(new URL('../artifacts/user_active_master.pptx', import.meta.url)).toString('base64');
+const logoPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
+function masterSandbox(extra = {}) {
+  const calls = [];
+  const c = sandbox({ crypto: globalThis.crypto, Uint8Array, DataView,
+    fetch: async url => { calls.push(url); return { ok: true, json: async () => ({ ok: true, projectId: 42, clientOrg: '시험기관', filename: '시험기관.png', dataUri: 'data:image/png;base64,' + logoPng }) }; }, ...extra });
+  return Object.assign(c, { masterCalls: calls, masterRelsPath: vm.runInContext('masterRelsPath', c) });
+}
+const masterData = () => ({ ...data(), proposalId: 42, clientOrg: '시험기관', projectTitle: '시험 감리사업 & <원본>' });
+async function preparedMaster(c, pd = masterData()) {
+  return c.prepareActiveMaster(await JSZip.loadAsync(activeMasterB64, { base64: true }), c.buildProjectViewModel(pd));
+}
+test('active master substitutes split project title and only designated red logo with distinct image relationship', async () => {
+  const c = masterSandbox(), T = c.ProposalTemplate, before = await JSZip.loadAsync(activeMasterB64, { base64: true });
+  const result = await preparedMaster(c);
+  assert.equal(result.layouts.length, 37); assert.equal(result.warnings.length, 0);
+  assert.deepEqual(c.masterCalls, ['/api/projects/42/client-logo']);
+  for (const path of ['ppt/slideMasters/slideMaster1.xml', 'ppt/slideLayouts/slideLayout34.xml', 'ppt/slideLayouts/slideLayout35.xml']) {
+    const txt = docText(c, await result.zip.file(path).async('string'));
+    assert(txt.includes(masterData().projectTitle)); assert(!txt.includes('[감리사업명]'));
+  }
+  const path = 'ppt/slideMasters/slideMaster1.xml';
+  const oldDoc = T.parse(await before.file(path).async('string')), doc = T.parse(await result.zip.file(path).async('string'));
+  const oldPics = T.nodes(oldDoc, 'pic', P), pics = T.nodes(doc, 'pic', P);
+  assert.equal(pics.length, oldPics.length);
+  for (let i = 0; i < pics.length; i++) {
+    const oldRid = T.nodes(oldPics[i], 'blip')[0].getAttribute('r:embed');
+    if (oldRid !== 'rId42') assert.equal(serialized(pics[i]), serialized(oldPics[i]));
+    else {
+      const newRid = T.nodes(pics[i], 'blip')[0].getAttribute('r:embed'); assert.notEqual(newRid, oldRid);
+      const rels = T.parse(await result.zip.file(c.masterRelsPath(path)).async('string'));
+      const rel = T.nodes(rels, 'Relationship', R).find(r => r.getAttribute('Id') === newRid);
+      const logoPath = c.masterResolvePath(path, rel.getAttribute('Target'));
+      assert.deepEqual(await result.zip.file(logoPath).async('nodebuffer'), Buffer.from(logoPng, 'base64'));
+      const ext = T.nodes(pics[i], 'ext')[0]; assert.equal(ext.getAttribute('cx'), ext.getAttribute('cy'));
+    }
+  }
+  for (const name of ['image1.png', 'image2.jpeg', 'image3.png', 'image4.png']) assert.deepEqual(await before.file('ppt/media/' + name).async('nodebuffer'), await result.zip.file('ppt/media/' + name).async('nodebuffer'));
+});
+test('active master preserves placeholder on ambiguous missing or wrong-project logo responses and missing project title', async () => {
+  for (const response of [{ ok: false, error: 'client_logo_ambiguous' }, { ok: false, error: 'client_logo_not_found' }, { ok:true,projectId:99,clientOrg:'시험기관',dataUri:'data:image/png;base64,'+logoPng }, { ok:true,projectId:42,clientOrg:'다른기관',dataUri:'data:image/png;base64,'+logoPng }, { ok:true,projectId:42,clientOrg:'시험기관',dataUri:'data:text/html;base64,WA==' }]) {
+    const c = masterSandbox({ fetch: async () => ({ ok:true,json:async()=>response }) });
+    const result = await preparedMaster(c, { ...masterData(), projectTitle: '' });
+    assert(result.warnings.some(w => w.includes('로고 미치환'))); assert(result.warnings.some(w => w.includes('[감리사업명]')));
+    const doc = c.ProposalTemplate.parse(await result.zip.file('ppt/slideMasters/slideMaster1.xml').async('string'));
+    assert(c.ProposalTemplate.nodes(doc, 'blip').some(b => b.getAttribute('r:embed') === 'rId42'));
+    assert(!Object.keys(result.zip.files).some(p => p.includes('active-client-logo')));
+  }
+});
+test('active master mapping rewires each section to its numbered layout and preserves content shapes', async () => {
+  const c = masterSandbox(), T = c.ProposalTemplate, master = await preparedMaster(c);
+  const expected = [['SECTION_SCHEDULE','1.1','1. 감리 수행 일정'], ['SECTION_MANPOWER','3.6','3. 분야별 감리 인력'], ['SECTION_QUALITY','3.5','3. 감리 지원 사항'], ['SECTION_COMPANY','1.1','1. 일반 현황']];
+  const parts = [], sourceBodies = [];
+  for (const [section, number, layout] of expected) {
+    const m = { ...menu('SAFETY_HEALTH', safetyB64), menu_number:number, parent_id:100 };
+    const part = await T.build(m, masterData());
+    sourceBodies.push(serialized(T.nodes(T.parse(await part.zip.file(ratioSlide).async('string')), 'spTree', P)[0]));
+    await c.planActiveLayouts(part, m, [{ id:100,menu_code:section }], master);
+    assert.equal(master.layouts.find(l => l.path === part.activeLayouts[ratioSlide]).name, layout); parts.push(part);
+  }
+  const merged = await c.mergePresentationZips([{ ...master,mergeStrategy:'MASTER_ONLY' }, ...parts]);
+  const slides = await T.slidePaths(merged); assert.equal(slides.length, 4);
+  for (let i = 0; i < slides.length; i++) {
+    const rd = T.parse(await merged.file(c.masterRelsPath(slides[i])).async('string'));
+    const layout = T.nodes(rd, 'Relationship', R).find(r => r.getAttribute('Type').endsWith('/slideLayout'));
+    const target = c.masterResolvePath(slides[i],layout.getAttribute('Target'));
+    assert.equal(T.nodes(T.parse(await merged.file(target).async('string')), 'cSld',P)[0].getAttribute('name'), expected[i][2]);
+    assert(!target.includes('/p1_'));
+    const doc = T.parse(await merged.file(slides[i]).async('string'));
+    assert.equal(serialized(T.nodes(doc,'spTree',P)[0]),sourceBodies[i]);
+    assert.equal(doc.documentElement.getAttribute('showMasterSp'),'1');
+  }
+  const pres = T.parse(await merged.file('ppt/presentation.xml').async('string'));
+  const names=Array.from(pres.documentElement.childNodes).map(n=>n.localName).filter(Boolean);
+  assert(names.indexOf('handoutMasterIdLst') < names.indexOf('sldIdLst')); assert(names.indexOf('sldIdLst') < names.indexOf('sldSz'));
+});
+test('explicit master layout has priority; invalid explicit mapping fails and unmatched or size mismatch is reported', async () => {
+  const c=masterSandbox(),T=c.ProposalTemplate,master=await preparedMaster(c);
+  const m={...menu('SAFETY_HEALTH',safetyB64),parent_id:100,menu_number:'3.5',rule:{target_layout_name:'목차'}};
+  const part=await T.build(m,masterData());
+  await c.planActiveLayouts(part,m,[{id:100,menu_code:'SECTION_QUALITY'}],master);
+  assert.equal(master.layouts.find(l=>l.path===part.activeLayouts[ratioSlide]).name,'목차');
+  await assert.rejects(()=>c.planActiveLayouts(part,{...m,rule:{target_layout_name:'없는 이름'}},[],master),/지정 레이아웃/);
+  const unknown=await T.build(menu('SAFETY_HEALTH',safetyB64),masterData());
+  await c.planActiveLayouts(unknown,{...m,rule:{},menu_number:'9'},[{id:100,menu_code:'SECTION_QUALITY'}],{...master,layouts:[]});
+  assert(unknown.warnings.some(w=>w.includes('매칭 없음')));
+  const different=await T.build(menu('SAFETY_HEALTH',safetyB64),masterData());
+  await c.planActiveLayouts(different,m,[],{...master,size:{w:1,h:1}});
+  assert(different.warnings.some(w=>w.includes('크기가 달라')));
+});
+test('master-only seed with real sample slides does not leak extra slide IDs into merged output', async () => {
+  const c=masterSandbox(),T=c.ProposalTemplate;
+  const seed=await JSZip.loadAsync(await template(shape(para('MASTER SAMPLE MUST NOT APPEAR'))),{base64:true});
+  const body=await JSZip.loadAsync(await template(shape(para('actual body'))),{base64:true});
+  const result=await c.mergePresentationZips([{zip:seed,mergeStrategy:'MASTER_ONLY'},{zip:body,mergeStrategy:'FOREIGN_TEMPLATE'}]);
+  const paths=await T.slidePaths(result);assert.equal(paths.length,1);assert(docText(c,await result.file(paths[0]).async('string')).includes('actual body'));
+  const rels=T.parse(await result.file('ppt/_rels/presentation.xml.rels').async('string'));
+  assert.equal(T.nodes(rels,'Relationship',R).filter(r=>r.getAttribute('Type').endsWith('/slide')).length,1);
+});
+test('composer applies active master and logo once while preserving partial generation policy', async () => {
+  const parent={id:100,menu_code:'SECTION_QUALITY',menu_number:'마',menu_name:'감리 품질 및 지원',is_enabled:1};
+  const good={...menu('SAFETY_HEALTH',safetyB64),parent_id:100,menu_number:'3.5'},bad={...menu('MANPOWER_MD'),id:2,parent_id:100};
+  const calls=[];
+  const c=masterSandbox({fetch:async url=>{calls.push(url);return {ok:true,json:async()=>url.includes('master-templates')?{ok:true,data:{pptx_b64:activeMasterB64}}:url.includes('client-logo')?{ok:true,projectId:42,clientOrg:'시험기관',dataUri:'data:image/png;base64,'+logoPng}:{ok:true,data:[{...parent,children:[good,bad]}]}};}});
+  const zip=await c.generateProposalPpt(c.buildProjectViewModel(masterData()));
+  assert.equal(zip.proposalReport.status,'부분 생성');assert.equal(calls.filter(u=>u.includes('client-logo')).length,1);
+  const paths=await c.ProposalTemplate.slidePaths(zip);assert.equal(paths.length,1);
+  const rels=c.ProposalTemplate.parse(await zip.file(c.masterRelsPath(paths[0])).async('string'));
+  assert(c.ProposalTemplate.nodes(rels,'Relationship',R).some(r=>r.getAttribute('Target')==='../slideLayouts/slideLayout10.xml'));
+});
+
 const ratioB64 = readFileSync(new URL('../artifacts/3.7_staff_ratio_placeholders.pptx', import.meta.url)).toString('base64');
 const ratioSlide = 'ppt/slides/slide1.xml';
 const ratioBarName = '전문가비율막대_PB_높이연동대상';

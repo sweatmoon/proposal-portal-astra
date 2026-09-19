@@ -35,6 +35,68 @@ async function nas(t, handler) {
   return { mod: await import(url), calls, url };
 }
 
+test('client logo matches exact normalized institution names without choosing other organizations or variants', async t => {
+  const { mod } = await nas(t);
+  const files = ['강원대학교.png', '강원대학교2.png', '강원대학교병원.png', '(재)한국정보문화산업진흥원.png', '경기도 과천시.png'].map(name => ({ name, isdir: false }));
+  assert.equal(mod.matchClientLogo('강원대학교', files).filename, '강원대학교.png');
+  assert.equal(mod.matchClientLogo('강원대', files).error, 'client_logo_not_found');
+  assert.equal(mod.matchClientLogo('한국정보문화산업진흥원', files).filename, '(재)한국정보문화산업진흥원.png');
+  assert.equal(mod.matchClientLogo('경기도 과천시', files).filename, '경기도 과천시.png');
+  assert.equal(mod.matchClientLogo('강원대학교', [...files, { name: '강원대학교.jpg', isdir: false }]).error, 'client_logo_ambiguous');
+  assert.equal(mod.matchClientLogo('../비밀', files).error, 'invalid_client_org');
+});
+test('client logo reads only designated folder with pagination then downloads one PNG and logs out', async t => {
+  const { mod, calls } = await nas(t, p => {
+    if (p.method === 'list') {
+      assert.equal(p.folder_path, '/activo/04.제안팀/99.악티보포털참조용/01.제안서 작성용 로고, 도장/주관기관 로고(누끼 딴거)');
+      return Response.json({ success: true, data: { total: 2, files: [{ name: p.offset === '0' ? '다른기관.png' : '시험기관.png', isdir: false }] } });
+    }
+  });
+  const r = await mod.fetchClientLogo('시험기관');
+  assert.equal(r.ok, true); assert.equal(r.dataUri, 'data:image/png;base64,' + png.toString('base64'));
+  assert.deepEqual(calls.filter(c => c.method === 'list').map(c => c.offset), ['0', '1']);
+  assert.equal(calls.filter(c => c.method === 'login').length, 1); assert.equal(calls.filter(c => c.method === 'logout').length, 1);
+  assert(JSON.parse(calls.find(c => c.method === 'download').path)[0].endsWith('/시험기관.png'));
+});
+test('client logo ambiguity and missing files do not download or fall back to another image', async t => {
+  const { mod, calls } = await nas(t, p => p.method === 'list' && Response.json({ success: true, data: { files: [{ name: '시험기관.png', isdir: false }, { name: '시험기관.jpg', isdir: false }] } }));
+  assert.equal((await mod.fetchClientLogo('시험기관')).error, 'client_logo_ambiguous');
+  assert.equal((await mod.fetchClientLogo('없는기관')).error, 'client_logo_not_found');
+  assert.equal(calls.filter(c => c.method === 'download').length, 0);
+  assert.equal(calls.filter(c => c.method === 'logout').length, 2);
+});
+test('client logo keeps NAS permission errors distinct from not-found and never exposes secrets', async t => {
+  const { mod, calls } = await nas(t, p => p.method === 'list' && Response.json({ success: false, error: { code: 407, message: 'test-secret test-session' } }));
+  const r = await mod.fetchClientLogo('시험기관');
+  assert.equal(r.error, 'nas_error'); assert.equal(r.stage, 'list'); assert.equal(r.code, 407);
+  assert(!JSON.stringify(r).includes('test-secret')); assert(!JSON.stringify(r).includes('test-session'));
+  assert.equal(calls.filter(c => c.method === 'logout').length, 1);
+});
+test('client logo retries expired sessions and rejects non-image download bodies', async t => {
+  let downloads = 0;
+  const { mod, calls } = await nas(t, p => {
+    if (p.method === 'list') return Response.json({ success: true, data: { files: [{ name: '시험기관.png', isdir: false }] } });
+    if (p.method === 'download' && downloads++ === 0) return Response.json({ success: false, error: { code: 106 } });
+    if (p.method === 'download') return new Response('<html>not an image</html>');
+  });
+  const r = await mod.fetchClientLogo('시험기관');
+  assert.equal(r.ok, false); assert.equal(r.stage, 'download'); assert.equal(r.dataUri, undefined);
+  assert.equal(calls.filter(c => c.method === 'login').length, 2); assert.equal(calls.filter(c => c.method === 'logout').length, 2);
+});
+test('client logo API uses stored project organization and validates project ID before NAS', async () => {
+  const db = moduleUrl(`export const calls=[]; export async function query() {throw new Error('forbidden')}; export async function queryOne(sql, params) { calls.push({sql,params}); return params[0]===42 ? {client_org:'저장 기관'} : null; }`);
+  const nasModule = moduleUrl(`export const calls=[]; export async function fetchClientLogo(org) { calls.push(org); return {ok:false,error:'client_logo_not_found'}; }`);
+  const source = readFileSync(new URL('../src/routes/projects.ts', import.meta.url), 'utf8').replace("'hono'", JSON.stringify(import.meta.resolve('hono'))).replace("'../db/client.js'", JSON.stringify(db)).replace("'../lib/nas-client.js'", JSON.stringify(nasModule));
+  const route = (await import(moduleUrl(source))).default;
+  assert.equal((await route.request('/0/client-logo')).status, 400);
+  assert.equal((await route.request('/41/client-logo')).status, 404);
+  const response = await route.request('/42/client-logo?clientOrg=조작된기관');
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await response.json(), { ok:false,error:'client_logo_not_found',projectId:42,clientOrg:'저장 기관' });
+  assert.deepEqual((await import(nasModule)).calls, ['저장 기관']);
+  assert((await import(db)).calls.every(c => c.sql === 'SELECT client_org FROM audit_projects WHERE id = $1'));
+});
+
 test('known filenames download without folder List; one login/logout for a batch', async t => {
   const { mod, calls } = await nas(t);
   const rows = await mod.fetchPersonnelPhotoResults(['가상인력A', '가상인력B', '가상인력A']);
