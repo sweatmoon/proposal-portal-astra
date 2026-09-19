@@ -19,11 +19,37 @@
  */
 import { Hono } from 'hono'
 import JSZip from 'jszip'
+import { DOMParser, XMLSerializer } from '@xmldom/xmldom'
 import type { CompanyStampType } from '../lib/nas-client.js'
 import { fetchAuditorCertificatePptxs, fetchCompanyStampPng } from '../lib/nas-client.js'
 import { query, queryOne } from '../db/client.js'
 
 const app = new Hono()
+
+const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
+async function readContentTypes(zip: JSZip) {
+  const file = zip.file('[Content_Types].xml')
+  if (!file) throw new Error('자격증 PPTX의 ContentType 선언 파일이 없습니다')
+  const text = await file.async('string')
+  if (/<!DOCTYPE|<!ENTITY/i.test(text)) throw new Error('자격증 PPTX의 ContentType 선언이 올바르지 않습니다')
+  const doc = new DOMParser({ onError: level => { if (level !== 'warning') throw new Error('자격증 PPTX의 ContentType XML이 올바르지 않습니다') } }).parseFromString(text, 'application/xml')
+  if (doc.documentElement?.namespaceURI !== CONTENT_TYPES_NS || doc.documentElement.localName !== 'Types') {
+    throw new Error('자격증 PPTX의 ContentType 선언이 올바르지 않습니다')
+  }
+  return doc
+}
+function mediaContentType(doc: Awaited<ReturnType<typeof readContentTypes>>, path: string): string {
+  const override = Array.from(doc.getElementsByTagNameNS(CONTENT_TYPES_NS, 'Override'))
+    .filter(n => n.getAttribute('PartName') === '/' + path)
+  const declarations = override.length ? override : Array.from(doc.getElementsByTagNameNS(CONTENT_TYPES_NS, 'Default'))
+    .filter(n => n.getAttribute('Extension')?.toLowerCase() === path.split('.').pop()?.toLowerCase())
+  const types = new Set(declarations.map(n => n.getAttribute('ContentType')))
+  const type = [...types][0]
+  if (types.size !== 1 || !type || !type.startsWith('image/')) {
+    throw new Error('자격증 원본 이미지의 ContentType을 확인할 수 없습니다: ' + path)
+  }
+  return type
+}
 
 const PAGE_TITLE = '자격증사본'
 const STAMP_TYPES: CompanyStampType[] = ['원본대조필', '사실과상위없음', '사용인감']
@@ -80,6 +106,8 @@ async function buildOneSlide(params: {
   templateRelsXml: string  // 템플릿 slide1.xml.rels 원본
   templateMediaFiles: Map<string, Uint8Array> // 템플릿 미디어 (도장 등)
   srcZip: JSZip            // NAS 자격증 pptx zip
+  sourceContentTypes: Awaited<ReturnType<typeof readContentTypes>>
+  copiedMediaTypes: Map<string, string> // 새 PartName → 원본 ContentType
   srcSlidePath: string     // 'ppt/slides/slideN.xml'
   slideIndex: number       // 결과에서 몇 번째 슬라이드인지 (1-based)
   titleText: string        // [제목] 치환 텍스트
@@ -88,7 +116,7 @@ async function buildOneSlide(params: {
 }): Promise<void> {
   const {
     outZip, templateSlideXml, templateRelsXml, templateMediaFiles,
-    srcZip, srcSlidePath, slideIndex, titleText, stampPng, stampRid,
+    srcZip, sourceContentTypes, copiedMediaTypes, srcSlidePath, slideIndex, titleText, stampPng, stampRid,
   } = params
 
   const slideNum = slideIndex
@@ -140,7 +168,9 @@ async function buildOneSlide(params: {
     const newMediaName = `slide${slideNum}_img${ridCounter}.${ext}`
     const newMediaPath = `ppt/media/${newMediaName}`
 
+    const contentType = mediaContentType(sourceContentTypes, srcMediaPath)
     outZip.file(newMediaPath, mediaData)
+    copiedMediaTypes.set(newMediaPath, contentType)
 
     const newRid = `rId_s${slideNum}_${ridCounter}`
     ridRemap.set(srcRid, newRid)
@@ -352,6 +382,7 @@ export async function buildLicenseCertificateZip(
   outZip.remove('ppt/slides/_rels/slide1.xml.rels')
 
   let slideIndex = 1
+  const copiedMediaTypes = new Map<string, string>()
 
   for (const name of names) {
     const pptxBuf = pptxMap.get(name) ?? null
@@ -376,6 +407,7 @@ export async function buildLicenseCertificateZip(
       continue
     }
 
+    const sourceContentTypes = await readContentTypes(srcZip)
     const totalPages = srcSlides.length
 
     for (let pi = 0; pi < srcSlides.length; pi++) {
@@ -389,6 +421,8 @@ export async function buildLicenseCertificateZip(
         templateRelsXml,
         templateMediaFiles,
         srcZip,
+        sourceContentTypes,
+        copiedMediaTypes,
         srcSlidePath,
         slideIndex,
         titleText,
@@ -409,14 +443,21 @@ export async function buildLicenseCertificateZip(
   outZip.file('ppt/_rels/presentation.xml.rels', presRelsXml)
 
   // ── [Content_Types].xml — 슬라이드 Override 재구성 ───────────────────────
-  const ctXml = await templateZip.file('[Content_Types].xml')!.async('string')
-  // 기존 슬라이드 Override 제거 후 재구성
-  let newCtXml = ctXml.replace(/<Override[^>]+\/slides\/[^>]+\/>/g, '')
-  const slideOverrides = Array.from({ length: totalSlides }, (_, i) =>
-    `<Override PartName="/ppt/slides/slide${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`
-  ).join('')
-  newCtXml = newCtXml.replace('</Types>', slideOverrides + '</Types>')
-  outZip.file('[Content_Types].xml', newCtXml)
+  const contentTypes = await readContentTypes(templateZip)
+  // 새 파일별 Override로 원본 선언을 보존한다. 템플릿의 Default/다른 파일 선언은 변경하지 않는다.
+  for (const entry of Array.from(contentTypes.getElementsByTagNameNS(CONTENT_TYPES_NS, 'Override'))) {
+    const part = entry.getAttribute('PartName') || ''
+    if (/^\/ppt\/slides\/slide\d+\.xml$/.test(part) || copiedMediaTypes.has(part.slice(1))) entry.parentNode?.removeChild(entry)
+  }
+  const addOverride = (path: string, type: string) => {
+    const entry = contentTypes.createElementNS(CONTENT_TYPES_NS, 'Override')
+    entry.setAttribute('PartName', '/' + path)
+    entry.setAttribute('ContentType', type)
+    contentTypes.documentElement!.appendChild(entry)
+  }
+  for (let i = 1; i <= totalSlides; i++) addOverride(`ppt/slides/slide${i}.xml`, 'application/vnd.openxmlformats-officedocument.presentationml.slide+xml')
+  for (const [path, type] of copiedMediaTypes) addOverride(path, type)
+  outZip.file('[Content_Types].xml', new XMLSerializer().serializeToString(contentTypes))
 
   return { zip: outZip, personCount: personnelResults.filter(p => p.status === 'done').length, slideCount: totalSlides, skipped, personnelResults, projectName }
 }

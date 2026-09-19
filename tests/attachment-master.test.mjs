@@ -37,6 +37,81 @@ export async function bodyDeck(n=1){
  pres=pres.replace('<p:sldSz',`<p:sldIdLst>${ids}</p:sldIdLst><p:sldSz`);
  z.file('ppt/presentation.xml',pres);z.file('ppt/_rels/presentation.xml.rels',rels);z.file('[Content_Types].xml',ct);z.file('ppt/media/body.png',Buffer.from(png,'base64'));return z;
 }
+async function licenseModule(sourceBytes) {
+ const mocks=url(`export async function fetchAuditorCertificatePptxs(){return new Map([['시험인력',Buffer.from('${sourceBytes.toString('base64')}','base64')]])} export async function fetchCompanyStampPng(){return null} export async function query(){throw new Error('No operating DB')} export async function queryOne(){throw new Error('No operating DB')}`);
+ return import(url(compile(read('src/routes/ppt-license-certificate.ts')).replace(/from ['"]([^'"]+)['"]/g,(_,name)=>'from '+JSON.stringify(name.startsWith('.')?mocks:import.meta.resolve(name)))));
+}
+async function licenseSource(jpgExtension='JPG') {
+ const z=new JSZip(), bytes=[Buffer.from([255,216,255,224,0,2,255,217]),Buffer.from(png,'base64'),Buffer.from('synthetic EMF bytes')];
+ const paths=[`ppt/media/certificate.${jpgExtension}`,'ppt/media/certificate.png','ppt/media/vector.emf'];
+ for(let i=0;i<paths.length;i++)z.file(paths[i],bytes[i]);
+ const pictures=paths.map((_,i)=>`<p:pic><p:nvPicPr><p:cNvPr id="${20+i}" name="certificate-${i}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId${i+1}"/></p:blipFill><p:spPr/></p:pic>`).join('');
+ for(let n=1;n<=2;n++){
+  z.file(`ppt/slides/slide${n}.xml`,`<p:sld xmlns:p="${P}" xmlns:a="${A}" xmlns:r="${OR}"><p:cSld><p:spTree>${pictures}</p:spTree></p:cSld></p:sld>`);
+  z.file(`ppt/slides/_rels/slide${n}.xml.rels`,`<Relationships xmlns="${R}">${paths.map((p,i)=>`<Relationship Id="rId${i+1}" Type="${OR}/image" Target="../media/${posix.basename(p)}"/>`).join('')}</Relationships>`);
+ }
+ // Prefixed elements, lower-case extension / upper-case file, and per-part Override precedence.
+ z.file('[Content_Types].xml','<ct:Types xmlns:ct="http://schemas.openxmlformats.org/package/2006/content-types"><ct:Default Extension="jpg" ContentType="image/jpeg"/><ct:Default Extension="png" ContentType="image/png"/><ct:Default Extension="emf" ContentType="application/octet-stream"/><ct:Override PartName="/ppt/media/vector.emf" ContentType="image/x-emf"/></ct:Types>');
+ return {z,bytes};
+}
+test('actual license images preserve ContentTypes and bytes through active-master merge',async()=>{
+ const {z,bytes}=await licenseSource('jpg'), mod=await licenseModule(await z.generateAsync({type:'nodebuffer'}));
+ const template=await bodyDeck();
+ const result=await mod.buildLicenseCertificateZip(await template.generateAsync({type:'nodebuffer'}),0,false,'원본대조필','',['시험인력']);
+ assert.equal(result.slideCount,2);assert.equal(result.personCount,1);
+ const CT='http://schemas.openxmlformats.org/package/2006/content-types';
+ const declarations=nodes(doc(await result.zip.file('[Content_Types].xml').async('string')),'Override',CT);
+ for(let n=1;n<=2;n++)for(let i=0;i<3;i++){
+  const path=`ppt/media/slide${n}_img${100+n*100+i}.${['jpg','png','emf'][i]}`;
+  assert.deepEqual(await result.zip.file(path).async('nodebuffer'),bytes[i]);
+  assert.equal(declarations.filter(d=>d.getAttribute('PartName')==='/'+path).length,1);
+  assert.equal(declarations.find(d=>d.getAttribute('PartName')==='/'+path).getAttribute('ContentType'),['image/jpeg','image/png','image/x-emf'][i]);
+ }
+ const merged=await mergeWithAttachmentMaster(await prepareAttachmentMaster(masterBytes,context()),[await bodyDeck(),result.zip]);
+ assert.equal(nodes(doc(await merged.file('ppt/presentation.xml').async('string')),'sldId').length,3);
+ const mergedCT=nodes(doc(await merged.file('[Content_Types].xml').async('string')),'Override',CT);
+ for(let n=1;n<=2;n++)for(let i=0;i<3;i++){
+  const path=`ppt/media/attachment1_slide${n}_img${100+n*100+i}.${['jpg','png','emf'][i]}`;
+  assert.deepEqual(await merged.file(path).async('nodebuffer'),bytes[i]);
+  assert.equal(mergedCT.find(d=>d.getAttribute('PartName')==='/'+path).getAttribute('ContentType'),['image/jpeg','image/png','image/x-emf'][i]);
+ }
+ for(const p of ['ppt/slides/attachment1_slide1.xml','ppt/slides/attachment1_slide2.xml']){
+  const relationships=nodes(doc(await merged.file(relPath(p)).async('string')),'Relationship',R);
+  for(const blip of nodes(doc(await merged.file(p).async('string')),'blip',A)){
+   const rel=relationships.find(r=>r.getAttribute('Id')===blip.getAttributeNS(OR,'embed'));
+   assert(rel);assert(merged.file(resolve(p,rel.getAttribute('Target'))));
+  }
+ }
+ // Reproduce the old builder's missing declaration: strict merger must still reject it.
+ const broken=await JSZip.loadAsync(await result.zip.generateAsync({type:'nodebuffer'}));
+ const badCT=doc(await broken.file('[Content_Types].xml').async('string'));
+ for(const d of nodes(badCT,'Override',CT))if(d.getAttribute('PartName').includes('/slide1_img200.'))d.parentNode.removeChild(d);
+ broken.file('[Content_Types].xml',serialize(badCT));
+ await assert.rejects(async()=>mergeWithAttachmentMaster(await prepareAttachmentMaster(masterBytes,context()),[await bodyDeck(),broken]),/ContentType.*slide1_img200\.jpg/);
+});
+test('license image declarations override conflicting template defaults without altering them',async()=>{
+ const {z}=await licenseSource(), mod=await licenseModule(await z.generateAsync({type:'nodebuffer'})), template=await bodyDeck();
+ template.file('[Content_Types].xml',(await template.file('[Content_Types].xml').async('string')).replace('</Types>','<Default Extension="JPG" ContentType="image/template-only"/></Types>'));
+ const result=await mod.buildLicenseCertificateZip(await template.generateAsync({type:'nodebuffer'}),0,false,'원본대조필','',['시험인력']);
+ const CT='http://schemas.openxmlformats.org/package/2006/content-types', d=doc(await result.zip.file('[Content_Types].xml').async('string'));
+ assert.equal(nodes(d,'Default',CT).find(n=>n.getAttribute('Extension')==='JPG').getAttribute('ContentType'),'image/template-only');
+ assert.equal(nodes(d,'Override',CT).find(n=>n.getAttribute('PartName')==='/ppt/media/slide1_img200.JPG').getAttribute('ContentType'),'image/jpeg');
+});
+test('license unknown missing conflicting or invalid source image types fail instead of guessing',async()=>{
+ for(const mode of ['missing-file','missing-type','conflict','non-image','invalid-xml']){
+  const {z}=await licenseSource();let ct=await z.file('[Content_Types].xml').async('string');
+  if(mode==='missing-file')z.remove('[Content_Types].xml');
+  else {
+   if(mode==='missing-type')ct=ct.replace('<ct:Default Extension="jpg" ContentType="image/jpeg"/>','');
+   if(mode==='conflict')ct=ct.replace('</ct:Types>','<ct:Default Extension="JPG" ContentType="image/png"/></ct:Types>');
+   if(mode==='non-image')ct=ct.replace('image/jpeg','application/octet-stream');
+   if(mode==='invalid-xml')ct='<broken/>';
+   z.file('[Content_Types].xml',ct);
+  }
+  const mod=await licenseModule(await z.generateAsync({type:'nodebuffer'}));
+  await assert.rejects(async()=>mod.buildLicenseCertificateZip(await (await bodyDeck()).generateAsync({type:'nodebuffer'}),0,false,'원본대조필','',['시험인력']),/ContentType/);
+ }
+});
 test('provided attachment master has two named portrait layouts and replaces only project token and designated logo',async()=>{
  const before=await JSZip.loadAsync(masterBytes), result=await prepareAttachmentMaster(masterBytes,context());
  assert.deepEqual(result.layouts.map(l=>l.name),['첨부 표지','첨부 내용']);assert.deepEqual(result.size,{w:6858000,h:9906000});assert.deepEqual(result.warnings,[]);
