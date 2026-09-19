@@ -33,6 +33,7 @@ export interface LicenseCertificateZipResult {
   personCount: number
   slideCount: number
   skipped: string[]
+  personnelResults: { name: string; status: 'done' | 'skipped'; detail: string }[]
   projectName: string
 }
 
@@ -289,6 +290,7 @@ export async function buildLicenseCertificateZip(
   ])
 
   const skipped: string[] = []
+  const personnelResults: LicenseCertificateZipResult['personnelResults'] = []
   const personCount = names.filter(n => !!pptxMap.get(n)).length
   if (personCount === 0) {
     throw new Error(`NAS 자격증사본 폴더에서 매칭되는 PPTX가 없습니다 (${names.join(', ')})`)
@@ -353,7 +355,11 @@ export async function buildLicenseCertificateZip(
 
   for (const name of names) {
     const pptxBuf = pptxMap.get(name) ?? null
-    if (!pptxBuf) { skipped.push(name); continue }
+    if (!pptxBuf) {
+      skipped.push(name)
+      personnelResults.push({ name, status: 'skipped', detail: 'NAS에서 자료를 받지 못했습니다. 파일 미발견과 개별 조회 실패는 구분되지 않습니다.' })
+      continue
+    }
 
     const srcZip = await JSZip.loadAsync(pptxBuf)
     const srcSlides = Object.keys(srcZip.files)
@@ -364,7 +370,11 @@ export async function buildLicenseCertificateZip(
         return na - nb
       })
 
-    if (!srcSlides.length) { skipped.push(name); continue }
+    if (!srcSlides.length) {
+      skipped.push(name)
+      personnelResults.push({ name, status: 'skipped', detail: '받은 PPTX에 포함할 슬라이드가 없습니다.' })
+      continue
+    }
 
     const totalPages = srcSlides.length
 
@@ -387,6 +397,7 @@ export async function buildLicenseCertificateZip(
       })
       slideIndex++
     }
+    personnelResults.push({ name, status: 'done', detail: `${totalPages}장 포함` })
   }
 
   const totalSlides = slideIndex - 1
@@ -407,7 +418,7 @@ export async function buildLicenseCertificateZip(
   newCtXml = newCtXml.replace('</Types>', slideOverrides + '</Types>')
   outZip.file('[Content_Types].xml', newCtXml)
 
-  return { zip: outZip, personCount, slideCount: totalSlides, skipped, projectName }
+  return { zip: outZip, personCount: personnelResults.filter(p => p.status === 'done').length, slideCount: totalSlides, skipped, personnelResults, projectName }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

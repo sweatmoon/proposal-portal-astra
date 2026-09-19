@@ -72,6 +72,7 @@
  *     - additionalPhaseIds: JSON 배열 문자열 — order에 'schedule'이 있을 때만 사용
  */
 import { Hono } from 'hono'
+import { stream } from 'hono/streaming'
 import type JSZip from 'jszip'
 import { buildScheduleZip } from './ppt-schedule.js'
 import { buildCareerZip, type FreeCareerOptions } from './ppt-career.js'
@@ -91,6 +92,15 @@ import { buildCoverZip } from './ppt-cover.js'
 import { mergeDecksSharingMaster } from '../lib/pptx-merge.js'
 
 const app = new Hono()
+
+function reportError(error: unknown): string {
+  let message = error instanceof Error ? error.message : '첨부 생성 실패'
+  for (const key of ['NAS_PASSWORD', 'NAS_USERNAME', 'NAS_BASE_URL', 'DATABASE_URL']) {
+    const value = process.env[key]
+    if (value) message = message.split(value).join('[비공개 설정]')
+  }
+  return message.replace(/https?:\/\/[^\s)]+/g, '[서버 주소]')
+}
 
 /** "범용 템플릿(도장O)" 계열 항목(사업자등록증/국세·지방세 납세증명서/법인등기부등본)이
  *  전부 같은 stampType 검증을 공유해서 뺐다(2026-09-03 — 이제 4곳에서 씀). */
@@ -121,6 +131,7 @@ export interface AttachmentItemSummary {
   skipped?: string[]
   /** 추가 상세 메시지 */
   detail?: string
+  personnelResults?: { name: string; status: 'done' | 'skipped'; detail: string }[]
 }
 
 /** 첨부 항목 레지스트리 — 나중에 새 첨부가 생기면 여기에 한 줄만 추가하면 된다.
@@ -272,7 +283,7 @@ const ATTACHMENT_TYPES: Record<
             } catch { return [] }
           })()
         : []
-      const { zip, personCount, skipped } =
+      const { zip, personCount, skipped, personnelResults } =
         await buildCareerCertificateZip(buf, projectId, withStamp, stampType, titlePrefix, freeNames, stampNumber)
       const stampLabel = withStamp ? ` · ${stampType}${stampNumber}` : ''
       return {
@@ -281,6 +292,7 @@ const ATTACHMENT_TYPES: Record<
           slideCount: personCount,
           personCount,
           skipped,
+          personnelResults,
           detail: `${personCount}명${stampLabel}` + (skipped.length ? ` (${skipped.length}명 제외)` : ''),
         },
       }
@@ -313,7 +325,7 @@ const ATTACHMENT_TYPES: Record<
             } catch { return [] }
           })()
         : []
-      const { zip, personCount, slideCount, skipped } =
+      const { zip, personCount, slideCount, skipped, personnelResults } =
         await buildLicenseCertificateZip(buf, projectId, withStamp, stampType, titlePrefix, freeNames, stampNumber)
       const stampLabel = withStamp ? ` · ${stampType}${stampNumber}` : ''
       return {
@@ -322,6 +334,7 @@ const ATTACHMENT_TYPES: Record<
           slideCount,
           personCount,
           skipped,
+          personnelResults,
           detail: `${personCount}명 ${slideCount}슬라이드${stampLabel}` + (skipped.length ? ` (${skipped.length}명 제외)` : ''),
         },
       }
@@ -332,7 +345,7 @@ const ATTACHMENT_TYPES: Record<
 app.post('/:projectId', async (c) => {
   try {
     const projectId = Number(c.req.param('projectId'))
-    if (isNaN(projectId) || projectId < 0) return c.json({ ok: false, error: 'projectId가 올바르지 않습니다' }, 400)
+    if (!Number.isSafeInteger(projectId) || projectId < 0) return c.json({ ok: false, error: 'projectId가 올바르지 않습니다' }, 400)
 
     const contentType = c.req.header('content-type') || ''
     if (!contentType.includes('multipart/form-data')) {
@@ -341,7 +354,7 @@ app.post('/:projectId', async (c) => {
     const form = await c.req.formData()
 
     const coverFile = form.get('cover') as File | null
-    if (!coverFile || coverFile.size === 0) {
+    if (!coverFile || typeof coverFile === 'string' || coverFile.size === 0) {
       return c.json({ ok: false, error: '표지 템플릿(.pptx) 파일이 필요합니다' }, 400)
     }
 
@@ -354,49 +367,86 @@ app.post('/:projectId', async (c) => {
       const parsed = JSON.parse(orderRaw)
       if (!Array.isArray(parsed) || parsed.length === 0) throw new Error()
       order = parsed.map(String)
+      if (new Set(order).size !== order.length) throw new Error()
     } catch {
       return c.json({ ok: false, error: 'order는 비어있지 않은 JSON 배열이어야 합니다' }, 400)
     }
     for (const id of order) {
-      if (!ATTACHMENT_TYPES[id]) return c.json({ ok: false, error: `알 수 없는 첨부 항목: ${id}` }, 400)
+      if (!Object.hasOwn(ATTACHMENT_TYPES, id)) return c.json({ ok: false, error: `알 수 없는 첨부 항목: ${id}` }, 400)
     }
 
     // ── 선택된 항목들을 순서대로 생성 (제목 앞 번호는 선택 순서 그대로: 1. 2. 3. ...) ────
-    const sectionZips: JSZip[] = []
-    const summaries: AttachmentItemSummary[] = []
-    for (let i = 0; i < order.length; i++) {
-      const id = order[i]
-      const file = form.get(id) as File | null
-      if (!file || file.size === 0) {
+    // 스트림 시작 전 입력 검사. 기존 바이너리 응답도 같은 생성 경로를 사용한다.
+    for (const id of order) {
+      const file = form.get(id)
+      if (!file || typeof file === 'string' || file.size === 0) {
         return c.json({ ok: false, error: `"${ATTACHMENT_TYPES[id].label}" 템플릿(.pptx) 파일이 필요합니다` }, 400)
       }
-      const buf = Buffer.from(await file.arrayBuffer())
-      const { zip, summary } = await ATTACHMENT_TYPES[id].build(buf, projectId, form, `${i + 1}. `)
-      sectionZips.push(zip)
-      summaries.push({
-        key: id,
-        label: ATTACHMENT_TYPES[id].label,
-        isPersonBased: ATTACHMENT_TYPES[id].isPersonBased,
-        ...summary,
-      })
+    }
+    let currentKey = 'prepare'
+    type ProgressEvent = Record<string, unknown>
+    const generate = async (emit: (event: ProgressEvent) => Promise<void>) => {
+      const sectionZips: JSZip[] = []
+      const summaries: AttachmentItemSummary[] = []
+      const slideCount = async (zip: JSZip) => {
+        const xml = await zip.file('ppt/presentation.xml')?.async('string')
+        if (!xml) throw new Error('생성 결과의 슬라이드 목록이 없습니다')
+        return (xml.match(/<(?:\w+:)?sldId\b/g) || []).length
+      }
+      await emit({ type: 'ready', items: order.map(key => ({ key, label: ATTACHMENT_TYPES[key].label })) })
+      for (let i = 0; i < order.length; i++) {
+        const key = order[i]
+        currentKey = key
+        await emit({ type: 'start', key })
+        const buf = Buffer.from(await (form.get(key) as File).arrayBuffer())
+        const { zip, summary } = await ATTACHMENT_TYPES[key].build(buf, projectId, form, `${i + 1}. `)
+        sectionZips.push(zip)
+        const result = { key, label: ATTACHMENT_TYPES[key].label, isPersonBased: ATTACHMENT_TYPES[key].isPersonBased,
+          ...summary, slideCount: await slideCount(zip) }
+        summaries.push(result)
+        await emit({ type: 'item', ...result })
+      }
+      currentKey = 'cover'
+      await emit({ type: 'start', key: 'cover' })
+      const coverBuf = Buffer.from(await coverFile.arrayBuffer())
+      const { zip: coverZip, projectName } = await buildCoverZip(coverBuf, projectId, order.map(id => ATTACHMENT_TYPES[id].label))
+      await emit({ type: 'item', key: 'cover', label: '정성제안서 첨부 표지', slideCount: await slideCount(coverZip) })
+      currentKey = 'merge'
+      await emit({ type: 'start', key: 'merge' })
+      const merged = await mergeDecksSharingMaster([coverZip, ...sectionZips])
+      const totalSlides = await slideCount(merged)
+      const outBuffer = await merged.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })
+      const safeName = (projectName || '자유생성').replace(/[\\/:*?"<>|]/g, '_').slice(0, 40)
+      return { outBuffer, filename: 'A_첨부_' + safeName + '.pptx', summaries, totalSlides }
     }
 
-    // ── 표지: 선택된 순서 그대로 라벨 목록을 만들어 번호를 새로 매긴다 ──────
-    const coverBuf = Buffer.from(await coverFile.arrayBuffer())
-    const labels = order.map(id => ATTACHMENT_TYPES[id].label)
-    const { zip: coverZip, projectName } = await buildCoverZip(coverBuf, projectId, labels)
-
-    const merged = await mergeDecksSharingMaster([coverZip, ...sectionZips])
-    const outBuffer = await merged.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })
-
-    const safeName = (projectName || '자유생성').replace(/[\\/:*?"<>|]/g, '_').slice(0, 40)
+    c.header('Cache-Control', 'no-store')
+    if (c.req.header('Accept') === 'application/x-attachment-progress') {
+      // JSON 줄 이벤트 뒤 file 이벤트의 size만큼 원본 PPTX 바이트를 전송한다.
+      // 작업 저장/폴링/재생성/Base64 변환 없이 한 HTTP 요청에서 완료한다.
+      c.header('Content-Type', 'application/x-attachment-progress')
+      c.header('X-Accel-Buffering', 'no')
+      return stream(c, async output => {
+        const emit = async (event: ProgressEvent) => {
+          if (output.aborted) throw new Error('요청 연결이 종료되었습니다')
+          await output.writeln(JSON.stringify(event))
+        }
+        try {
+          const { outBuffer, filename, summaries, totalSlides } = await generate(emit)
+          await emit({ type: 'file', filename, size: outBuffer.length, summaries, totalSlides })
+          await output.write(new Uint8Array(outBuffer))
+        } catch (e) {
+          if (!output.aborted) await emit({ type: 'error', key: currentKey, error: reportError(e) })
+        }
+      })
+    }
+    const { outBuffer, filename, summaries } = await generate(async () => {})
     c.header('Content-Type', 'application/vnd.openxmlformats-officedocument.presentationml.presentation')
-    c.header('Content-Disposition', `attachment; filename="${encodeURIComponent('A_첨부_' + safeName)}.pptx"`)
-    // 항목별 생성 결과 요약 — 프론트에서 팝업으로 표시
-    c.header('X-Bundle-Summary', encodeURIComponent(JSON.stringify(summaries)))
+    c.header('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`)
+    c.header('X-Bundle-Summary', encodeURIComponent(JSON.stringify(summaries.map(({ personnelResults, ...summary }) => summary))))
     return c.body(new Uint8Array(outBuffer))
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e)
+    const msg = reportError(e)
     console.error('[ppt-attachment-bundle] 오류:', e)
     return c.json({ ok: false, error: msg }, 500)
   }

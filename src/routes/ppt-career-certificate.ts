@@ -40,6 +40,7 @@ export interface CareerCertificateZipResult {
   zip: JSZip
   personCount: number
   skipped: string[]
+  personnelResults: { name: string; status: 'done' | 'skipped'; detail: string }[]
   projectName: string
 }
 
@@ -146,7 +147,13 @@ export async function buildCareerCertificateZip(
     }
   }
 
-  return { zip, personCount, skipped, projectName }
+  const personnelResults: CareerCertificateZipResult['personnelResults'] = names.map(name => {
+    const person = perPerson.find(p => p.name === name)
+    return person
+      ? { name, status: 'done', detail: `${person.pages.length}장 포함` }
+      : { name, status: 'skipped', detail: 'NAS에서 PDF를 받지 못했습니다. 파일 미발견과 개별 조회 실패는 구분되지 않습니다.' }
+  })
+  return { zip, personCount, skipped, personnelResults, projectName }
 }
 
 app.post('/:projectId', async (c) => {
