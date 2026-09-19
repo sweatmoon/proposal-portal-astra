@@ -459,13 +459,20 @@ test('finished 3.6 only fetches history for an assigned selected PM with an expl
   const legacy = await c.ProposalTemplate.build(menu('COMPLIANCE', complianceB64), pmCopyFixture());
   assert(c.ProposalTemplate.text(mainComplianceTable(c, await legacy.zip.file(ratioSlide).async('string'))).includes('총괄 수행 19건, 감리 경력 6년 2개월 / 141건'));
 });
-test('finished 3.6 handles six stages, raw missing MD, escaped DB text and optional additional notes without inventing facts', async () => {
+test('finished 3.6 handles six stages, raw missing MD and escaped DB text while ignoring removed manual note inputs', async () => {
   const d = pmCopyFixture(); d.stages = Array.from({ length: 6 }, (_, i) => ({ ...d.stages[0], stage: `실제단계${i + 1}` }));
   const c = copySandbox({ ...pmProfile, highlights: 'A&B <사업>\n두번째\n세번째' }, { ...complianceChoices, 'proposal-compliance-auditor-notes': '확인된 <경험>', 'proposal-compliance-education': '확정 교육 1회' });
   const result = await c.ProposalTemplate.build(menu('COMPLIANCE', proposalCopyB64), d);
   const table = mainComplianceTable(c, await result.zip.file(ratioSlide).async('string')), text = c.ProposalTemplate.text(table);
   assert(text.includes('실제단계6')); assert(text.includes('A&B <사업>')); assert(!text.includes('세번째'));
-  assert(text.includes('확인된 <경험>')); assert(text.includes('확정 교육 1회'));
+  assert(!text.includes('확인된 <경험>')); assert(!text.includes('확정 교육 1회'));
+  assert(text.includes('사업별 담당 분야에 맞춰 감리원 배치'));
+  assert(!result.warnings.some(w => w.includes('담당자 입력 문구')));
+  const T = c.ProposalTemplate;
+  const base = T.complianceData(T.context(d, { compliancePM: '가' }), menu('COMPLIANCE'));
+  const stale = T.complianceData(T.context(d, { compliancePM: '가', complianceAuditorNotes: '오래된 경험 문구', complianceEducation: '오래된 교육 계획' }), menu('COMPLIANCE'));
+  assert.deepEqual(stale, base);
+  assert.equal(stale.map['[교육계획]'], '');
   assert(result.warnings.some(w => w.includes('앞 두 항목')));
   d.stages[0].감리원.people[0].mdComplete = false;
   const missing = await c.ProposalTemplate.build(menu('COMPLIANCE', proposalCopyB64), d);
@@ -605,8 +612,10 @@ test('3.6 SSR removes scope choices, retains PM selection and preserves unknown 
   assert(result.html.querySelector('a[href="/static/compliance-proposal-template.pptx"]'));
   assert(result.html.text.includes('인력 DB에서 자동 조회'));
   assert.equal(result.html.querySelector('#proposal-compliance-pm-notes'), null);
-  assert(result.html.querySelector('#proposal-compliance-auditor-notes'));
-  assert(result.html.querySelector('#proposal-compliance-education'));
+  assert.equal(result.html.querySelector('#proposal-compliance-notes'), null);
+  assert.equal(result.html.querySelector('#proposal-compliance-auditor-notes'), null);
+  assert.equal(result.html.querySelector('#proposal-compliance-education'), null);
+  assert(!result.html.text.includes('3.6 추가 제안 문구'));
   const script = result.html.querySelectorAll('script').find(s => s.text.includes('var parsedData ='));
   const c = vm.createContext({}); vm.runInContext(script.text, c);
   assert.equal(c.parsedData.personGradeMap[name].fulltimeKnown, false);
