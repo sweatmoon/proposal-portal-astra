@@ -182,6 +182,37 @@ test('compliance profile distinguishes real zero history from unlinked person an
   assert.equal(response.status, 503); assert(!JSON.stringify(await response.json()).includes('secret'));
 });
 
+test('education profile reads linked personnel education fields only, with ID validation and no NAS', async () => {
+  const { mod, db } = await complianceApi({ person: { education_name: ' 교육 A&B ', education_hours: '42.5', education_org: ' 교육기관 ' } });
+  const response = await mod.default.request('/7/education-profile?projectId=42');
+  assert.equal(response.status, 200); assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.deepEqual((await response.json()).data, { personnelId: 7, projectId: 42, name: '시험PM', educationName: '교육 A&B', educationHours: 42.5, educationOrg: '교육기관' });
+  assert.equal(db.calls.length, 2);
+  assert.deepEqual(db.calls.map(c => c.params), [[42, 7], [7]]);
+  assert.equal(db.calls[1].sql, 'SELECT education_name, education_hours, education_org FROM personnel WHERE id = $1');
+  for (const path of ['/0/education-profile?projectId=42', '/7/education-profile', '/7.5/education-profile?projectId=42', '/7/education-profile?projectId=-1', '/x/education-profile?projectId=42']) {
+    assert.equal((await mod.default.request(path)).status, 400);
+  }
+  assert.equal(db.calls.length, 2);
+});
+test('education profile preserves actual zero and distinguishes missing or invalid hours', async () => {
+  for (const [raw, expected] of [[0, 0], ['0', 0], [null, null], ['', null], [' ', null], [-1, null], ['unknown', null]]) {
+    const { mod } = await complianceApi({ person: { education_hours: raw } });
+    const response = await mod.default.request('/7/education-profile?projectId=42');
+    const p = (await response.json()).data;
+    assert.equal(p.educationHours, expected); assert.equal(p.educationName, ''); assert.equal(p.educationOrg, '');
+  }
+});
+test('education profile rejects unlinked personnel, missing records and DB failure without substituting zero', async () => {
+  for (const [opts, status, error] of [[{ member: null }, 404, 'person_not_in_proposal'], [{ person: null }, 404, 'person_not_found'], [{ fail: true }, 503, 'education_profile_unavailable']]) {
+    const { mod, db } = await complianceApi(opts);
+    const response = await mod.default.request('/7/education-profile?projectId=42');
+    assert.equal(response.status, status);
+    assert.deepEqual(await response.json(), { ok: false, error });
+    if (opts.member === null) assert.equal(db.calls.length, 1);
+  }
+});
+
 function photoBrowser(fetch) {
   const c = vm.createContext({ fetch, atob, Uint8Array });
   vm.runInContext(detail.slice(detail.indexOf('async function loadProposalPhotos('), detail.indexOf('async function downloadPhotoAssignPptx(')), c);

@@ -585,6 +585,175 @@ test('full-deck dispatcher retains photo and assignment ZIP builders after indiv
   assert.deepEqual(calls.slice(0, 3).map(o => o.menuCode), ['AUDITOR_PROFILE', 'CORE_EXPERT_PROFILE', 'EXPERT_PROFILE']);
 });
 
+const educationB64 = readFileSync(new URL('../artifacts/continuing_edu_registered_template.pptx', import.meta.url)).toString('base64');
+const safetyB64 = readFileSync(new URL('../artifacts/safety_health_registered_template.pptx', import.meta.url)).toString('base64');
+function educationFixture(count = 3) {
+  const d = data(); d.proposalId = 42; d.personnelIdMap = {}; d.personGradeMap = {};
+  d.portalOrder = Array.from({ length: count }, (_, i) => ({ name: `감리원${i + 1}`, group: '감리원팀' }));
+  d.portalOrder.forEach((p, i) => { d.personnelIdMap[p.name] = i + 1; d.personGradeMap[p.name] = { group: p.group }; });
+  d.stages = [{ stage: '설계', 감리원: { people: d.portalOrder.map(p => ({ name: p.name, pre: 0, audit: 5, post: 1 })) }, 전문가: { people: [] } }];
+  return d;
+}
+function educationSandbox(pm = '감리원2', change = p => p) {
+  const calls = [];
+  const c = sandbox({ document: { getElementById: id => id === 'proposal-compliance-pm' ? { value: pm } : null },
+    fetch: async (url, opts) => {
+      calls.push({ url, opts });
+      const id = Number(url.match(/personnel\/(\d+)/)?.[1]);
+      const p = await change({ personnelId: id, projectId: 42, name: `감리원${id}`, educationName: `교육 ${id} & <실습>`, educationHours: id * 10, educationOrg: `기관 ${id}` });
+      return { ok: true, json: async () => ({ ok: true, data: p }) };
+    },
+  });
+  return Object.assign(c, { educationCalls: calls });
+}
+function eduTable(c, xml) { return c.ProposalTemplate.nodes(c.ProposalTemplate.parse(xml), 'tbl')[0]; }
+const rowsOf = t => Array.from(t.childNodes).filter(n => n.localName === 'tr');
+const cellsOf = r => Array.from(r.childNodes).filter(n => n.localName === 'tc');
+test('continuing education registered table reads personnel profiles, places PM first and deletes spare rows', async () => {
+  const c = educationSandbox(), T = c.ProposalTemplate;
+  const r = await c.generateMenuPpt(menu('CONTINUING_EDU', educationB64), c.buildProjectViewModel(educationFixture()));
+  const xml = await r.zip.file(ratioSlide).async('string'), rows = rowsOf(eduTable(c, xml));
+  assert.equal(r.slideCount, 1); assert.equal(rows.length, 4);
+  assert.deepEqual(rows.slice(1).map(r => cellsOf(r).map(cell => T.text(cell))), [
+    ['감리원2', '교육 2 & <실습>', '20', '기관 2'], ['감리원1', '교육 1 & <실습>', '10', '기관 1'], ['감리원3', '교육 3 & <실습>', '30', '기관 3'],
+  ]);
+  const text = docText(c, xml);
+  assert(text.includes('60 시간')); assert(text.includes('20 시간'));
+  assert.equal(c.educationCalls.length, 3); assert(c.educationCalls.every(r => r.url.endsWith('/education-profile?projectId=42') && r.opts.cache === 'no-store'));
+  assert(!r.warnings.some(w => w.includes('미치환')));
+  assert(text.includes('3년마다 40시간 이상')); assert(r.warnings.some(w => w.includes('자동 검증한 결과가 아니')));
+});
+test('continuing education includes only general-stage auditors, deduplicates and retains known participants with incomplete MD', async () => {
+  const d = educationFixture();
+  d.portalOrder.push({ name: '상주전용', group: '감리원팀' }, { name: '검수전용', group: '감리원팀' }, { name: '미배정', group: '감리원팀' }, { name: '전문가', group: '전문가' }, { name: '테스터', group: '테스터' });
+  d.stages.push({ stage: '상주감리', 감리원: { people: [{ name: '상주전용', pre: 0, audit: 10, post: 0 }] } }, { stage: '검수지원', 감리원: { people: [{ name: '검수전용', pre: 0, audit: 2, post: 0 }] } });
+  d.stages[0].전문가.people.push({ name: '전문가', pre: 0, audit: 3, post: 0 }, { name: '테스터', pre: 0, audit: 3, post: 0 });
+  d.stages[0].감리원.people.push({ name: '미배정', pre: 0, audit: 0, post: 0 });
+  d.stages.push({ ...d.stages[0], stage: '추가 일반단계' });
+  d.stages[0].감리원.people[0].mdComplete = false;
+  const c = educationSandbox(''), T = c.ProposalTemplate;
+  const r = await T.build(menu('CONTINUING_EDU', educationB64), d);
+  assert.deepEqual(rowsOf(eduTable(c, await r.zip.file(ratioSlide).async('string'))).slice(1).map(r => T.text(cellsOf(r)[0])), ['감리원1', '감리원2', '감리원3']);
+  assert.equal(c.educationCalls.length, 3); assert(r.warnings.some(w => w.includes('잘못된 공수')));
+});
+test('continuing education expands registered rows without reducing fonts and preserves original non-slide parts and off-slide examples', async () => {
+  const c = educationSandbox(), T = c.ProposalTemplate;
+  const src = await JSZip.loadAsync(educationB64, { base64: true });
+  const r = await T.build(menu('CONTINUING_EDU', educationB64), educationFixture(10));
+  const before = T.parse(await src.file(ratioSlide).async('string')), after = T.parse(await r.zip.file(ratioSlide).async('string'));
+  const oldTable = T.nodes(before, 'tbl')[0], newTable = T.nodes(after, 'tbl')[0];
+  assert.equal(rowsOf(newTable).length, 11);
+  assert.equal(serialized(rowsOf(oldTable)[0]), serialized(rowsOf(newTable)[0]));
+  assert.equal(rowsOf(oldTable).reduce((s, r) => s + +r.getAttribute('h'), 0), rowsOf(newTable).reduce((s, r) => s + +r.getAttribute('h'), 0));
+  for (let i = 1; i <= 10; i++) {
+    const original = rowsOf(oldTable)[Math.min(i, 7)], output = rowsOf(newTable)[i];
+    assert.deepEqual(T.nodes(output, 'rPr').map(serialized), T.nodes(original, 'rPr').map(serialized));
+    assert.deepEqual(T.nodes(output, 'tcPr').map(serialized), T.nodes(original, 'tcPr').map(serialized));
+  }
+  assert.equal(serialized(T.nodes(before, 'tbl')[1]), serialized(T.nodes(after, 'tbl')[1]));
+  for (const path of Object.keys(src.files).filter(p => !src.files[p].dir && p !== ratioSlide)) assert.deepEqual(await r.zip.file(path).async('uint8array'), await src.file(path).async('uint8array'), path);
+  assert(T.text(after).includes('550 시간')); assert(r.warnings.some(w => w.includes('10명으로 확장')));
+});
+test('continuing education leaves missing values unresolved, does not average only successful records and keeps real zero', async () => {
+  const c = educationSandbox('', p => ({ ...p, educationName: p.personnelId === 1 ? '' : p.educationName, educationHours: p.personnelId === 1 ? 0 : null }));
+  const r = await c.ProposalTemplate.build(menu('CONTINUING_EDU', educationB64), educationFixture(2));
+  const xml = await r.zip.file(ratioSlide).async('string'), rows = rowsOf(eduTable(c, xml));
+  assert.equal(c.ProposalTemplate.text(cellsOf(rows[1])[2]), '0');
+  assert.equal(c.ProposalTemplate.text(cellsOf(rows[1])[1]), '[교육명]');
+  assert(docText(c, xml).includes('[교육시간합계]')); assert(docText(c, xml).includes('[교육시간평균]'));
+  assert(r.warnings.some(w => w.includes('분모에서 제외하지')));
+  const zero = educationSandbox('', p => ({ ...p, educationHours: 0 }));
+  const z = await zero.ProposalTemplate.build(menu('CONTINUING_EDU', educationB64), educationFixture(1));
+  assert(!docText(zero, await z.zip.file(ratioSlide).async('string')).includes('[교육시간'));
+});
+test('continuing education retains rows for lookup failures, wrong identities and unlinked IDs without using stale profiles', async () => {
+  for (const change of [() => { throw new Error('offline'); }, p => ({ ...p, name: '다른인력' }), p => ({ ...p, personnelId: 999 }), p => ({ ...p, projectId: 999 }), p => ({ ...p, educationHours: -1 })]) {
+    const c = educationSandbox('', change), T = c.ProposalTemplate;
+    const r = await T.build(menu('CONTINUING_EDU', educationB64), educationFixture(1));
+    const txt = T.text(eduTable(c, await r.zip.file(ratioSlide).async('string')));
+    assert(txt.includes('감리원1')); assert(txt.includes('[교육시간]')); assert(r.warnings.some(w => w.includes('조회 실패')));
+  }
+  const c = educationSandbox(''), d = educationFixture(1), T = c.ProposalTemplate;
+  await T.build(menu('CONTINUING_EDU', educationB64), d);
+  delete d.personnelIdMap['감리원1'];
+  const r = await T.build(menu('CONTINUING_EDU', educationB64), d);
+  assert.equal(c.educationCalls.length, 1);
+  assert(T.text(eduTable(c, await r.zip.file(ratioSlide).async('string'))).includes('[교육시간]'));
+  assert(r.warnings.some(w => w.includes('연결 ID')));
+});
+test('continuing education zero people deletes all unused data rows and keeps header with no lookups', async () => {
+  const c = educationSandbox(), T = c.ProposalTemplate;
+  const r = await T.build(menu('CONTINUING_EDU', educationB64), educationFixture(0));
+  const xml = await r.zip.file(ratioSlide).async('string');
+  assert.equal(rowsOf(eduTable(c, xml)).length, 1); assert.equal(c.educationCalls.length, 0);
+  assert(docText(c, xml).includes('0 시간')); assert(docText(c, xml).includes('[교육시간평균]'));
+  assert(r.warnings.some(w => w.includes('대상 단계감리원이 없습니다')));
+});
+test('continuing education supports split tokens and line breaks without losing fixed strings or styles', async () => {
+  const c = educationSandbox('', p => ({ ...p, educationName: 'A&B <실습>\n둘째 교육', educationOrg: '기관1\n기관2' })), T = c.ProposalTemplate;
+  const src = await JSZip.loadAsync(educationB64, { base64: true });
+  // 원본은 이름 토큰이 여러 run에 나뉘어 있다. 교육 토큰에도 공백을 넣어 검증한다.
+  let xml = await src.file(ratioSlide).async('string'); xml = xml.replaceAll('[교육명]', '[교육 명]');
+  src.file(ratioSlide, xml);
+  const r = await T.build(menu('CONTINUING_EDU', await src.generateAsync({ type: 'base64' })), educationFixture(1));
+  const t = eduTable(c, await r.zip.file(ratioSlide).async('string'));
+  assert(T.text(t).includes('A&B <실습>둘째 교육')); assert(T.nodes(t, 'br').length >= 2);
+  assert(!r.warnings.some(w => w.includes('미치환') && w.includes('교육 명')));
+  const fixed = await T.build(menu('CONTINUING_EDU', await template(shape(para('고정 교육 계획 / 40시간 충족')))), educationFixture());
+  assert.equal(docText(c, await fixed.zip.file(ratioSlide).async('string')), '고정 교육 계획 / 40시간 충족');
+  assert.equal(c.educationCalls.length, 1);
+});
+test('safety health replaces only three names with selected PM first and retains all fixed content and OOXML styles', async () => {
+  const c = educationSandbox('감리원3'), T = c.ProposalTemplate;
+  const src = await JSZip.loadAsync(safetyB64, { base64: true });
+  const r = await c.generateMenuPpt(menu('SAFETY_HEALTH', safetyB64), c.buildProjectViewModel(educationFixture(5)));
+  const before = await src.file(ratioSlide).async('string'), after = await r.zip.file(ratioSlide).async('string');
+  const nameRow = rowsOf(T.nodes(T.parse(after), 'tbl')[0])[1];
+  assert.deepEqual(cellsOf(nameRow).map(c => T.text(c)), ['성명', '감리원3', '감리원1', '감리원2']);
+  assert.equal(c.educationCalls.length, 0); assert.equal(withoutText(c, before), withoutText(c, after));
+  const expected = T.parse(before);
+  T.replace(expected, token => ({ ...T.common(T.context(educationFixture(5)), menu('SAFETY_HEALTH')), '[이름1]': '감리원3', '[이름2]': '감리원1', '[이름3]': '감리원2' })[token]);
+  assert.equal(serialized(expected), after);
+  for (const path of Object.keys(src.files).filter(p => !src.files[p].dir && p !== ratioSlide)) assert.deepEqual(await r.zip.file(path).async('uint8array'), await src.file(path).async('uint8array'), path);
+});
+test('safety health never guesses a PM, repeats nobody for short teams and supports optional spaced tokens', async () => {
+  const c = educationSandbox('미배정'), T = c.ProposalTemplate;
+  const r = await T.build(menu('SAFETY_HEALTH', safetyB64), educationFixture(1));
+  const txt = docText(c, await r.zip.file(ratioSlide).async('string'));
+  assert(txt.includes('[이름1]')); assert(txt.includes('[이름3]')); assert(txt.includes('감리원1'));
+  assert(r.warnings.some(w => w.includes('임의 지정하지')));
+  const selected = educationSandbox('감리원1');
+  const s = await selected.ProposalTemplate.build(menu('SAFETY_HEALTH', await template(shape(para('[이름 1] / [이', '름2] / 고정 1년')))), educationFixture(2));
+  assert.equal(docText(selected, await s.zip.file(ratioSlide).async('string')), '감리원1 / 감리원2 / 고정 1년');
+  assert(!s.warnings.some(w => w.includes('미치환')));
+});
+test('education lookups are bounded and response completion order cannot change people or averages', async () => {
+  let running = 0, peak = 0;
+  const c = educationSandbox('감리원5', async p => {
+    running++; peak = Math.max(peak, running);
+    await new Promise(resolve => setTimeout(resolve, (7 - p.personnelId) * 3));
+    running--; return { ...p, educationHours: p.personnelId === 1 ? 0.5 : p.personnelId };
+  }), T = c.ProposalTemplate;
+  const r = await T.build(menu('CONTINUING_EDU', educationB64), educationFixture(6));
+  const xml = await r.zip.file(ratioSlide).async('string');
+  assert(peak <= 3); assert(peak > 1);
+  assert.deepEqual(rowsOf(eduTable(c, xml)).slice(1).map(row => T.text(cellsOf(row)[0])), ['감리원5', '감리원1', '감리원2', '감리원3', '감리원4', '감리원6']);
+  assert(docText(c, xml).includes('20.5 시간')); assert(docText(c, xml).includes('3.42 시간'));
+});
+test('education and safety results merge together, missing templates and unsafe data-row merges fail explicitly', async () => {
+  const c = educationSandbox(), T = c.ProposalTemplate;
+  const results = await Promise.all([T.build(menu('CONTINUING_EDU', educationB64), educationFixture()), T.build(menu('SAFETY_HEALTH', safetyB64), educationFixture())]);
+  const merged = await c.mergePresentationZips(results), paths = await T.slidePaths(merged);
+  assert.equal(paths.length, 2); assert(docText(c, await merged.file(paths[0]).async('string')).includes('교육 2 & <실습>'));
+  assert(docText(c, await merged.file(paths[1]).async('string')).includes('감리원2'));
+  for (const code of ['CONTINUING_EDU', 'SAFETY_HEALTH']) await assert.rejects(() => T.build(menu(code), educationFixture()), /등록된 PPT/);
+  const src = await JSZip.loadAsync(educationB64, { base64: true }), doc = T.parse(await src.file(ratioSlide).async('string'));
+  cellsOf(rowsOf(T.nodes(doc, 'tbl')[0])[1])[0].setAttribute('rowSpan', '2');
+  src.file(ratioSlide, serialized(doc));
+  const b64 = await src.generateAsync({ type: 'base64' });
+  await assert.rejects(() => T.build(menu('CONTINUING_EDU', b64), educationFixture()), /세로 병합/);
+});
+
 const tsModuleUrl = source => 'data:text/javascript;base64,' + Buffer.from(ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText).toString('base64');

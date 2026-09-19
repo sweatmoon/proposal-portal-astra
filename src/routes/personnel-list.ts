@@ -124,6 +124,34 @@ app.get('/:id/compliance-profile', async (c) => {
   }
 })
 
+// 계속교육 장표용 SELECT-only 조회. 사업의 인력 ID 연결을 검증하며 NAS/복사된 교육시간은 사용하지 않는다.
+app.get('/:id/education-profile', async (c) => {
+  const personnelId = Number(c.req.param('id')), projectId = Number(c.req.query('projectId'))
+  if (!Number.isSafeInteger(personnelId) || personnelId <= 0 || !Number.isSafeInteger(projectId) || projectId <= 0)
+    return c.json({ ok: false, error: 'invalid_id' }, 400)
+  c.header('Cache-Control', 'no-store')
+  try {
+    const member = await queryOne<{ person_name: string }>(
+      'SELECT person_name FROM proposal_members WHERE project_id = $1 AND personnel_id = $2 LIMIT 1', [projectId, personnelId]
+    )
+    if (!member) return c.json({ ok: false, error: 'person_not_in_proposal' }, 404)
+    const person = await queryOne<{ education_name: string | null; education_hours: number | string | null; education_org: string | null }>(
+      'SELECT education_name, education_hours, education_org FROM personnel WHERE id = $1', [personnelId]
+    )
+    if (!person) return c.json({ ok: false, error: 'person_not_found' }, 404)
+    const raw = person.education_hours
+    const hours = raw == null || String(raw).trim() === '' ? null : Number(raw)
+    return c.json({ ok: true, data: {
+      personnelId, projectId, name: member.person_name,
+      educationName: String(person.education_name ?? '').trim(),
+      educationHours: hours !== null && Number.isFinite(hours) && hours >= 0 ? hours : null,
+      educationOrg: String(person.education_org ?? '').trim(),
+    } })
+  } catch {
+    return c.json({ ok: false, error: 'education_profile_unavailable' }, 503)
+  }
+})
+
 app.get('/:id', async (c) => {
   const id = Number(c.req.param('id'))
   if (isNaN(id)) return c.json({ ok: false, error: 'invalid id' }, 400)

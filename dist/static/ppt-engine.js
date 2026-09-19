@@ -679,6 +679,12 @@ async function generateMenuPpt(menu, vm) {
       break;
     }
 
+    // 단계감리원 전용: 인력 DB 교육정보 / 안전·보건 담당자 이름
+    case 'CONTINUING_EDU':
+    case 'SAFETY_HEALTH':
+      result = await ProposalTemplate.build(menu, vm);
+      break;
+
     // ── 주관기관 요청사항 준수 여부 (요약표) ──────────────────────
     case 'SUMMARY_TABLE':         // 구버전 alias
     case 'COMPLIANCE':

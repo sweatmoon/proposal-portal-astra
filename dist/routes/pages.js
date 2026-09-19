@@ -1007,7 +1007,7 @@ app.get('/proposals/:id', async (c) => {
         <p style="margin:4px 0">요구 감리 일수 <b>${fmtRequirement(project.required_audit_days, '일')}</b>: 각 기본 일반단계가 요구 일수 이상인지 개별 비교합니다. 단계 일수를 합산하지 않습니다.</p>
         <p style="margin:4px 0;color:#666;font-size:12px">일수 비교에서 추가 선택 단계와 상시·상주·검수지원은 제외합니다. 저장된 요구값이나 배정값이 없으면 검토 필요로 표시합니다.</p>
       </section>
-      <label for="proposal-compliance-pm" style="display:block;font-size:13px;margin-bottom:12px">3.6 수행 총괄 감리원(PM) 확인
+      <label for="proposal-compliance-pm" style="display:block;font-size:13px;margin-bottom:12px">수행 총괄 감리원(PM) 확인 — 준수 여부·안전 보건 공용
         <select id="proposal-compliance-pm" style="display:block;width:100%;padding:7px;margin-top:4px">
           <option value="">미지정 — 저장된 총괄 값을 자동 적용하지 않음</option>
           ${portalOrder.filter(p => p.group === '감리원팀' && !/TBD|미정/i.test(p.name)).map(p => {

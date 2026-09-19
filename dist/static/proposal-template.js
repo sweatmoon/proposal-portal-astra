@@ -902,11 +902,11 @@ var ProposalTemplate = (() => {
       return ['3.6 총괄 감리 이력 조회 실패: 인력 DB 연결 및 응답을 확인하세요. 다른 인력의 실적이나 0건으로 대체하지 않습니다.'];
     }
   }
-  function replaceComplianceCopy(root, map) {
+  function replaceComplianceCopy(root, map, multilineTokens = /\[제안[^\]]+\]/) {
     // 새 제안 문구 토큰이 들어 있는 런만 OOXML 줄바꿈으로 확장한다.
     // 고정 문단과 기존 양식은 건드리지 않으며, 런의 글꼴·색상·강조를 복제한다.
-    const paragraphs = nodes(root, 'p').filter(p => /\[제안[^\]]+\]/.test(text(p).replace(/\s+/g, '')));
-    const unresolved = replace(root, token => map[token]);
+    const paragraphs = nodes(root, 'p').filter(p => multilineTokens.test(text(p).replace(/\s+/g, '')));
+    const unresolved = replace(root, typeof map === 'function' ? map : token => map[token]);
     for (const para of paragraphs) for (const run of children(para, 'r')) {
       const value = text(run);
       if (!value.includes('\n')) continue;
@@ -1105,7 +1105,143 @@ var ProposalTemplate = (() => {
     }
     return { zip, warnings: unique(out.warnings), slideCount: 1, mergeStrategy: 'FOREIGN_TEMPLATE' };
   }
+  // 일반 감리 단계의 실제 참여자만 사용. 추가 일반단계는 포함하되 상주/상시/검수지원 전용 인력은 제외.
+  function stagePersonnel(ctx, warnings) {
+    const assignments = ctx.stages.filter(s => !/상주|상시|검수지원/.test(s.stage)).flatMap(s => s.auditors);
+    if (assignments.some(p => !validAssignment(p))) warnings.push('단계감리원 배정에 누락·잘못된 공수가 있습니다. 확인된 양의 공수가 있는 인력은 유지했으므로 명단을 확인하세요.');
+    const active = unique(assignments.filter(p => ['pre', 'audit', 'post'].some(k => number(p[k]) > 0)).map(p => p.name).filter(Boolean));
+    const ordered = unique([...ctx.members.map(p => p.name).filter(n => active.includes(n)), ...active]);
+    const people = ordered.map(name => ctx.members.find(p => p.name === name) || { name })
+      .filter(p => !['전문가', '테스터'].includes(p.group));
+    if (people.some(p => !p.group)) warnings.push('단계감리원 중 제안 인력 목록에 없는 사람이 있습니다. 이름으로 다른 인력 DB를 추정하지 않습니다.');
+    const pm = people.find(p => p.name === ctx.opt.compliancePM && !/TBD|미정/i.test(p.name));
+    return { people: pm ? [pm, ...people.filter(p => p !== pm)] : people, pm };
+  }
+  async function loadEducationProfiles(ctx, people, warnings) {
+    const profiles = new Map(), projectId = Number(ctx.pd.proposalId);
+    let next = 0;
+    // 인력별 읽기 요청은 최대 3개 동시 실행. 결과는 원래 명단 순서로 사용한다.
+    await Promise.all(Array.from({ length: Math.min(3, people.length) }, async () => {
+      while (next < people.length) {
+        const person = people[next++], personnelId = Number(ctx.pd.personnelIdMap?.[person.name]);
+        if (!person.group || /TBD|미정/i.test(person.name) || !Number.isSafeInteger(personnelId) || personnelId <= 0 || !Number.isSafeInteger(projectId) || projectId <= 0) {
+          warnings.push(`계속교육 ${person.name}: 인력 DB 연결 ID 또는 사업 ID가 없어 교육 이력을 조회하지 못했습니다.`);
+          continue;
+        }
+        try {
+          const signal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(12000) : undefined;
+          const response = await fetch(`/api/personnel/${personnelId}/education-profile?projectId=${projectId}`, { cache: 'no-store', signal });
+          if (!response.ok) throw new Error('education_unavailable');
+          const result = await response.json(), p = result?.data;
+          if (!result.ok || !p || p.personnelId !== personnelId || p.projectId !== projectId || p.name !== person.name
+            || typeof p.educationName !== 'string' || typeof p.educationOrg !== 'string'
+            || !(p.educationHours === null || (typeof p.educationHours === 'number' && Number.isFinite(p.educationHours) && p.educationHours >= 0))) throw new Error('education_invalid');
+          profiles.set(person.name, p);
+          if (!p.educationName.trim() || !p.educationOrg.trim() || p.educationHours === null)
+            warnings.push(`계속교육 ${person.name}: 인력정보의 교육명·교육시간·교육기관 중 누락된 값이 있습니다.`);
+        } catch {
+          warnings.push(`계속교육 ${person.name}: 교육 이력 조회 실패. 해당 행을 유지하고 다른 사람의 교육이나 0시간으로 대체하지 않습니다.`);
+        }
+      }
+    }));
+    return profiles;
+  }
+  function visiblePersonnelShapes(doc, size) {
+    const tree = nodes(doc, 'spTree', P)[0];
+    if (!tree) throw new Error('등록 양식의 도형 목록이 없습니다.');
+    return Array.from(tree.childNodes).filter(el => {
+      if (el.nodeType !== 1) return false;
+      const b = geometry(el);
+      return b && b.x < +size.getAttribute('cx') && b.y < +size.getAttribute('cy') && b.x + b.w > 0 && b.y + b.h > 0;
+    });
+  }
+  function educationRows(table, people, profiles, rowMaps, warnings) {
+    const rows = children(table, 'tr');
+    const isData = r => /\[(?:이름\d+|교육명|교육시간|교육기관)\]/.test(text(r).replace(/\s+/g, ''));
+    const dataRows = rows.filter(isData);
+    if (!dataRows.length) return false; // 고정 표는 추정해서 덮어쓰지 않는다.
+    const start = rows.indexOf(dataRows[0]);
+    if (dataRows.some((r, i) => rows[start + i] !== r)
+      || dataRows.some(r => children(r, 'tc').some(c => c.hasAttribute('rowSpan') || c.hasAttribute('vMerge'))))
+      throw new Error('계속교육 인력 행의 연속 구조 또는 세로 병합을 확인하세요. 임의의 행을 삭제하지 않습니다.');
+    const budget = dataRows.reduce((sum, r) => sum + +r.getAttribute('h'), 0);
+    if (!Number.isFinite(budget) || budget <= 0) throw new Error('계속교육 인력 행 높이가 올바르지 않습니다.');
+    people.forEach((person, i) => {
+      const source = dataRows[Math.min(i, dataRows.length - 1)], copy = source.cloneNode(true);
+      if (people.length > dataRows.length) copy.setAttribute('h', String(Math.floor(budget / people.length) + (i < budget % people.length ? 1 : 0)));
+      const p = profiles.get(person.name);
+      rowMaps.set(copy, { name: person.name, values: {
+        '[교육명]': p?.educationName.trim() || undefined,
+        '[교육시간]': p?.educationHours ?? undefined,
+        '[교육기관]': p?.educationOrg.trim() || undefined,
+      } });
+      table.insertBefore(copy, dataRows[0]);
+    });
+    dataRows.forEach(r => table.removeChild(r));
+    const frame = ancestor(table, 'graphicFrame');
+    const xf = frame && children(frame, 'xfrm')[0], ext = xf && children(xf, 'ext')[0];
+    if (ext) ext.setAttribute('cy', String(tableHeight(table)));
+    if (people.length > dataRows.length) warnings.push(`계속교육 표를 ${dataRows.length}명에서 ${people.length}명으로 확장했습니다. 원본 글꼴은 유지하고 기존 인력 영역의 행 높이를 나누었으므로 배치를 확인하세요.`);
+    return true;
+  }
+  async function buildStagePersonnel(menu, vm) {
+    const education = menu.menu_code === 'CONTINUING_EDU';
+    const label = education ? '계속교육' : '안전·보건';
+    const template = (menu.templates || []).find(t => t.pptx_b64_key && t.variant_code === 'DEFAULT') || (menu.templates || []).find(t => t.pptx_b64_key);
+    if (!template) throw new Error(`${label} 목차에 등록된 PPT 양식이 없습니다.`);
+    const zip = await JSZip.loadAsync(template.pptx_b64_key, { base64: true });
+    const slides = await slidePaths(zip);
+    if (!slides.length || (education && slides.length !== 1)) throw new Error(`${label} 양식의 슬라이드 수를 확인하세요. 계속교육은 한 장의 인력 표를 사용합니다.`);
+    const pres = parse(await zip.file('ppt/presentation.xml').async('string')), size = nodes(pres, 'sldSz', P)[0];
+    if (!size) throw new Error(`${label} 슬라이드 크기가 없습니다.`);
+    const docs = await Promise.all(slides.map(async path => {
+      const doc = parse(await zip.file(path).async('string'));
+      return { path, doc, shapes: visiblePersonnelShapes(doc, size) };
+    }));
+    const ctx = context(vm._raw || vm, options()), warnings = [];
+    const { people, pm } = stagePersonnel(ctx, warnings), map = common(ctx, menu);
+    const hasEducation = education && docs.some(d => d.shapes.some(s => /\[교육(?:명|기관|시간|시간합계|시간평균)\]/.test(text(s).replace(/\s+/g, ''))));
+    const profiles = hasEducation ? await loadEducationProfiles(ctx, people, warnings) : new Map();
+    const rowMaps = new WeakMap();
+    if (education) {
+      const hours = people.map(p => profiles.get(p.name)?.educationHours);
+      const allKnown = hours.every(h => typeof h === 'number' && Number.isFinite(h) && h >= 0);
+      const sum = allKnown ? hours.reduce((s, h) => s + h, 0) : undefined;
+      const round = n => Math.round(n * 100) / 100;
+      map['[교육시간합계]'] = sum === undefined ? undefined : round(sum);
+      map['[교육시간평균]'] = sum === undefined || !people.length ? undefined : round(sum / people.length);
+      people.forEach((p, i) => { map[`[이름${i + 1}]`] = p.name; });
+      if (hasEducation && !allKnown) warnings.push('계속교육 시간에 미확인 값이 있어 합계·평균을 확정하지 않았습니다. 누락된 인력을 분모에서 제외하지 않습니다.');
+      if (!people.length) warnings.push('계속교육 대상 단계감리원이 없습니다. 빈 인력 행을 삭제하고 평균은 미확인으로 남겼습니다.');
+      if (hasEducation) warnings.push('계속교육은 인력정보에 저장된 교육명·시간·기관을 그대로 사용합니다. 최근 3년/40시간 자격 기준 충족을 자동 검증한 결과가 아니며 양식의 고정 충족 문구는 유지합니다.');
+    } else {
+      const others = people.filter(p => p !== pm);
+      map['[이름1]'] = pm?.name;
+      map['[이름2]'] = others[0]?.name;
+      map['[이름3]'] = others[1]?.name;
+      const usedNames = unique(docs.flatMap(d => d.shapes.flatMap(s => text(s).replace(/\s+/g, '').match(/\[이름[123]\]/g) || [])));
+      if (usedNames.includes('[이름1]') && !pm) warnings.push('안전·보건 총괄 PM이 미지정이거나 단계감리원이 아닙니다. [이름1]에 첫 인력을 임의 지정하지 않습니다.');
+      if (people.length < 3 && usedNames.some(token => map[token] === undefined)) warnings.push('안전·보건 단계감리원이 3명 미만입니다. 없는 인력의 이름 토큰은 미치환 상태로 남깁니다.');
+    }
+    for (const { path, doc, shapes } of docs) {
+      for (const shape of shapes) {
+        if (education) for (const table of nodes(shape, 'tbl')) educationRows(table, people, profiles, rowMaps, warnings);
+        const unresolved = replaceComplianceCopy(shape, (token, para) => {
+          const row = ancestor(para, 'tr'), person = row && rowMaps.get(row);
+          if (person && /^\[이름\d+\]$/.test(token)) return person.name;
+          if (person && Object.prototype.hasOwnProperty.call(person.values, token)) return person.values[token];
+          return map[token];
+        }, /\[교육(?:명|기관)\]/);
+        if (unresolved.length) warnings.push(`${label} 미치환: ${unresolved.join(', ')}`);
+        if (education) complianceOverflow(shape, warnings, '계속교육');
+      }
+      zip.file(path, new XMLSerializer().serializeToString(doc));
+    }
+    // 슬라이드 본문만 편집. 장표 밖 작업용 예시, master/layout/media/rels는 그대로 보존한다.
+    return { zip, warnings: unique(warnings), slideCount: slides.length, mergeStrategy: 'FOREIGN_TEMPLATE' };
+  }
   async function build(menu, vm) {
+    if (['CONTINUING_EDU', 'SAFETY_HEALTH'].includes(menu.menu_code)) return buildStagePersonnel(menu, vm);
     if (menu.menu_code === 'MANPOWER_RATIO') return buildRatio(menu, vm);
     if (['COMPLIANCE', 'SUMMARY_TABLE'].includes(menu.menu_code)) return buildCompliance(menu, vm);
     const template = (menu.templates || []).find(t => t.pptx_b64_key && t.variant_code === 'DEFAULT') || (menu.templates || []).find(t => t.pptx_b64_key);
