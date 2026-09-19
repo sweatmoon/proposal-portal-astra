@@ -415,16 +415,25 @@ class PhotoNasError extends Error {
   }
 }
 
+// 초기 QuickConnect 연결/이미지 다운로드에 요청당 60초를 허용한다. 로그아웃만 10초.
+const NAS_READ_TIMEOUT_MS = 60000
+function transientNasFailure(error?: string, stage?: string, code?: number): boolean {
+  return error === 'nas_timeout' || error === 'nas_connection_error'
+    || (error === 'nas_http_error' && [408, 429, 502, 503, 504].includes(code ?? 0))
+    || (error === 'nas_error' && ['login', 'list', 'download'].includes(stage ?? '') && [106, 107, 119].includes(code ?? 0))
+}
 async function photoRequest(params: Record<string, string>, stage: string): Promise<Buffer> {
+  const signal = AbortSignal.timeout(stage === 'logout' ? 10000 : NAS_READ_TIMEOUT_MS)
   try {
     const res = await fetch(`${NAS_BASE_URL}/webapi/entry.cgi`, {
-      method: 'POST', body: new URLSearchParams(params), signal: AbortSignal.timeout(15000),
+      method: 'POST', body: new URLSearchParams(params), signal,
     })
     if (!res.ok) throw new PhotoNasError(stage, res.status, 'nas_http_error')
     return Buffer.from(await res.arrayBuffer())
   } catch (e) {
     if (e instanceof PhotoNasError) throw e
-    throw new PhotoNasError(stage, undefined, 'nas_connection_error')
+    const timedOut = signal.aborted || (e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError'))
+    throw new PhotoNasError(stage, undefined, timedOut ? 'nas_timeout' : 'nas_connection_error')
   }
 }
 
@@ -499,7 +508,7 @@ async function loadClientLogo(org: string): Promise<ClientLogoResult> {
       return { ok: true, filename: match.filename, dataUri: `data:image/${png ? 'png' : 'jpeg'};base64,${buf.toString('base64')}` }
     } catch (e) {
       const err = e instanceof PhotoNasError ? e : new PhotoNasError('lookup', undefined, 'nas_invalid_response')
-      if (attempt === 0 && (err.kind === 'nas_connection_error' || [106, 107, 119].includes(err.code ?? 0))) continue
+      if (attempt === 0 && transientNasFailure(err.kind, err.stage, err.code)) continue
       return { ok: false, error: err.kind, stage: err.stage, code: err.code }
     } finally {
       if (sid) await photoRequest({ api: 'SYNO.API.Auth', version: '6', method: 'logout', session: 'FileStation', _sid: sid }, 'logout').catch(() => {})
@@ -521,7 +530,7 @@ async function loadPersonnelPhotoResults(names: string[]): Promise<PersonnelPhot
   for (let attempt = 0; attempt < 2; attempt++) {
     const pending = names.filter(name => {
       const r = results.get(name)
-      return !r || (!r.ok && (r.error === 'nas_connection_error' || (r.stage === 'download' && [106, 107, 119].includes(r.code ?? 0))))
+      return !r || (!r.ok && transientNasFailure(r.error, r.stage, r.code))
     })
     if (!pending.length) break
     let sid: string | undefined

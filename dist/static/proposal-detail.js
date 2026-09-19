@@ -2416,7 +2416,8 @@ async function loadProposalPhotos(pages) {
   const warnings = new Map()
   const labels = {
     nas_not_configured: 'NAS 환경변수 미설정',
-    nas_connection_error: 'NAS 연결 실패/시간 초과',
+    nas_connection_error: 'NAS 연결 실패',
+    nas_timeout: 'NAS 응답 시간 초과 (요청당 60초)',
     nas_http_error: 'NAS HTTP 오류',
     nas_error: 'NAS 조회 실패',
     nas_invalid_response: 'NAS 응답 형식 오류',

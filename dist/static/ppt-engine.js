@@ -664,13 +664,15 @@ async function _mergeForeign({ baseZip, srcZip, srcPresXml, srcPresRels, activeL
     }
   }
 
+  // 모든 본문이 활성 레이아웃으로 매핑되면 사용하지 않을 원본 마스터는 목록에 추가하지 않는다.
+  const allMapped = activeLayouts && (await ProposalTemplate.slidePaths(srcZip)).every(path => activeLayouts[path]);
   // ── 2단계: presentation.xml 에 master/slide 등록 ────────────────
   // src의 presentation.xml.rels에서 slideMaster 참조 추출
   const masterRids = [];
   srcPresRels.replace(/<Relationship\b[^>]*\/>/g, tag => {
     const type = tag.match(/\bType="([^"]+)"/)?.[1] || '';
     const tgt  = tag.match(/\bTarget="([^"]+)"/)?.[1] || '';
-    if (type.includes('/slideMaster') && tgt) {
+    if (!allMapped && type.includes('/slideMaster') && tgt) {
       // tgt = "slideMasters/slideMaster1.xml" → prefix 적용
       const slash = tgt.lastIndexOf('/');
       const prefixedTgt = slash >= 0

@@ -128,6 +128,41 @@ test('login failure preserves code without secrets or false not-found', async t 
   assert.equal(calls.length, 1);
 });
 
+test('NAS photo reads allow 60 seconds and retry only timed-out personnel, keeping successful images', async t => {
+  const deadlines = [];
+  t.mock.method(AbortSignal, 'timeout', ms => { deadlines.push(ms); return new AbortController().signal; });
+  let secondAttempts = 0;
+  const { mod, calls } = await nas(t, p => {
+    if (p.method === 'download' && p.path.includes('단계감리원B') && secondAttempts++ === 0) {
+      const error = new Error('deadline exceeded'); error.name = 'TimeoutError'; throw error;
+    }
+  });
+  const rows = await mod.fetchPersonnelPhotoResults(['단계감리원A', '단계감리원B']);
+  assert(rows.every(r => r.ok));
+  assert.deepEqual(deadlines, calls.map(p => p.method === 'logout' ? 10000 : 60000));
+  assert.equal(calls.filter(p => p.method === 'download' && p.path.includes('단계감리원A')).length, 1);
+  assert.equal(calls.filter(p => p.method === 'download' && p.path.includes('단계감리원B')).length, 2);
+  assert.equal(calls.filter(p => p.method === 'login').length, 2);
+});
+test('NAS photo timeout exhaustion is distinct from connection failure and file-not-found', async t => {
+  const { mod, calls } = await nas(t, p => {
+    if (p.method === 'download') { const e = new Error('timeout'); e.name = 'TimeoutError'; throw e; }
+  });
+  const [row] = await mod.fetchPersonnelPhotoResults(['단계감리원']);
+  assert.equal(row.ok, false); assert.equal(row.error, 'nas_timeout'); assert.equal(row.stage, 'download');
+  assert.equal(calls.filter(p => p.method === 'download').length, 2); assert.equal(row.dataUri, undefined);
+});
+test('NAS transient gateway errors retry while permission errors do not', async t => {
+  let tries = 0;
+  const { mod, calls } = await nas(t, p => {
+    if (p.method === 'download' && p.path.includes('일시실패') && tries++ === 0) return new Response('busy', { status: 503 });
+    if (p.method === 'download' && p.path.includes('권한없음')) return Response.json({ success: false, error: { code: 407 } });
+  });
+  const rows = await mod.fetchPersonnelPhotoResults(['일시실패', '권한없음']);
+  assert(rows[0].ok); assert.equal(rows[1].code, 407);
+  assert.equal(calls.filter(p => p.method === 'download' && p.path.includes('권한없음')).length, 1);
+});
+
 test('expired session is retried; already successful photos are not downloaded twice', async t => {
   let secondAttempts = 0;
   const { mod, calls } = await nas(t, p => {
