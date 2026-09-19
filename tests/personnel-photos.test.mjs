@@ -227,5 +227,5 @@ test('partial PPT downloads without confirm, while report stays attached', async
   await c.downloadProposalPpt(null);
   assert.equal(clicked, true);
   assert.ok(alerts.some(a => a.includes('다운로드했습니다')));
-  assert.ok(!detail.slice(detail.indexOf('async function downloadPhotoAssignPptx('), detail.indexOf('async function downloadSummaryTablePptx(')).includes('confirm('));
+  assert.ok(!detail.slice(detail.indexOf('async function downloadPhotoAssignPptx('), detail.indexOf('// ── 전체 합본 PPT')).includes('confirm('));
 });

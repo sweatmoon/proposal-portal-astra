@@ -401,115 +401,6 @@ function computeDetailSchedule1Rows() {
   })
 }
 
-async function downloadDetailSchedule1Pptx(btn, opts) {
-  opts = opts || {}
-  if (typeof PptxGenJS === 'undefined') { alert('PPT 라이브러리 로딩 중입니다. 잠시 후 다시 시도해주세요.'); return null }
-  setBtnState(btn, true)
-  try {
-    const stageRows = computeDetailSchedule1Rows()
-    if (!stageRows.length) { alert('일정 데이터가 없습니다.'); return null }
-    const extraSet = getExtraSet()
-    const pres = new PptxGenJS(); pres.layout = 'LAYOUT_WIDE'
-    const FONT_BOLD = 'KoPub돋움체 Bold', FONT_MEDIUM = 'KoPub돋움체 Medium'
-    const colW = [0.8472, 0.8472, 1.6944, 1.6944, 1.5403]
-    const tableX = 3.2717, tableY = 0.7635
-    const BORDER_COLOR = 'BFBFBF'
-    const bd = { pt: 0.5, color: BORDER_COLOR }, bd0 = { pt: 0, color: 'FFFFFF', type: 'none' }
-    const bMid = [bd, bd, bd, bd], bLeft = [bd, bd, bd, bd0], bRight = [bd, bd0, bd, bd]
-    const baseOpt = e => Object.assign({ align: 'center', valign: 'middle', margin: [0, 0, 0, 0] }, e)
-    const mdLabel = (d, m) => '(' + d + ')일 / (' + m + ')MD'
-    const STAGE_FILL = 'F2F2F2', HILITE_FILL = 'F2F2F2'
-    const STAGE_ROW_H = [0.1623, 0.1298, 0.1623, 0.1298, 0.1298, 0.1623, 0.1710]
-    const HEADER_H = 0.1623, TOTAL_H = 0.3254
-    const rows = [], rowH = []
-    rows.push([
-      { text: '단계', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: 'D2F0FF' }, border: bLeft }) },
-      { text: '수행 활동', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: 'D2F0FF' }, border: bMid }) },
-      { text: '수행 절차', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: 'D2F0FF' }, border: bMid }) },
-      { text: '세부 일정', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: 'D2F0FF' }, border: bMid }) },
-      { text: '소요 일수 및 공수', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: 'D2F0FF' }, border: bRight }) },
-    ]); rowH.push(HEADER_H)
-    let grandTotal = 0
-    stageRows.forEach(s => {
-      grandTotal += s.subtotalMD
-      if (s.isCompact) {
-        rows.push([
-          { text: s.stage, options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', rowspan: 2, fill: { color: STAGE_FILL }, border: bLeft }) },
-          { text: '감리시행', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-          { text: s.compactLabel, options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: HILITE_FILL }, border: bMid }) },
-          { text: s.compactDate, options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: HILITE_FILL }, border: bMid }) },
-          { text: mdLabel(s.subtotalDays, s.subtotalMD), options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', border: bRight }) },
-        ]); rowH.push(STAGE_ROW_H[0])
-        rows.push([
-          { text: '소계', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 10, color: '000000', colspan: 3, fill: { color: STAGE_FILL }, border: bMid }) },
-          { text: mdLabel(s.subtotalDays, s.subtotalMD), options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: STAGE_FILL }, border: bRight }) },
-        ]); rowH.push(STAGE_ROW_H[6])
-        return
-      }
-      const showPre = s.preMD > 0, showPost = s.postMD > 0
-      let pushed = false
-      if (showPre) {
-        const preEnd = s.startD ? shiftDateStr(s.startD, -1) : ''
-        const preDate = s.startD ? ('~ ' + preEnd) : '예비조사'
-        rows.push([
-          { text: s.stage, options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', rowspan: (showPre ? 1 : 0) + 3 + (showPost ? 1 : 0) + 1, fill: { color: STAGE_FILL }, border: bLeft }) },
-          { text: '사전 검토', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-          { text: '예비조사', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-          { text: preDate, options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-          { text: mdLabel(1, s.preMD), options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', border: bRight }) },
-        ]); rowH.push(STAGE_ROW_H[1]); pushed = true
-      }
-      const auditDate = s.startD && s.endD ? (s.startD + ' ~ ' + s.endD) : (s.compactDate || '')
-      rows.push([
-        !pushed ? { text: s.stage, options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', rowspan: 3 + (showPost ? 1 : 0) + 1, fill: { color: STAGE_FILL }, border: bLeft }) } : null,
-        { text: '감리시행', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-        { text: '현장감리', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: HILITE_FILL }, border: bMid }) },
-        { text: auditDate, options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: HILITE_FILL }, border: bMid }) },
-        { text: mdLabel(s.days, s.auditMD), options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', border: bRight }) },
-      ].filter(Boolean)); rowH.push(STAGE_ROW_H[2]); pushed = true
-      rows.push([
-        { text: '결과 검토', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-        { text: '감리결과보고서 작성', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-        { text: '', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-        { text: '', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bRight }) },
-      ]); rowH.push(STAGE_ROW_H[3])
-      rows.push([
-        { text: '후속 조치', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-        { text: '시정조치 확인', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-        { text: '', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-        { text: '', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bRight }) },
-      ]); rowH.push(STAGE_ROW_H[4])
-      if (showPost) {
-        const postDate = s.endD ? (shiftDateStr(s.endD, 14) + ' ~') : ''
-        rows.push([
-          { text: '조치확인', options: baseOpt({ fontFace: FONT_MEDIUM, fontSize: 9, color: '000000', border: bMid }) },
-          { text: '조치확인', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: HILITE_FILL }, border: bMid }) },
-          { text: postDate, options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', fill: { color: HILITE_FILL }, border: bMid }) },
-          { text: mdLabel(1, s.postMD), options: baseOpt({ fontFace: FONT_BOLD, fontSize: 9, color: '000000', border: bRight }) },
-        ]); rowH.push(STAGE_ROW_H[5])
-      }
-      rows.push([
-        { text: '소계', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 10, color: '000000', colspan: 4, fill: { color: STAGE_FILL }, border: bMid }) },
-        { text: grandTotal + ' MD', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 10, color: '000000', fill: { color: STAGE_FILL }, border: bRight }) },
-      ]); rowH.push(STAGE_ROW_H[6])
-    })
-    rows.push([
-      { text: '합계', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 10, color: '000000', colspan: 4, fill: { color: 'D2F0FF' }, border: bLeft }) },
-      { text: grandTotal + ' MD', options: baseOpt({ fontFace: FONT_BOLD, fontSize: 10, color: '000000', fill: { color: 'D2F0FF' }, border: bRight }) },
-    ]); rowH.push(TOTAL_H)
-    const sld = pres.addSlide()
-    sld.addTable(rows, { x: tableX, y: tableY, w: colW.reduce((a, b) => a + b, 0), colW, rowH })
-    if (opts.returnZip) {
-      const ab = await pres.write({ outputType: 'arraybuffer' })
-      const z = new JSZip(); await z.loadAsync(ab); return { zip: z }
-    }
-    await pres.writeFile({ fileName: '세부감리일정1_' + (parsedData.projectTitle || '').slice(0, 10) + '.pptx' })
-    showAutoAlert('✅ 세부 감리 일정 (1) 생성 완료', true)
-    return null
-  } catch (e) { showAutoAlert('❌ 생성 실패: ' + e.message, false); return null }
-  finally { setBtnState(btn, false) }
-}
-
 // ── 표장표 PPT ──────────────────────────────────────────────
 function computeAssignRows() {
   const { stages, personGradeMap, personFieldMap, portalOrder } = parsedData
@@ -555,6 +446,7 @@ function computeAssignRows() {
 //   폰트: KoPub돋움체 Bold, sz=11pt(헤더)/10pt(데이터)
 // ────────────────────────────────────────────────────────────────
 
+// 합본 엔진용 ZIP 반환 함수. 개별 파일 다운로드는 제공하지 않는다.
 async function downloadAssignPptx(btn, opts) {
   opts = opts || {}
   if (typeof PptxGenJS === 'undefined') { alert('PPT 라이브러리 로딩 중입니다.'); return null }
@@ -921,25 +813,12 @@ async function downloadAssignPptx(btn, opts) {
         }
       }
 
-      if (opts.returnZip) return { zip: tplZip }
-      const finalAb = await tplZip.generateAsync({ type: 'arraybuffer', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' })
-      const blob = new Blob([finalAb], { type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' })
-      const url  = URL.createObjectURL(blob)
-      const a    = document.createElement('a'); a.href = url
-      a.download = '표장표_' + (parsedData.projectTitle || '').slice(0, 10) + '.pptx'
-      a.click(); URL.revokeObjectURL(url)
-      showAutoAlert('✅ 표장표 생성 완료', true)
-      return null
+      return { zip: tplZip }
 
     } else {
       // [B] 템플릿 없는 경우 — 빈 슬라이드에 테이블만
-      if (opts.returnZip) {
-        const ab = await presTemp.write({ outputType: 'arraybuffer' })
-        const z  = new JSZip(); await z.loadAsync(ab); return { zip: z }
-      }
-      await presTemp.writeFile({ fileName: '표장표_' + (parsedData.projectTitle || '').slice(0, 10) + '.pptx' })
-      showAutoAlert('✅ 표장표 생성 완료', true)
-      return null
+      const ab = await presTemp.write({ outputType: 'arraybuffer' })
+      const z = new JSZip(); await z.loadAsync(ab); return { zip: z }
     }
 
   } catch (e) {
@@ -2571,6 +2450,7 @@ async function loadProposalPhotos(pages) {
   return [...warnings].map(([label, names]) => label + ' — 기존 대체 이미지 사용: ' + [...names].join(', '))
 }
 
+// 합본 엔진용 ZIP 반환 함수. 사진 슬롯 및 경고는 합본에 전달한다.
 async function downloadPhotoAssignPptx(btn, opts) {
   opts = opts || {}
   if (typeof JSZip === 'undefined') { alert('JSZip 라이브러리 로딩 중입니다. 잠시 후 다시 시도해주세요.'); return null }
@@ -2779,21 +2659,7 @@ async function downloadPhotoAssignPptx(btn, opts) {
     const people = pages.flatMap(pg => Object.values(pg.slotPeople))
     const missingProfiles = [...new Set(people.filter(p => !p.personnelId || !profileMap[p.personnelId]).map(p => p.name))]
     if (missingProfiles.length) warnings.push('프로파일 확인 필요: ' + missingProfiles.join(', '))
-    if (opts.returnZip) return { zip, warnings }
-    // 단독 다운로드도 확인창 없이 진행하고 경고는 완료 메시지에 표시한다.
-
-    const today = new Date().toISOString().slice(0, 10)
-    const blob = await zip.generateAsync({
-      type: 'blob',
-      mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url; a.download = `사진장표_${today}.pptx`
-    document.body.appendChild(a); a.click(); a.remove()
-    setTimeout(() => URL.revokeObjectURL(url), 1000)
-    showAutoAlert(warnings.length ? '사진장표 다운로드 완료. 검토 사항: ' + warnings.join(' / ') : '사진장표 다운로드 완료', !warnings.length)
-    return null
+    return { zip, warnings }
   } catch (e) {
     console.error(e)
     showAutoAlert('❌ 생성 실패: ' + e.message, false)
@@ -2801,39 +2667,6 @@ async function downloadPhotoAssignPptx(btn, opts) {
     return null
   }
   finally { setBtnState(btn, false) }
-}
-
-// ── 요약표 PPT ──────────────────────────────────────────────
-async function downloadSummaryTablePptx(btn, opts) {
-  opts = opts || {}
-  setBtnState(btn, true)
-  try {
-    let menu = opts.menu
-    let reportMenus = opts.menus || []
-    if (!menu) {
-      const registry = await PptMenuRegistry.load(true)
-      reportMenus = registry.list
-      menu = registry.byCode.COMPLIANCE || registry.byCode.SUMMARY_TABLE
-    }
-    if (!menu) throw new Error('3.6 준수 여부 목차가 등록되어 있지 않습니다.')
-    const result = await ProposalTemplate.build(menu, opts.vm || parsedData)
-    if (opts.returnZip) return result
-    renderProposalReport({ status: '검토 필요', total: 1, entries: [{
-      ...proposalReportLocation(menu, reportMenus), status: result.warnings.length ? '검토 필요' : '생성됨',
-      slides: result.slideCount || 1, warnings: result.warnings,
-    }], warnings: ['다운로드는 초안입니다. 생성 결과와 증빙 확인 항목을 최종 검수하세요.'] })
-    const blob = await result.zip.generateAsync({ type: 'blob' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = '3.6_주관기관_요청사항_준수여부.pptx'
-    document.body.appendChild(link); link.click(); link.remove()
-    setTimeout(() => URL.revokeObjectURL(url), 10000)
-    showAutoAlert('등록 양식으로 3.6 초안을 생성했습니다. 생성 보고서와 증빙 확인 항목을 검토하세요.', false)
-  } catch (e) {
-    showAutoAlert('요약표 생성 실패: ' + e.message, false)
-    if (opts.returnZip) throw e
-  } finally { setBtnState(btn, false) }
 }
 
 // ── 전체 합본 PPT ───────────────────────────────────────────

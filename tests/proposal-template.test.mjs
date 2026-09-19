@@ -547,18 +547,42 @@ test('user revised 3.6 aliases work through dispatcher and merge without unsuppo
   assert(!/\[[^\]]+\]/.test(txt));
 });
 
-const summaryFunctionSource = readFileSync(new URL('../public/static/proposal-detail.js', import.meta.url), 'utf8').split('async function downloadSummaryTablePptx')[1].split('// ── 전체 합본 PPT')[0];
-test('standalone 3.6 reloads registry, returns same template result and downloads despite warnings', async () => {
-  const c = complianceSandbox(complianceChoices); let clicked = 0, calls = 0;
-  c.parsedData = complianceFixture(); c.setBtnState = () => {}; c.setTimeout = fn => fn();
-  c.URL = { createObjectURL: () => 'blob:test', revokeObjectURL() {} };
-  c.fetch = async url => { assert.equal(url, '/api/ppt-menus?category=proposal'); calls++; return { json: async () => ({ ok: true, data: [menu('COMPLIANCE', complianceB64)] }) }; };
-  c.document.createElement = () => ({ click() { clicked++; }, remove() {} }); c.document.body = { appendChild() {} };
-  vm.runInContext('renderProposalReport = () => { reportCalls++; }', Object.assign(c, { reportCalls: 0 }));
-  vm.runInContext('async function downloadSummaryTablePptx' + summaryFunctionSource, c);
-  const result = await c.downloadSummaryTablePptx(null, { returnZip: true });
-  assert.equal(result.slideCount, 1); assert(result.warnings.length > 0);
-  await c.downloadSummaryTablePptx(null); assert.equal(clicked, 1); assert.equal(c.reportCalls, 1); assert.equal(calls, 2);
+test('individual generation UI is removed while full-deck download and shared builders remain', async () => {
+  const result = await renderRequirements({});
+  const modal = result.html.querySelector('#autoModal');
+  assert(!modal.text.includes('개별 생성'));
+  const handlers = modal.querySelectorAll('button').map(b => b.getAttribute('onclick') || '');
+  assert.equal(handlers.filter(h => h === 'downloadAllPptx(this)').length, 1);
+  assert(!handlers.some(h => /downloadProposalPpt|downloadAssignPptx|downloadPhotoAssignPptx|downloadSummaryTablePptx/.test(h)));
+  const source = readFileSync(new URL('../public/static/proposal-detail.js', import.meta.url), 'utf8');
+  assert(!source.includes('async function downloadSummaryTablePptx('));
+  assert(!source.includes('async function downloadDetailSchedule1Pptx('));
+  for (const [start, end] of [['async function downloadAssignPptx(', '// ── buildHistoryPptx'], ['async function downloadPhotoAssignPptx(', '// ── 전체 합본 PPT']]) {
+    const body = source.slice(source.indexOf(start), source.indexOf(end));
+    assert(body.includes('return { zip'));
+    assert(!/createObjectURL|writeFile|\.click\(/.test(body));
+  }
+  const calls = [], alerts = [], button = {};
+  const c = vm.createContext({ downloadProposalPpt: async (...args) => { calls.push(args); return 'merged'; }, showAutoAlert: (...args) => alerts.push(args) });
+  vm.runInContext(source.slice(source.indexOf('async function downloadAllPptx('), source.indexOf('// ── 인원 상세 모달')), c);
+  assert.equal(await c.downloadAllPptx(button), 'merged');
+  assert.deepEqual(calls, [[button]]);
+  c.downloadProposalPpt = undefined;
+  await c.downloadAllPptx(button);
+  assert.equal(calls.length, 1); assert(alerts[0][0].includes('엔진을 불러오지 못했습니다'));
+});
+
+test('full-deck dispatcher retains photo and assignment ZIP builders after individual download removal', async () => {
+  const c = sandbox(), calls = [];
+  c.downloadPhotoAssignPptx = async (btn, opts) => { calls.push(opts); return { zip: new JSZip(), warnings: ['photo warning'] }; };
+  c.downloadAssignPptx = async (btn, opts) => { calls.push(opts); return { zip: new JSZip() }; };
+  for (const code of ['AUDITOR_PROFILE', 'CORE_EXPERT_PROFILE', 'EXPERT_PROFILE', 'ASSIGN_TABLE']) {
+    const result = await c.generateMenuPpt(menu(code), {});
+    assert(result.zip);
+  }
+  assert.equal(calls.length, 4);
+  assert(calls.every(o => o.returnZip === true));
+  assert.deepEqual(calls.slice(0, 3).map(o => o.menuCode), ['AUDITOR_PROFILE', 'CORE_EXPERT_PROFILE', 'EXPERT_PROFILE']);
 });
 
 const tsModuleUrl = source => 'data:text/javascript;base64,' + Buffer.from(ts.transpileModule(source, {

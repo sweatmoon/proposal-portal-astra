@@ -1094,15 +1094,6 @@ app.get('/proposals/:id', async (c) => {
       <button onclick="downloadAllPptx(this)" style="width:100%;padding:14px 0;font-size:16px;font-weight:800;color:#fff;background:linear-gradient(135deg,#7c3aed,#4338ca);border:none;border-radius:9px;cursor:pointer;box-shadow:0 3px 10px rgba(67,56,202,.4);font-family:inherit;margin-bottom:16px">
         🚀 자동화 생성 (전체 합본)
       </button>
-      <details style="margin-top:4px">
-        <summary style="cursor:pointer;color:#555;font-size:13px;font-weight:600;padding:4px 0">🔧 개별 생성</summary>
-        <div style="margin-top:10px;display:flex;flex-direction:column;gap:10px">
-          <button onclick="downloadProposalPpt(this, ['DETAIL_SCHEDULE'])" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">📅 세부 감리 일정 (1, 2) 생성</button>
-          <button onclick="downloadAssignPptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">📋 표장표 생성</button>
-          <button onclick="downloadPhotoAssignPptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">🖼️ 사진장표 생성</button>
-          <button onclick="downloadSummaryTablePptx(this)" style="background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:9px 14px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-align:left">📊 요약표 생성</button>
-        </div>
-      </details>
     </div>
   </div>
 
