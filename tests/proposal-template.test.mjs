@@ -1379,7 +1379,9 @@ for (const [groupFilter, perPage] of [['AUDITOR', 2], ['EXPERT', 4]]) {
       assert.equal(c.ProposalTemplate.text(titlePara), `실적 시험 (${i + 1}/3)`);
       const numberRun = c.ProposalTemplate.nodes(titlePara, 'r').at(-1);
       assert.equal(c.ProposalTemplate.nodes(numberRun, 'rPr')[0].getAttribute('sz'), '1600');
-      assert.equal(c.ProposalTemplate.nodes(numberRun, 'rPr')[0].getAttribute('i'), '1');
+      assert.equal(c.ProposalTemplate.nodes(numberRun, 'rPr')[0].getAttribute('i'), '0');
+      assert.equal(c.ProposalTemplate.nodes(numberRun, 'rPr')[0].getAttribute('b'), '1');
+      for (const font of ['latin', 'ea', 'cs']) assert.equal(c.ProposalTemplate.nodes(numberRun, font)[0].getAttribute('typeface'), 'KoPub돋움체 Medium');
     }
     assert.deepEqual(await result.zip.file('ppt/media/reference.png').async('nodebuffer'), fixture.image);
     assert(!result.zip.file('ppt/slides/slide9.xml'));
@@ -1594,12 +1596,19 @@ test('photo page counts restart for distinct menu entries even when their titles
 test('repeated titles preserve original style, split tokens, XML text and paragraph end ordering', () => {
   const c = sandbox(), T = c.ProposalTemplate;
   for (const parts of [['[제목]'], ['[ 제', '목 ]']]) {
-    const d = T.parse(slide(shape(para(...parts).replace('</a:p>', '<a:endParaRPr sz="2400"/></a:p>')) + shape(para('고정 본문'))));
+    const d = T.parse(slide(shape(para(...parts).replaceAll('<a:rPr sz="1200"/>', '<a:rPr sz="1200" b="0" i="1"><a:latin typeface="Original"/><a:ea typeface="Original"/><a:cs typeface="Original"/></a:rPr>').replace('</a:p>', '<a:endParaRPr sz="2400"/></a:p>')) + shape(para('고정 본문'))));
     assert.equal(c.replaceRepeatedSlideTitle(d, '3.4 실적 & <경력>', 2, 3), true);
     const p = T.nodes(d, 'p')[0], r = T.nodes(p, 'r');
     assert.equal(T.text(p), '3.4 실적 & <경력> (2/3)');
     assert.equal(T.nodes(r[0], 'rPr')[0].getAttribute('sz'), '1200');
-    assert.equal(T.nodes(r.at(-1), 'rPr')[0].getAttribute('sz'), '1600');
+    assert.equal(T.nodes(r[0], 'rPr')[0].getAttribute('b'), '0');
+    assert.equal(T.nodes(r[0], 'rPr')[0].getAttribute('i'), '1');
+    assert.equal(T.nodes(r[0], 'ea')[0].getAttribute('typeface'), 'Original');
+    const pagePr = T.nodes(r.at(-1), 'rPr')[0];
+    assert.equal(pagePr.getAttribute('sz'), '1600');
+    assert.equal(pagePr.getAttribute('b'), '1');
+    assert.equal(pagePr.getAttribute('i'), '0');
+    for (const font of ['latin', 'ea', 'cs']) assert.equal(T.nodes(pagePr, font)[0].getAttribute('typeface'), 'KoPub돋움체 Medium');
     assert.equal(Array.from(p.childNodes).filter(n => n.nodeType === 1).at(-1).localName, 'endParaRPr');
     assert.equal(T.text(T.nodes(d, 'p')[1]), '고정 본문');
     assert.equal(T.text(T.nodes(T.parse(new XMLSerializer().serializeToString(d)), 'p')[0]), '3.4 실적 & <경력> (2/3)');
@@ -1621,7 +1630,13 @@ for (const size of [2, 4, 6, 9]) {
       for (let i = 0; i < paths.length; i++) {
         const p = T.nodes(T.parse(await zip.file(paths[i]).async('string')), 'p').find(p => T.text(p).startsWith('3.'));
         assert(p); assert.equal(T.text(p), pages[i].slideTitle + (i < 2 ? ` (${i + 1}/2)` : ''));
-        if (i < 2) assert.equal(T.nodes(T.nodes(p, 'r').at(-1), 'rPr')[0].getAttribute('sz'), '1600');
+        if (i < 2) {
+          const pagePr = T.nodes(T.nodes(p, 'r').at(-1), 'rPr')[0];
+          assert.equal(pagePr.getAttribute('sz'), '1600');
+          assert.equal(pagePr.getAttribute('b'), '1');
+          assert.equal(pagePr.getAttribute('i'), '0');
+          for (const font of ['latin', 'ea', 'cs']) assert.equal(T.nodes(pagePr, font)[0].getAttribute('typeface'), 'KoPub돋움체 Medium');
+        }
       }
     };
     await check(result, await T.slidePaths(result));

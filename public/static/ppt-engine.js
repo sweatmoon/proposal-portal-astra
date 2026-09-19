@@ -810,7 +810,15 @@ function replaceRepeatedSlideTitle(doc, title, page, total, labels = ['[제목]'
       const r = doc.createElementNS(A, 'a:r');
       const sourcePr = sourceRun.getElementsByTagNameNS(A, 'rPr')[0];
       const pr = sourcePr ? sourcePr.cloneNode(true) : doc.createElementNS(A, 'a:rPr');
-      pr.setAttribute('sz', '1600'); pr.setAttribute('i', '1');
+      pr.setAttribute('sz', '1600'); pr.setAttribute('b', '1'); pr.setAttribute('i', '0');
+      // 서체 이름은 Medium, 굵기는 PowerPoint의 Bold 속성으로 명시한다.
+      for (const font of Array.from(pr.childNodes).filter(n => ['latin', 'ea', 'cs'].includes(n.localName))) pr.removeChild(font);
+      const fontAnchor = Array.from(pr.childNodes).find(n => ['sym', 'hlinkClick', 'hlinkMouseOver', 'rtl', 'extLst'].includes(n.localName)) || null;
+      for (const tag of ['latin', 'ea', 'cs']) {
+        const font = doc.createElementNS(A, 'a:' + tag);
+        font.setAttribute('typeface', 'KoPub돋움체 Medium');
+        pr.insertBefore(font, fontAnchor);
+      }
       r.appendChild(pr);
       const t = doc.createElementNS(A, 'a:t'); t.textContent = ` (${page}/${total})`; r.appendChild(t);
       const endPr = Array.from(p.childNodes).find(n => n.localName === 'endParaRPr');
