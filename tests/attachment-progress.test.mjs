@@ -28,7 +28,9 @@ async function app(t, options = {}) {
   const key = '__attachment_mock_' + seq++;
   const calls = [];
   const functions = [...source.matchAll(/import \{ (build\w+)/g)].map(m => m[1]);
-  const mock = { mergeDecksSharingMaster: async decks => {
+  const mock = { queryOne: async () => null, fetchClientLogo: async () => { throw new Error('No logo call without active master'); },
+    prepareAttachmentMaster: async () => { throw new Error('No active master'); }, mergeWithAttachmentMaster: async () => { throw new Error('No active master'); },
+    mergeDecksSharingMaster: async decks => {
     calls.push('merge'); if (options.fail === 'merge') throw new Error('합본 시험 오류');
     let n = 0; for (const z of decks) n += ((await z.file('ppt/presentation.xml').async('string')).match(/<p:sldId /g) || []).length;
     return deck(n);
@@ -59,7 +61,7 @@ test('attachment streaming sends actual ordered results, cover, merge and unchan
   const { route, calls } = await app(t);
   const res = await request(route); assert.equal(res.headers.get('cache-control'), 'no-store');
   const events = []; const result = await parser()(res, e => events.push(e));
-  assert.deepEqual(events.filter(e => e.type === 'start').map(e => e.key), ['schedule', 'licenseCert', 'cover', 'merge']);
+  assert.deepEqual(events.filter(e => e.type === 'start').map(e => e.key), ['master', 'schedule', 'licenseCert', 'cover', 'merge']);
   assert.equal(result.totalSlides, 8); assert.equal(result.blob.size, result.size);
   const zip = await JSZip.loadAsync(await result.blob.arrayBuffer());
   assert.equal(Object.keys(zip.files).filter(k => /slide\d+\.xml$/.test(k)).length, 8);
@@ -73,9 +75,9 @@ test('attachment start event arrives while its builder is still pending, not fab
   const res = await request(route, form(['schedule']));
   let started; const start = new Promise(resolve => { started = resolve; });
   const events = [];
-  const job = parser()(res, e => { events.push(e); if (e.type === 'start') started(); });
+  const job = parser()(res, e => { events.push(e); if (e.type === 'start' && e.key === 'schedule') started(); });
   await start;
-  assert.equal(events.some(e => e.type === 'item'), false);
+  assert.equal(events.some(e => e.type === 'item' && e.key === 'schedule'), false);
   release(); await job;
 });
 test('attachment failure preserves earlier results and stops without merging or returning a file', async t => {

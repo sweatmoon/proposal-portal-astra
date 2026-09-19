@@ -24,7 +24,8 @@
  * POST   /api/ppt-compositions/reorder         — 순서 일괄 변경
  */
 import { Hono } from 'hono';
-import { query, queryOne } from '../db/client.js';
+import { query, queryOne, transaction } from '../db/client.js';
+import { inspectAttachmentMaster } from '../lib/pptx-attachment-master.js';
 import { inflateRawSync } from 'zlib';
 const app = new Hono();
 // ─────────────────────────────────────────────────
@@ -1225,91 +1226,104 @@ app.delete('/presets/:id', async (c) => {
 //     PUT    /api/ppt-menus/master-templates/:id/activate — 활성 마스터 변경
 //     DELETE /api/ppt-menus/master-templates/:id     — 삭제
 // ═══════════════════════════════════════════════════════════════════
-/** GET /api/ppt-menus/master-templates — 목록 (pptx_b64 제외, 용량 절약) */
+// Existing array metadata is proposal-scoped. Attachment metadata uses the same JSONB column,
+// so no schema migration or automatic rewrite of registered templates is required.
+const MASTER_SCOPE = "COALESCE(layouts->>'scope', 'proposal')";
+const masterCategory = (raw) => raw === undefined ? 'proposal' : (['proposal', 'attachment'].includes(raw) ? raw : null);
+function masterResponse(row) {
+    const metadata = row.layouts;
+    return { ...row, category: !Array.isArray(metadata) && metadata?.scope === 'attachment' ? 'attachment' : 'proposal',
+        layouts: Array.isArray(metadata) ? metadata : metadata?.names || [] };
+}
 app.get('/master-templates', async (c) => {
+    const category = masterCategory(c.req.query('category'));
+    if (!category)
+        return c.json({ ok: false, error: '잘못된 마스터 구분입니다' }, 400);
+    c.header('Cache-Control', 'no-store');
     try {
-        const rows = await query(`
-      SELECT id, name, description, layouts, is_active, created_at
-      FROM ppt_master_templates
-      ORDER BY is_active DESC, created_at DESC
-    `);
-        return c.json({ ok: true, data: rows });
+        const rows = await query(`SELECT id,name,description,layouts,is_active,created_at FROM ppt_master_templates WHERE ${MASTER_SCOPE}=$1 ORDER BY is_active DESC,created_at DESC,id DESC`, [category]);
+        return c.json({ ok: true, data: rows.map(masterResponse) });
     }
-    catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return c.json({ ok: false, error: msg }, 500);
+    catch {
+        return c.json({ ok: false, error: '마스터 목록을 조회하지 못했습니다' }, 503);
     }
 });
-/** GET /api/ppt-menus/master-templates/active — 현재 활성 마스터 (pptx_b64 포함) */
 app.get('/master-templates/active', async (c) => {
+    const category = masterCategory(c.req.query('category'));
+    if (!category)
+        return c.json({ ok: false, error: '잘못된 마스터 구분입니다' }, 400);
+    c.header('Cache-Control', 'no-store');
     try {
-        const row = await queryOne(`
-      SELECT id, name, description, pptx_b64, layouts, is_active, created_at
-      FROM ppt_master_templates
-      WHERE is_active = 1
-      ORDER BY created_at DESC LIMIT 1
-    `);
-        return c.json({ ok: true, data: row ?? null });
+        const row = await queryOne(`SELECT id,name,description,pptx_b64,layouts,is_active,created_at FROM ppt_master_templates WHERE is_active=1 AND ${MASTER_SCOPE}=$1 ORDER BY created_at DESC,id DESC LIMIT 1`, [category]);
+        return c.json({ ok: true, data: row ? masterResponse(row) : null });
     }
-    catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return c.json({ ok: false, error: msg }, 500);
+    catch {
+        return c.json({ ok: false, error: '활성 마스터를 조회하지 못했습니다' }, 503);
     }
 });
-/** POST /api/ppt-menus/master-templates — 업로드 */
 app.post('/master-templates', async (c) => {
+    const category = masterCategory(c.req.query('category'));
+    if (!category)
+        return c.json({ ok: false, error: '잘못된 마스터 구분입니다' }, 400);
     try {
-        const formData = await c.req.formData();
-        const file = formData.get('file');
-        const name = formData.get('name')?.trim() || '';
-        const description = formData.get('description')?.trim() || '';
-        const setActive = formData.get('set_active') === '1' || formData.get('set_active') === 'true';
-        if (!file || !name)
-            return c.json({ ok: false, error: 'file, name 필수' }, 400);
-        // 파일 → base64
-        const buf = Buffer.from(await file.arrayBuffer());
-        const b64 = buf.toString('base64');
-        // PPTX(ZIP)에서 레이아웃 이름 추출
-        const layouts = extractLayoutNamesFromPptx(buf);
-        // 활성으로 설정 시 기존 활성 해제
-        if (setActive) {
-            await exec(`UPDATE ppt_master_templates SET is_active = 0, updated_at = NOW()`);
-        }
-        const row = await queryOne(`
-      INSERT INTO ppt_master_templates (name, description, pptx_b64, layouts, is_active)
-      VALUES ($1, $2, $3, $4, $5) RETURNING id
-    `, [name, description, b64, JSON.stringify(layouts), setActive ? 1 : 0]);
-        return c.json({ ok: true, id: row?.id, layouts });
+        const form = await c.req.formData(), file = form.get('file'), name = String(form.get('name') || '').trim(), description = String(form.get('description') || '').trim();
+        const active = ['1', 'true'].includes(String(form.get('set_active')));
+        if (!file || typeof file === 'string' || !name || !file.name.toLowerCase().endsWith('.pptx'))
+            return c.json({ ok: false, error: '이름과 PPTX 파일이 필요합니다' }, 400);
+        if (!file.size || file.size > 20 * 1024 * 1024)
+            return c.json({ ok: false, error: '마스터 파일은 0바이트 초과 20MB 이하여야 합니다' }, 400);
+        const buffer = Buffer.from(await file.arrayBuffer());
+        const layouts = category === 'attachment' ? (await inspectAttachmentMaster(buffer)).layouts.map(l => l.name) : extractLayoutNamesFromPptx(buffer);
+        if (!layouts.length)
+            return c.json({ ok: false, error: '유효한 마스터 레이아웃이 없습니다' }, 400);
+        const metadata = category === 'attachment' ? { scope: 'attachment', names: layouts } : layouts;
+        const id = await transaction(async (client) => {
+            await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['ppt-master:' + category]);
+            if (active)
+                await client.query(`UPDATE ppt_master_templates SET is_active=0,updated_at=NOW() WHERE ${MASTER_SCOPE}=$1`, [category]);
+            const result = await client.query(`INSERT INTO ppt_master_templates(name,description,pptx_b64,layouts,is_active) VALUES($1,$2,$3,$4,$5) RETURNING id`, [name, description, buffer.toString('base64'), JSON.stringify(metadata), active ? 1 : 0]);
+            return result.rows[0].id;
+        });
+        return c.json({ ok: true, id, layouts, category });
     }
     catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return c.json({ ok: false, error: msg }, 400);
+        return c.json({ ok: false, error: e instanceof Error ? e.message : '마스터 등록 실패' }, 400);
     }
 });
-/** PUT /api/ppt-menus/master-templates/:id/activate — 활성 마스터 변경 */
 app.put('/master-templates/:id/activate', async (c) => {
+    const category = masterCategory(c.req.query('category')), id = Number(c.req.param('id'));
+    if (!category || !Number.isSafeInteger(id) || id <= 0)
+        return c.json({ ok: false, error: '잘못된 마스터 요청입니다' }, 400);
     try {
-        const id = Number(c.req.param('id'));
-        // 전체 비활성화 후 선택된 것만 활성화
-        await exec(`UPDATE ppt_master_templates SET is_active = 0, updated_at = NOW()`);
-        await exec(`UPDATE ppt_master_templates SET is_active = 1, updated_at = NOW() WHERE id = $1`, [id]);
-        return c.json({ ok: true });
+        const found = await transaction(async (client) => {
+            await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['ppt-master:' + category]);
+            const target = await client.query(`SELECT id FROM ppt_master_templates WHERE id=$1 AND ${MASTER_SCOPE}=$2 FOR UPDATE`, [id, category]);
+            if (!target.rows.length)
+                return false;
+            await client.query(`UPDATE ppt_master_templates SET is_active=0,updated_at=NOW() WHERE ${MASTER_SCOPE}=$1`, [category]);
+            await client.query(`UPDATE ppt_master_templates SET is_active=1,updated_at=NOW() WHERE id=$1 AND ${MASTER_SCOPE}=$2`, [id, category]);
+            return true;
+        });
+        return found ? c.json({ ok: true }) : c.json({ ok: false, error: '해당 구분의 마스터가 없습니다' }, 404);
     }
-    catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return c.json({ ok: false, error: msg }, 500);
+    catch {
+        return c.json({ ok: false, error: '마스터 활성화 실패' }, 500);
     }
 });
-/** DELETE /api/ppt-menus/master-templates/:id — 삭제 */
 app.delete('/master-templates/:id', async (c) => {
+    const category = masterCategory(c.req.query('category')), id = Number(c.req.param('id'));
+    if (!category || !Number.isSafeInteger(id) || id <= 0)
+        return c.json({ ok: false, error: '잘못된 마스터 요청입니다' }, 400);
     try {
-        const id = Number(c.req.param('id'));
-        await exec(`DELETE FROM ppt_master_templates WHERE id = $1`, [id]);
-        return c.json({ ok: true });
+        const found = await transaction(async (client) => {
+            await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['ppt-master:' + category]);
+            const result = await client.query(`DELETE FROM ppt_master_templates WHERE id=$1 AND ${MASTER_SCOPE}=$2 RETURNING id`, [id, category]);
+            return result.rows.length > 0;
+        });
+        return found ? c.json({ ok: true }) : c.json({ ok: false, error: '해당 구분의 마스터가 없습니다' }, 404);
     }
-    catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return c.json({ ok: false, error: msg }, 500);
+    catch {
+        return c.json({ ok: false, error: '마스터 삭제 실패' }, 500);
     }
 });
 export default app;

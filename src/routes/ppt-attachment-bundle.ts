@@ -90,6 +90,9 @@ import { buildLicenseCertificateZip } from './ppt-license-certificate.js'
 import type { CompanyStampType } from '../lib/nas-client.js'
 import { buildCoverZip } from './ppt-cover.js'
 import { mergeDecksSharingMaster } from '../lib/pptx-merge.js'
+import { queryOne } from '../db/client.js'
+import { fetchClientLogo } from '../lib/nas-client.js'
+import { prepareAttachmentMaster, mergeWithAttachmentMaster } from '../lib/pptx-attachment-master.js'
 
 const app = new Hono()
 
@@ -394,6 +397,24 @@ app.post('/:projectId', async (c) => {
         return (xml.match(/<(?:\w+:)?sldId\b/g) || []).length
       }
       await emit({ type: 'ready', items: order.map(key => ({ key, label: ATTACHMENT_TYPES[key].label })) })
+      currentKey = 'master'
+      await emit({ type: 'start', key: 'master' })
+      // 본문 활성 마스터와 분리. 등록/활성화는 사용자만 수행하며 생성 요청은 SELECT만 한다.
+      const registered = await queryOne<{ name: string; pptx_b64: string }>(
+        "SELECT name,pptx_b64 FROM ppt_master_templates WHERE is_active=1 AND COALESCE(layouts->>'scope','proposal')='attachment' ORDER BY created_at DESC,id DESC LIMIT 1"
+      )
+      let activeMaster: Awaited<ReturnType<typeof prepareAttachmentMaster>> | null = null
+      if (registered) {
+        const project = projectId > 0 ? await queryOne<{ project_name: string; client_org: string | null }>(
+          'SELECT project_name,client_org FROM audit_projects WHERE id=$1', [projectId]) : null
+        if (projectId > 0 && !project) throw new Error('사업을 찾을 수 없습니다')
+        const clientOrg = String(project?.client_org || '').trim()
+        activeMaster = await prepareAttachmentMaster(Buffer.from(registered.pptx_b64,'base64'), {
+          projectName: String(project?.project_name || '').trim(), clientOrg, loadLogo: () => fetchClientLogo(clientOrg),
+        })
+      }
+      await emit({ type: 'item', key: 'master', detail: registered ? '첨부 전용 마스터: ' + registered.name : '활성 첨부 마스터 없음 — 기존 표지 내장 마스터를 사용합니다.',
+        warnings: activeMaster?.warnings || ['첨부 전용 마스터가 등록·활성화되지 않았습니다.'] })
       for (let i = 0; i < order.length; i++) {
         const key = order[i]
         currentKey = key
@@ -413,7 +434,9 @@ app.post('/:projectId', async (c) => {
       await emit({ type: 'item', key: 'cover', label: '정성제안서 첨부 표지', slideCount: await slideCount(coverZip) })
       currentKey = 'merge'
       await emit({ type: 'start', key: 'merge' })
-      const merged = await mergeDecksSharingMaster([coverZip, ...sectionZips])
+      const merged = activeMaster
+        ? await mergeWithAttachmentMaster(activeMaster, [coverZip, ...sectionZips])
+        : await mergeDecksSharingMaster([coverZip, ...sectionZips])
       const totalSlides = await slideCount(merged)
       const outBuffer = await merged.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })
       const safeName = (projectName || '자유생성').replace(/[\\/:*?"<>|]/g, '_').slice(0, 40)

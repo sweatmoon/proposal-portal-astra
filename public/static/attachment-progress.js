@@ -110,6 +110,7 @@
     row.count.textContent = Number.isInteger(row.slideCount) ? row.slideCount + '장' : '';
     row.body.replaceChildren();
     if (row.detail) row.body.append(element('p', '', row.detail));
+    if (row.warnings?.length) row.warnings.forEach(warning => row.body.append(element('p', 'text-amber-800', warning)));
     if (Number.isInteger(row.personCount)) row.body.append(element('p', '', '생성 인원: ' + row.personCount + '명'));
     if (row.personnelResults?.length) {
       const list = element('ul', 'space-y-1');
@@ -124,7 +125,7 @@
     if (!row.body.childNodes.length) row.body.append(element('p', 'text-slate-500', row.status === 'waiting' ? '앞선 단계 처리 후 시작합니다.' : row.status === 'running' ? '서버에서 자료 조회·장표를 생성하고 있습니다. 완료 응답을 기다리는 중입니다.' : '추가 상세 내역이 없습니다.'));
   }
   function renderOverview() {
-    const items = state.rows.filter(r => !['prepare', 'merge', 'download'].includes(r.key));
+    const items = state.rows.filter(r => !['prepare', 'master', 'merge', 'download'].includes(r.key));
     const n = status => items.filter(r => r.status === status).length;
     const completed = n('done') + n('warning');
     $('brOverview').textContent = '표지 포함 ' + items.length + '개 항목 · 생성 완료 ' + n('done') + ' · 검토 필요 ' + n('warning') + ' · 실패 ' + n('failed') + ' · 미처리 ' + n('stopped');
@@ -144,6 +145,7 @@
     $('brSubtitle').textContent = label;
     $('brNotice').textContent = '요청 준비 중입니다. 실제 항목 처리 결과에 따라 갱신됩니다. 자료 조회 중에는 시간이 걸릴 수 있습니다.';
     addRow('prepare', '템플릿·옵션 전송 및 요청 확인', 'running', '서버가 요청을 받을 때까지 기다립니다.');
+    addRow('master', '첨부 마스터·사업명·주관기관 로고');
     order.forEach(o => addRow(o.key, o.menu.menu_name));
     addRow('cover', '정성제안서 첨부 표지');
     addRow('merge', '합본 및 PPTX 압축');
@@ -170,8 +172,8 @@
       if (!row) throw new Error('요청하지 않은 항목의 진행 응답입니다.');
       if (event.type === 'start') { row.status = 'running'; }
       if (event.type === 'item') {
-        Object.assign(row, { slideCount: event.slideCount, personCount: event.personCount, detail: event.detail || '', skipped: event.skipped, personnelResults: event.personnelResults });
-        row.status = event.skipped?.length || event.slideCount === 0 ? 'warning' : 'done';
+        Object.assign(row, { slideCount: event.slideCount, personCount: event.personCount, detail: event.detail || '', warnings: event.warnings, skipped: event.skipped, personnelResults: event.personnelResults });
+        row.status = event.warnings?.length || event.skipped?.length || event.slideCount === 0 ? 'warning' : 'done';
         if (event.slideCount === 0) row.detail += ' 생성된 장표가 없습니다.';
         if (row.status === 'warning') row.node.open = true;
       }

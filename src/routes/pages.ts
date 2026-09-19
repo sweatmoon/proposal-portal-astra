@@ -3188,8 +3188,8 @@ app.get('/ppt-templates', async (c) => {
         <!-- 헤더 -->
         <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between flex-shrink-0">
           <div>
-            <h3 class="font-bold text-slate-800 text-base"><i class="fas fa-layer-group mr-2 text-violet-500"></i>마스터 템플릿 관리</h3>
-            <p class="text-xs text-slate-400 mt-0.5">생성 시 목차에 맞는 활성 마스터 레이아웃과 사업명·주관기관 로고를 적용합니다. 매칭 실패·로고 누락은 생성 보고서에 표시됩니다.</p>
+            <h3 id="masterModalTitle" class="font-bold text-slate-800 text-base">마스터 템플릿 관리</h3>
+            <p id="masterModalHelp" class="text-xs text-slate-400 mt-0.5"></p>
           </div>
           <button onclick="closeMasterModal()" class="text-slate-400 hover:text-slate-700 ml-4"><i class="fas fa-times text-lg"></i></button>
         </div>
@@ -3342,6 +3342,7 @@ app.get('/ppt-templates', async (c) => {
     + '<button onclick=\\"openMasterModal()\\" class=\\"px-3 py-1.5 text-xs rounded-lg bg-violet-600 hover:bg-violet-700 text-white transition\\"><i class=\\"fas fa-layer-group mr-1\\"></i>마스터 템플릿</button>'
   const HDR_ATTACHMENT = '<button onclick=\\"runMigrate()\\" class=\\"px-3 py-1.5 text-xs rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition\\"><i class=\\"fas fa-database mr-1\\"></i>테이블 생성</button>'
     + '<button onclick=\\"runAttachmentSeed()\\" class=\\"px-3 py-1.5 text-xs rounded-lg bg-teal-50 hover:bg-teal-100 text-teal-700 border border-teal-300 transition\\"><i class=\\"fas fa-paperclip mr-1\\"></i>첨부 항목 초기화</button>'
+    + '<button onclick=\"openMasterModal()\" class=\"px-3 py-1.5 text-xs rounded-lg bg-violet-600 hover:bg-violet-700 text-white transition\">첨부 마스터 템플릿</button>'
 
   function switchTab(tab) {
     _activeTab = tab
@@ -4051,20 +4052,39 @@ app.get('/ppt-templates', async (c) => {
   }
 
   // ── 마스터 템플릿 관리 ───────────────────────────────────────
+  let _masterCategory = 'proposal'
+  let _masterLoadSeq = 0
+  let _masterUploading = false
+  const masterApi = (path = '') => '/api/ppt-menus/master-templates' + path + '?category=' + _masterCategory
+  const masterEscape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
   async function openMasterModal() {
+    if (_masterUploading) return
+    _masterCategory = _activeTab
+    const attachment = _masterCategory === 'attachment'
+    document.getElementById('masterModalTitle').textContent = attachment ? '첨부 전용 마스터 템플릿 관리' : '본문 마스터 템플릿 관리'
+    document.getElementById('masterModalHelp').textContent = attachment
+      ? '본문과 별도로 등록·활성화합니다. “첨부 표지”·“첨부 내용” 레이아웃과 [감리사업명]·주관기관 로고를 적용합니다. 자유 생성은 사업 정보가 없어 토큰·안내 그림을 유지하고 경고합니다.'
+      : '생성 시 목차에 맞는 활성 마스터 레이아웃과 사업명·주관기관 로고를 적용합니다. 매칭 실패·로고 누락은 생성 보고서에 표시됩니다.'
+    document.getElementById('masterNameInput').placeholder = attachment ? '예: 제안서첨부 마스터' : '예: 2026 표준 마스터'
+    document.getElementById('masterFileInput').value = ''
+    document.getElementById('masterUploadInfo').classList.add('hidden')
     document.getElementById('masterModal').classList.remove('hidden')
     await loadMasterList()
   }
   function closeMasterModal() {
+    if (_masterUploading) return
     document.getElementById('masterModal').classList.add('hidden')
   }
 
   async function loadMasterList() {
+    const seq = ++_masterLoadSeq
+    const category = _masterCategory
     const el = document.getElementById('masterList')
     el.innerHTML = '<div class="text-center text-slate-400 text-xs py-6"><i class="fas fa-spinner fa-spin mr-1"></i>로딩 중...</div>'
     try {
-      const r = await fetch('/api/ppt-menus/master-templates')
+      const r = await fetch(masterApi(), { cache: 'no-store' })
       const j = await r.json()
+      if (seq !== _masterLoadSeq || category !== _masterCategory) return
       if (!j.ok) throw new Error(j.error)
       if (!j.data.length) {
         el.innerHTML = '<div class="text-center text-slate-400 text-xs py-8"><i class="fas fa-inbox text-2xl mb-2 block opacity-30"></i>저장된 마스터가 없습니다<br><span class="text-slate-300">왼쪽에서 PPTX를 업로드하세요</span></div>'
@@ -4080,9 +4100,9 @@ app.get('/ppt-templates', async (c) => {
             <div class="flex-1 min-w-0">
               <div class="flex items-center gap-2 mb-0.5">
                 \${isActive ? '<span class="inline-flex items-center px-1.5 py-0.5 rounded-md bg-violet-600 text-white text-xs font-bold"><i class="fas fa-check mr-1"></i>활성</span>' : ''}
-                <span class="text-sm font-semibold text-slate-800 truncate">\${m.name}</span>
+                <span class="text-sm font-semibold text-slate-800 truncate">\${masterEscape(m.name)}</span>
               </div>
-              \${m.description ? \`<div class="text-xs text-slate-400 mb-1">\${m.description}</div>\` : ''}
+              \${m.description ? \`<div class="text-xs text-slate-400 mb-1">\${masterEscape(m.description)}</div>\` : ''}
               <div class="text-xs text-slate-300">\${createdAt}</div>
             </div>
             <div class="flex items-center gap-1 flex-shrink-0">
@@ -4094,17 +4114,19 @@ app.get('/ppt-templates', async (c) => {
           <div class="mt-2 pt-2 border-t border-slate-100">
             <div class="text-xs text-slate-400 mb-1"><i class="fas fa-th-list mr-1"></i>레이아웃 \${layouts.length}개</div>
             <div class="flex flex-wrap gap-1">
-              \${layouts.map(l => \`<span class="px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 text-xs">\${l}</span>\`).join('')}
+              \${layouts.map(l => \`<span class="px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 text-xs">\${masterEscape(l)}</span>\`).join('')}
             </div>
           </div>\` : ''}
         </div>\`
       }).join('')
     } catch (e) {
-      el.innerHTML = \`<div class="text-red-400 text-xs text-center py-4"><i class="fas fa-exclamation-circle mr-1"></i>로드 실패: \${e.message}</div>\`
+      if (seq !== _masterLoadSeq || category !== _masterCategory) return
+      el.innerHTML = \`<div class="text-red-400 text-xs text-center py-4"><i class="fas fa-exclamation-circle mr-1"></i>로드 실패: \${masterEscape(e.message)}</div>\`
     }
   }
 
   async function uploadMasterTemplate() {
+    if (_masterUploading) return
     const name = document.getElementById('masterNameInput').value.trim()
     const desc = document.getElementById('masterDescInput').value.trim()
     const fileInput = document.getElementById('masterFileInput')
@@ -4119,11 +4141,12 @@ app.get('/ppt-templates', async (c) => {
     fd.append('set_active', setActive ? '1' : '0')
 
     const btn = document.getElementById('masterUploadBtn')
+    _masterUploading = true
     btn.disabled = true
     btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>업로드 중...'
     document.getElementById('masterUploadInfo').classList.add('hidden')
     try {
-      const r = await fetch('/api/ppt-menus/master-templates', { method: 'POST', body: fd })
+      const r = await fetch(masterApi(), { method: 'POST', body: fd })
       const j = await r.json()
       if (!j.ok) throw new Error(j.error)
 
@@ -4142,13 +4165,14 @@ app.get('/ppt-templates', async (c) => {
     } catch (e) {
       showAlert('❌ 업로드 실패: ' + e.message, false)
     } finally {
+      _masterUploading = false
       btn.disabled = false
       btn.innerHTML = '<i class="fas fa-cloud-upload-alt mr-1"></i>업로드'
     }
   }
 
   async function activateMaster(id) {
-    const r = await fetch('/api/ppt-menus/master-templates/' + id + '/activate', { method: 'PUT' })
+    const r = await fetch(masterApi('/' + id + '/activate'), { method: 'PUT' })
     const j = await r.json()
     if (j.ok) {
       showAlert('✅ 마스터 템플릿이 활성화되었습니다', true)
@@ -4160,7 +4184,7 @@ app.get('/ppt-templates', async (c) => {
     const row = document.querySelector('[data-master-id="' + id + '"]')
     const name = row?.querySelector('.font-semibold')?.textContent?.trim() || '이 마스터'
     if (!confirm('"' + name + '"을 삭제하시겠습니까?')) return
-    const r = await fetch('/api/ppt-menus/master-templates/' + id, { method: 'DELETE' })
+    const r = await fetch(masterApi('/' + id), { method: 'DELETE' })
     const j = await r.json()
     if (j.ok) { showAlert('✅ 삭제 완료', true); await loadMasterList() }
     else showAlert('❌ 삭제 실패: ' + j.error, false)
