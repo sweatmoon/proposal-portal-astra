@@ -4,11 +4,62 @@
  * 중복 처리: personnel.name 동일 시 UPSERT (덮어쓰기)
  */
 import { Hono } from 'hono'
-import { parsePersonnelHtml } from '../parsers/personnel-parser.js'
+import { parsePersonnelHtml, type MemberProfileUpdates } from '../parsers/personnel-parser.js'
 import { transaction } from '../db/client.js'
 import type pg from 'pg'
 
 const app = new Hono()
+
+/** 반드시 인력 저장과 같은 트랜잭션에서 호출한다. 사업 정보 UPDATE/DELETE/INSERT 금지. */
+export async function syncProposalMemberProfile(client: pg.PoolClient, pid: number, name: string, updates: MemberProfileUpdates) {
+  const matches = await client.query<{ id: number }>(
+    'SELECT id FROM personnel WHERE TRIM(name) = TRIM($1) ORDER BY id', [name]
+  )
+  const uniqueName = matches.rows.length === 1 && matches.rows[0].id === pid
+  const candidates = await client.query<{ id: number; project_id: number; personnel_id: number | null; name_matches: boolean }>(`
+    SELECT id, project_id, personnel_id, TRIM(person_name) = TRIM($2) AS name_matches
+    FROM proposal_members
+    WHERE personnel_id = $1 OR TRIM(person_name) = TRIM($2)
+    ORDER BY id FOR UPDATE
+  `, [pid, name])
+  const eligible = candidates.rows.filter(row => row.name_matches &&
+    (row.personnel_id === pid || (row.personnel_id === null && uniqueName)))
+  const skipped = candidates.rows.length - eligible.length
+  const fields = (['auditor_grade', 'auditor_cert_no', 'phone', 'education_hours'] as const)
+    .filter(key => updates[key] !== undefined)
+  let changed: { id: number; project_id: number }[] = []
+  if (eligible.length) {
+    // 고정 허용 목록 4개 + 빈 인력 연결만 변경. is_fulltime은 반드시 사업 HTML 값 유지.
+    // 이름/사업/소속팀/구분/분야/공수/단계/일정에는 절대 대입하지 않는다.
+    const result = await client.query<{ id: number; project_id: number }>(`
+      UPDATE proposal_members AS pm SET
+        personnel_id = $1,
+        auditor_grade = COALESCE($3, pm.auditor_grade),
+        auditor_cert_no = COALESCE($4, pm.auditor_cert_no),
+        phone = COALESCE($5, pm.phone),
+        education_hours = COALESCE($6, pm.education_hours)
+      WHERE pm.id = ANY($7::int[])
+        AND TRIM(pm.person_name) = TRIM($2)
+        AND (pm.personnel_id = $1 OR pm.personnel_id IS NULL)
+        AND (pm.personnel_id, pm.auditor_grade, pm.auditor_cert_no, pm.phone, pm.education_hours)
+          IS DISTINCT FROM ($1, COALESCE($3, pm.auditor_grade), COALESCE($4, pm.auditor_cert_no),
+            COALESCE($5, pm.phone), COALESCE($6, pm.education_hours))
+      RETURNING pm.id, pm.project_id
+    `, [pid, name, updates.auditor_grade ?? null, updates.auditor_cert_no ?? null,
+      updates.phone ?? null, updates.education_hours ?? null, eligible.map(row => row.id)])
+    changed = result.rows
+  }
+  const oldUnlinked = new Set(eligible.filter(row => row.personnel_id === null).map(row => row.id))
+  return {
+    matched_rows: eligible.length,
+    updated_rows: changed.length,
+    updated_projects: new Set(changed.map(row => row.project_id)).size,
+    linked_rows: changed.filter(row => oldUnlinked.has(row.id)).length,
+    skipped_rows: skipped,
+    fields,
+    warnings: skipped ? ['이름 중복·기존 연결 충돌·이름 불일치가 있는 사업 인력은 변경하지 않았습니다.'] : [],
+  }
+}
 
 app.post('/', async (c) => {
   // ── 파일 수신 ──
@@ -32,7 +83,7 @@ app.post('/', async (c) => {
     return c.json({ ok: false, error: `파싱 실패: ${String(e)}` }, 422)
   }
 
-  const { personnel, certifications, audit_history, it_career, project_career } = parsed
+  const { personnel, memberProfileUpdates, certifications, audit_history, it_career, project_career } = parsed
   if (!personnel.name)
     return c.json({ ok: false, error: '성명을 파싱할 수 없습니다. 인력 프로파일 HTML인지 확인하세요' }, 422)
 
@@ -65,10 +116,10 @@ app.post('/', async (c) => {
           is_fulltime     = EXCLUDED.is_fulltime,
           company         = EXCLUDED.company,
           email           = EXCLUDED.email,
-          phone           = EXCLUDED.phone,
+          phone           = CASE WHEN $21 THEN EXCLUDED.phone ELSE personnel.phone END,
           birthdate       = EXCLUDED.birthdate,
-          auditor_cert_no = EXCLUDED.auditor_cert_no,
-          auditor_grade   = EXCLUDED.auditor_grade,
+          auditor_cert_no = CASE WHEN $22 THEN EXCLUDED.auditor_cert_no ELSE personnel.auditor_cert_no END,
+          auditor_grade   = CASE WHEN $23 THEN EXCLUDED.auditor_grade ELSE personnel.auditor_grade END,
           tech_grade      = EXCLUDED.tech_grade,
           school          = EXCLUDED.school,
           major           = EXCLUDED.major,
@@ -78,7 +129,7 @@ app.post('/', async (c) => {
           career_project  = EXCLUDED.career_project,
           career_expert   = EXCLUDED.career_expert,
           education_name  = EXCLUDED.education_name,
-          education_hours = EXCLUDED.education_hours,
+          education_hours = CASE WHEN $24 THEN EXCLUDED.education_hours ELSE personnel.education_hours END,
           education_org   = EXCLUDED.education_org,
           updated_at      = NOW()
         RETURNING id
@@ -88,7 +139,9 @@ app.post('/', async (c) => {
         personnel.auditor_cert_no, personnel.auditor_grade, personnel.tech_grade,
         personnel.school, personnel.major, personnel.degree,
         personnel.career_summary, personnel.career_qualif, personnel.career_project, personnel.career_expert,
-        personnel.education_name, personnel.education_hours, personnel.education_org,
+        personnel.education_name, memberProfileUpdates.education_hours ?? 0, personnel.education_org,
+        memberProfileUpdates.phone !== undefined, memberProfileUpdates.auditor_cert_no !== undefined,
+        memberProfileUpdates.auditor_grade !== undefined, memberProfileUpdates.education_hours !== undefined,
       ])
 
       const pid: number = upsertRes.rows[0].id
@@ -177,7 +230,12 @@ app.post('/', async (c) => {
         `, [pid, pc.year_range, pc.project_name, pc.client_org, pc.domain, pc.role, pc.company, pc.remarks])
       }
 
+      // 사업별 상근/비상근과 배정정보는 보존하고, 기존 모든 사업의 해당 인력만 동기화한다.
+      // 실패하면 인력·이력 저장도 함께 롤백되어 부분 반영되지 않는다.
+      const profileSync = await syncProposalMemberProfile(client, pid, personnel.name, memberProfileUpdates)
+
       return {
+        profile_sync: profileSync,
         personnel_id: pid,
         name: personnel.name,
         certifications: certifications.length,
@@ -187,7 +245,9 @@ app.post('/', async (c) => {
       }
     })
 
-    return c.json({ ok: true, message: `인력 "${personnel.name}" 저장 완료`, data: result })
+    const sync = result.profile_sync
+    const review = sync.skipped_rows ? ` · 연결 검토 ${sync.skipped_rows}건 (변경 제외)` : ''
+    return c.json({ ok: true, message: `인력 "${personnel.name}" 저장 완료 · 사업 ${sync.updated_projects}개/인력행 ${sync.updated_rows}건 갱신 · 신규 이름/(K) 연결 ${sync.linked_rows}건${review}`, data: result })
   } catch (e) {
     return c.json({ ok: false, error: `DB 저장 실패: ${String(e)}` }, 500)
   }

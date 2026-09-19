@@ -1918,6 +1918,16 @@ app.get('/upload', (c) => {
     if (state[type].length > 0) addLog('info', '실패한 ' + state[type].length + '개 파일이 목록에 남아있습니다.')
   }
 
+  function personnelSyncSummary(sync) {
+    if (!sync) return ''
+    const count = key => Number.isSafeInteger(sync[key]) && sync[key] >= 0 ? sync[key] : 0
+    return '<div class="mt-1 text-indigo-700">사업 ' + count('updated_projects') + '개 · 인력행 ' + count('updated_rows')
+      + '건 갱신 · 신규 이름/(K) 연결 ' + count('linked_rows') + '건</div>'
+      + '<div class="mt-1 text-slate-500">사업 상근/비상근·배정정보 유지. 이름/(K) 링크는 사업 상세 새로고침 후 확인하세요.</div>'
+      + (count('skipped_rows') ? '<div class="mt-1 text-amber-700">연결 검토 ' + count('skipped_rows')
+        + '건: 이름 중복·기존 연결 충돌·이름 불일치로 변경하지 않았습니다.</div>' : '')
+  }
+
   function showBatchResult(type, results) {
     const el = document.getElementById('result-' + type)
     const inner = document.getElementById('result-' + type + '-inner')
@@ -1930,7 +1940,7 @@ app.get('/upload', (c) => {
       html += okList.map(r => {
         const d = r.data
         return type === 'personnel'
-          ? \`<div class="text-xs bg-white rounded-lg px-3 py-2 mb-1 border border-slate-100"><span class="font-medium text-slate-700">\${d.name}</span><span class="text-slate-400 ml-2">자격증 \${d.certifications}건 · 감리실적 \${d.audit_history}건 · IT경력 \${d.it_career}건</span></div>\`
+          ? \`<div class="text-xs bg-white rounded-lg px-3 py-2 mb-1 border border-slate-100"><span class="font-medium text-slate-700">\${d.name}</span><span class="text-slate-400 ml-2">자격증 \${d.certifications}건 · 감리실적 \${d.audit_history}건 · IT경력 \${d.it_career}건</span>\${personnelSyncSummary(d.profile_sync)}</div>\`
           : \`<div class="text-xs bg-white rounded-lg px-3 py-2 mb-1 border border-slate-100"><span class="font-medium text-slate-700">\${d.project_name}</span><span class="text-slate-400 ml-2">키워드 \${d.keywords}개 · 단계 \${d.phases} · 인력 \${d.proposal_members}명</span></div>\`
       }).join('')
     }

@@ -122,9 +122,9 @@ export interface PersonnelProjectCareer {
   remarks: string
 }
 
-/** 사업별 배정과 무관한 공통 인력정보만 허용한다. 누락 필드는 동기화하지 않는다. */
+/** 사업별 상근/비상근·배정은 제외. 명확히 파싱된 공통 인력정보 4개만 동기화한다. */
 export type MemberProfileUpdates = Partial<Pick<PersonnelData,
-  'is_fulltime' | 'auditor_grade' | 'auditor_cert_no' | 'phone' | 'education_hours'>>
+  'auditor_grade' | 'auditor_cert_no' | 'phone' | 'education_hours'>>
 
 export interface ParsedPersonnel {
   personnel: PersonnelData
@@ -229,7 +229,6 @@ export function parsePersonnelHtml(html: string): ParsedPersonnel {
       const statuses = new Set(employment)
       if (statuses.size === 1) {
         personnel.is_fulltime = statuses.has('비상근') ? 0 : 1
-        memberProfileUpdates.is_fulltime = personnel.is_fulltime
       }
       // 회사: 마지막 셀 (index off+5 기준)
       personnel.company = vRow[off + 5] ?? vRow[vRow.length - 1] ?? ''

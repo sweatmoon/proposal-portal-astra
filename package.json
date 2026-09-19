@@ -19,6 +19,7 @@
     "pg": "^8.13.3"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@types/pg": "^8.11.11",
     "@xmldom/xmldom": "^0.9.12",
     "tsx": "^4.19.3",
