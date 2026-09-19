@@ -1016,10 +1016,7 @@ app.get('/proposals/:id', async (c) => {
     }).join('')}
         </select>
       </label>
-      <p style="font-size:12px;color:#666">PM은 실제 공수가 배정된 감리원만 반영합니다. 선택한 PM의 총괄 수행 건수·감리 경력·전체 감리 건수와 주요이력은 인력 DB에서 자동 조회합니다.
-        등록된 양식의 플레이스홀더만 입력하며 고정 문구는 유지합니다. 자격 요건·교육계획의 최종 검토는 생성 보고서에서 확인하세요.
-        <a href="/static/compliance-proposal-template.pptx" download="마.3.6_완성본기반_등록용템플릿.pptx">3.6 완성본 기반 등록용 템플릿 다운로드</a>
-      </p>
+      <p style="font-size:12px;color:#666">PM은 실제 공수가 배정된 감리원만 반영합니다. 선택한 PM의 총괄 수행 건수·감리 경력·전체 감리 건수와 주요이력은 인력 DB에서 자동 조회합니다.</p>
       <div style="margin-bottom:16px;background:#f7f8fa;border-radius:8px;padding:12px">
         <b style="font-size:13px;color:#333">추가 제안 단계</b>
         <div style="font-size:12px;color:#666;margin-top:4px">RFP 최소 요건 이상으로 추가 제안한 단계를 선택하세요 (요약표에 반영됩니다)</div>
