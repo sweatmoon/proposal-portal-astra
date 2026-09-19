@@ -1375,6 +1375,11 @@ for (const [groupFilter, perPage] of [['AUDITOR', 2], ['EXPERT', 4]]) {
       assert(xml.includes(fixture.picture)); assert(xml.includes('r:id="externalLink"'));
       assert(xml.includes(people[i * perPage].name.split('').join(' ')));
       assert(!/\[P\d+_/.test(xml)); assert(xml.includes('실적 시험'));
+      const titlePara = c.ProposalTemplate.nodes(c.ProposalTemplate.parse(xml), 'p')[0];
+      assert.equal(c.ProposalTemplate.text(titlePara), `실적 시험 (${i + 1}/3)`);
+      const numberRun = c.ProposalTemplate.nodes(titlePara, 'r').at(-1);
+      assert.equal(c.ProposalTemplate.nodes(numberRun, 'rPr')[0].getAttribute('sz'), '1600');
+      assert.equal(c.ProposalTemplate.nodes(numberRun, 'rPr')[0].getAttribute('i'), '1');
     }
     assert.deepEqual(await result.zip.file('ppt/media/reference.png').async('nodebuffer'), fixture.image);
     assert(!result.zip.file('ppt/slides/slide9.xml'));
@@ -1395,6 +1400,7 @@ for (const [groupFilter, perPage] of [['AUDITOR', 2], ['EXPERT', 4]]) {
       assert.equal(link.getAttribute('TargetMode'), 'External');
       assert.equal(link.getAttribute('Target'), 'https://example.test/reference?a=1&b=2');
       assert.match(await merged.file(path).async('string'), /r:embed="imageRef"/);
+      assert.equal(c.ProposalTemplate.text(c.ProposalTemplate.nodes(c.ProposalTemplate.parse(await merged.file(path).async('string')), 'p')[0]), `실적 시험 (${mergedPaths.indexOf(path)}/3)`);
     }
   });
 }
@@ -1558,6 +1564,68 @@ for (const size of [2, 4, 6, 9]) {
     await check(zip, await T.slidePaths(zip));
     const base = await JSZip.loadAsync(await template(shape(para('앞 장표'))), { base64: true });
     const merged = await c.mergePresentationZips([{ zip: base }, { zip, mergeStrategy: 'FOREIGN_TEMPLATE' }]);
+    await check(merged, (await T.slidePaths(merged)).slice(1));
+  });
+}
+
+test('photo page counts restart for distinct menu entries even when their titles match', async () => {
+  const c = photoContext();
+  const b64 = await (await photoFixture(2)).generateAsync({ type: 'base64' });
+  let captured;
+  Object.assign(c, {
+    setBtnState() {}, getEffectiveGrade: () => '',
+    buildPhotoAssignCache: () => ({ audit: [1, 2, 3] }),
+    readPhotoAssignConfig: () => [
+      { menuCode: 'AUDITOR_PROFILE', title: '같은 제목', sheetSize: 2, catKeys: ['audit'] },
+      { menuCode: 'EXPERT_PROFILE', title: '같은 제목', sheetSize: 2, catKeys: ['audit'] },
+    ],
+    PHOTO_CATS: [{ key: 'audit', label: '감리원', grpFilter: () => true }],
+    parsedData: { portalOrder: ['가', '나', '다'].map(name => ({ name })) },
+    loadProposalPhotos: async () => [],
+    buildPhotoPptxFromTemplate: async pages => { captured = pages; return new JSZip(); },
+  });
+  vm.runInContext(`PptMenuRegistry.load = async () => ({ byCode: { AUDITOR_PROFILE: { templates: [{ variant_code: 'PERSON_2', pptx_b64_key: ${JSON.stringify(b64)} }] } } });`, c);
+  vm.runInContext(detailSource.slice(detailSource.indexOf('async function downloadPhotoAssignPptx('), detailSource.indexOf('// ── 전체 합본 PPT')), c);
+  const result = await c.downloadPhotoAssignPptx(null, { returnZip: true });
+  assert(result.zip);
+  assert.deepEqual(JSON.parse(JSON.stringify(captured.map(p => [p.pageNum, p.totalPages]))), [[1, 2], [2, 2], [1, 2], [2, 2]]);
+});
+
+test('repeated titles preserve original style, split tokens, XML text and paragraph end ordering', () => {
+  const c = sandbox(), T = c.ProposalTemplate;
+  for (const parts of [['[제목]'], ['[ 제', '목 ]']]) {
+    const d = T.parse(slide(shape(para(...parts).replace('</a:p>', '<a:endParaRPr sz="2400"/></a:p>')) + shape(para('고정 본문'))));
+    assert.equal(c.replaceRepeatedSlideTitle(d, '3.4 실적 & <경력>', 2, 3), true);
+    const p = T.nodes(d, 'p')[0], r = T.nodes(p, 'r');
+    assert.equal(T.text(p), '3.4 실적 & <경력> (2/3)');
+    assert.equal(T.nodes(r[0], 'rPr')[0].getAttribute('sz'), '1200');
+    assert.equal(T.nodes(r.at(-1), 'rPr')[0].getAttribute('sz'), '1600');
+    assert.equal(Array.from(p.childNodes).filter(n => n.nodeType === 1).at(-1).localName, 'endParaRPr');
+    assert.equal(T.text(T.nodes(d, 'p')[1]), '고정 본문');
+    assert.equal(T.text(T.nodes(T.parse(new XMLSerializer().serializeToString(d)), 'p')[0]), '3.4 실적 & <경력> (2/3)');
+  }
+  const single = T.parse(slide(shape(para('[제목]'))));
+  c.replaceRepeatedSlideTitle(single, '한 장 목차', 1, 1); assert.equal(T.text(single), '한 장 목차');
+  const fixed = T.parse(slide(shape(para('고정 제목')))), before = new XMLSerializer().serializeToString(fixed);
+  assert.equal(c.replaceRepeatedSlideTitle(fixed, '없는 토큰은 만들지 않음', 1, 2), false);
+  assert.equal(new XMLSerializer().serializeToString(fixed), before);
+});
+for (const size of [2, 4, 6, 9]) {
+  test(`${size}-person photo titles carry per-menu page suffixes through merging`, async () => {
+    const c = photoContext(), T = c.ProposalTemplate, templates = await photoTemplates();
+    const original = await templates[size].file('ppt/slides/slide1.xml').async('string');
+    templates[size].file('ppt/slides/slide1.xml', original.replace('</p:spTree>', shape(para(size === 2 ? '[ 제' : `${size}인`, size === 2 ? '목 ]' : '장표')) + '</p:spTree>'));
+    const pages = [1, 2, 1].map((pageNum, i) => ({ sheetSize: size, slideTitle: i < 2 ? '3.1 전문역량 & <검증>' : '3.2 다른 목차', pageNum, totalPages: i < 2 ? 2 : 1, slotPeople: { 1: { name: '가상인력', profile: {} } } }));
+    const result = await c.buildPhotoPptxFromTemplate(pages, templates);
+    const check = async (zip, paths) => {
+      for (let i = 0; i < paths.length; i++) {
+        const p = T.nodes(T.parse(await zip.file(paths[i]).async('string')), 'p').find(p => T.text(p).startsWith('3.'));
+        assert(p); assert.equal(T.text(p), pages[i].slideTitle + (i < 2 ? ` (${i + 1}/2)` : ''));
+        if (i < 2) assert.equal(T.nodes(T.nodes(p, 'r').at(-1), 'rPr')[0].getAttribute('sz'), '1600');
+      }
+    };
+    await check(result, await T.slidePaths(result));
+    const merged = await c.mergePresentationZips([{ zip: await JSZip.loadAsync(await template(shape(para('앞 장표'))), { base64: true }) }, { zip: result, mergeStrategy: 'FOREIGN_TEMPLATE' }]);
     await check(merged, (await T.slidePaths(merged)).slice(1));
   });
 }

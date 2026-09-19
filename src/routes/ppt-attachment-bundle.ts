@@ -403,11 +403,12 @@ app.post('/:projectId', async (c) => {
       const registered = await queryOne<{ name: string; pptx_b64: string }>(
         "SELECT name,pptx_b64 FROM ppt_master_templates WHERE is_active=1 AND COALESCE(layouts->>'scope','proposal')='attachment' ORDER BY created_at DESC,id DESC LIMIT 1"
       )
+      // 파일명에도 저장된 사업/주관기관을 사용한다. 자유 생성은 사업 DB를 조회하지 않는다.
+      const project = projectId > 0 ? await queryOne<{ project_name: string; client_org: string | null }>(
+        'SELECT project_name,client_org FROM audit_projects WHERE id=$1', [projectId]) : null
+      if (projectId > 0 && !project) throw new Error('사업을 찾을 수 없습니다')
       let activeMaster: Awaited<ReturnType<typeof prepareAttachmentMaster>> | null = null
       if (registered) {
-        const project = projectId > 0 ? await queryOne<{ project_name: string; client_org: string | null }>(
-          'SELECT project_name,client_org FROM audit_projects WHERE id=$1', [projectId]) : null
-        if (projectId > 0 && !project) throw new Error('사업을 찾을 수 없습니다')
         const clientOrg = String(project?.client_org || '').trim()
         activeMaster = await prepareAttachmentMaster(Buffer.from(registered.pptx_b64,'base64'), {
           projectName: String(project?.project_name || '').trim(), clientOrg, loadLogo: () => fetchClientLogo(clientOrg),
@@ -430,7 +431,7 @@ app.post('/:projectId', async (c) => {
       currentKey = 'cover'
       await emit({ type: 'start', key: 'cover' })
       const coverBuf = Buffer.from(await coverFile.arrayBuffer())
-      const { zip: coverZip, projectName } = await buildCoverZip(coverBuf, projectId, order.map(id => ATTACHMENT_TYPES[id].label))
+      const { zip: coverZip } = await buildCoverZip(coverBuf, projectId, order.map(id => ATTACHMENT_TYPES[id].label))
       await emit({ type: 'item', key: 'cover', label: '정성제안서 첨부 표지', slideCount: await slideCount(coverZip) })
       currentKey = 'merge'
       await emit({ type: 'start', key: 'merge' })
@@ -439,8 +440,10 @@ app.post('/:projectId', async (c) => {
         : await mergeDecksSharingMaster([coverZip, ...sectionZips])
       const totalSlides = await slideCount(merged)
       const outBuffer = await merged.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })
-      const safeName = (projectName || '자유생성').replace(/[\\/:*?"<>|]/g, '_').slice(0, 40)
-      return { outBuffer, filename: 'A_첨부_' + safeName + '.pptx', summaries, totalSlides }
+      const safeName = (value: unknown) => String(value ?? '').replace(/[\\/:*?"<>|\u0000-\u001F\u007F]/g, '_')
+      const filename = projectId === 0 ? '[자동화][첨부] 커스텀생성.pptx'
+        : '[자동화][첨부] ' + safeName(project?.client_org) + '_' + safeName(project?.project_name) + '.pptx'
+      return { outBuffer, filename, summaries, totalSlides }
     }
 
     c.header('Cache-Control', 'no-store')

@@ -1164,34 +1164,11 @@ async function buildHistoryPptx(opts) {
   }
 
   // ── 5. [제목] 치환 함수 ────────────────────────────────────────
-  function applyMenuTitle(xml, menuTitle) {
+  function applyMenuTitle(xml, menuTitle, pageNum, totalPages) {
     if (!menuTitle) return xml
-    if (xml.includes('[제목]')) return xml.split('[제목]').join(menuTitle)
-    if (!xml.includes('제목')) return xml
-    const paraReg = /(<a:p\b[^>]*>)([\s\S]*?)(<\/a:p>)/g
-    let changed = false
-    const result = xml.replace(paraReg, (full, open, inner, close) => {
-      const runs = []
-      inner.replace(/<a:r\b[\s\S]*?<\/a:r>/g, run => {
-        const t = run.match(/<a:t[^>]*>([^<]*)<\/a:t>/)
-        runs.push({ run, text: t ? t[1] : '' })
-      })
-      const concat = runs.map(r => r.text).join('')
-      if (!concat.includes('[제목]')) return full
-      const jS = concat.indexOf('[제목]'), jE = jS + 4
-      let pos = 0, firstDone = false
-      const newInner = inner.replace(/<a:r\b[\s\S]*?<\/a:r>/g, run => {
-        const t = run.match(/<a:t[^>]*>([^<]*)<\/a:t>/)
-        const txt = t ? t[1] : ''
-        const rS = pos, rE = pos + txt.length; pos = rE
-        if (txt === '') return run
-        if (!(rE > jS && rS < jE)) return run
-        if (!firstDone) { firstDone = true; return run.replace(/<a:t([^>]*)>[^<]*<\/a:t>/, `<a:t$1>${menuTitle}</a:t>`) }
-        return ''
-      })
-      changed = true; return open + newInner + close
-    })
-    return changed ? result : xml
+    const doc = new DOMParser().parseFromString(xml, 'application/xml')
+    return replaceRepeatedSlideTitle(doc, menuTitle, pageNum, totalPages)
+      ? new XMLSerializer().serializeToString(doc) : xml
   }
 
   // ── 6. 템플릿 PPTX 로드 ───────────────────────────────────────
@@ -1260,7 +1237,7 @@ async function buildHistoryPptx(opts) {
     const sldId = ++maxSldId
 
     // 본문 토큰만 치환한다. 그림 객체와 관계 ID는 원본 그대로 복제한다.
-    let slideXml = applyMenuTitle(tplSlideXml, opts.menuTitle || '')
+    let slideXml = applyMenuTitle(tplSlideXml, opts.menuTitle || '', slideNum, chunks.length)
     slideXml = applyPersonData(slideXml, chunk)
 
     tplZip.file(fileName, slideXml)
@@ -1758,54 +1735,7 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
   // titleText로 치환하고, totalPages >= 2 이면 뒤에 16pt " (pageNum/totalPages)" 런 추가.
   // titleLabel: PHOTO_LAYOUT_META의 titleLabel 값 (예: '9인장표')
   function replaceTitleLabel(xmlDoc, titleText, pageNum, totalPages, titleLabel) {
-    const paras = Array.from(xmlDoc.getElementsByTagNameNS(A_NS, 'p'))
-    // 탐색 후보: titleLabel(공백제거)을 포함하는 단락 또는 '[제목]' 포함 단락(하위 호환)
-    const candidates = titleLabel
-      ? [titleLabel.replace(/\s+/g, ''), '[제목]']
-      : ['[제목]']
-
-    for (const pEl of paras) {
-      const runs = Array.from(pEl.getElementsByTagNameNS(A_NS, 'r'))
-      if (!runs.length) continue
-      const concat = runs.map(r => {
-        const t = r.getElementsByTagNameNS(A_NS, 't')[0]; return t ? t.textContent : ''
-      }).join('').replace(/\s+/g, '')
-
-      // 후보 중 하나라도 포함하면 제목 단락으로 인식
-      const matchedLabel = candidates.find(c => concat.includes(c))
-      if (!matchedLabel) continue
-
-      // 1) placeholder → titleText 치환 (기존 런 서식 유지)
-      // titleLabel은 공백 포함 원본 형태로 치환 (예: '9인장표' → 공백 정규화 매칭)
-      const labelToReplace = (titleLabel && concat.includes(titleLabel.replace(/\s+/g, '')))
-        ? titleLabel
-        : '[제목]'
-      replaceLabelInParagraphNorm(pEl, labelToReplace, titleText)
-
-      // 2) totalPages >= 2 이면 뒤에 16pt (pageNum/totalPages) 런 추가
-      if (totalPages >= 2) {
-        // 마지막 런을 복제해 서식 참조
-        const lastRun = Array.from(pEl.getElementsByTagNameNS(A_NS, 'r')).pop()
-        if (!lastRun) continue
-
-        const numRun = lastRun.cloneNode(true)
-        // 텍스트 설정
-        const numT = numRun.getElementsByTagNameNS(A_NS, 't')[0]
-        if (numT) numT.textContent = ' (' + pageNum + '/' + totalPages + ')'
-
-        // rPr 가져오거나 생성 후 sz=1600(16pt) 설정
-        let rPr = numRun.getElementsByTagNameNS(A_NS, 'rPr')[0]
-        if (!rPr) {
-          rPr = xmlDoc.createElementNS(A_NS, 'a:rPr')
-          numRun.insertBefore(rPr, numRun.firstChild)
-        }
-        rPr.setAttribute('sz', '1600')
-        // 기존 b(볼드) 속성은 유지, 별도 제거 불필요
-
-        pEl.appendChild(numRun)
-      }
-      break // 제목은 슬라이드당 1개
-    }
+    return replaceRepeatedSlideTitle(xmlDoc, titleText, pageNum, totalPages, ['[제목]', titleLabel].filter(Boolean))
   }
 
   // 슬라이드에서 label이 몇 번 등장하는지 카운트
@@ -2607,23 +2537,13 @@ async function downloadPhotoAssignPptx(btn, opts) {
         const pagePeople = people.slice(start, start + sheetSize)
         const slotPeople = {}
         pagePeople.forEach((p, i) => { slotPeople[i + 1] = p })  // 행 우선 1-based
-        pages.push({ sheetSize, slotPeople, slideTitle })
+        pages.push({ sheetSize, slotPeople, slideTitle, pageNum: Math.floor(start / sheetSize) + 1, totalPages: Math.ceil(people.length / sheetSize) })
       }
     }
 
     if (!pages.length) { showAutoAlert('❌ 생성할 인력이 없습니다.', false); return null }
 
-    // ── slideTitle 기준 pageNum / totalPages 계산 ──
-    // 동일 목차 제목끼리 묶어서 (N/total) 넘버링
-    // 1장짜리는 넘버링 없이 제목만, 2장 이상부터 (N/total) 추가
-    const titleCountMap = {}
-    pages.forEach(pg => { titleCountMap[pg.slideTitle] = (titleCountMap[pg.slideTitle] || 0) + 1 })
-    const titleSeqMap = {}
-    pages.forEach(pg => {
-      titleSeqMap[pg.slideTitle] = (titleSeqMap[pg.slideTitle] || 0) + 1
-      pg.pageNum    = titleSeqMap[pg.slideTitle]
-      pg.totalPages = titleCountMap[pg.slideTitle]
-    })
+    // 페이지 번호는 위에서 목차별로 계산한다. 제목이 같은 다른 목차와 합산하지 않는다.
 
     // ── photo-profile API 호출: 등장하는 모든 인원의 profile 로드 ──
     const proposalId = parsedData.proposalId || 0

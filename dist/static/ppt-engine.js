@@ -783,6 +783,44 @@ async function _mergeForeign({ baseZip, srcZip, srcPresXml, srcPresRels, activeL
  * @param {object} vm    - ProjectViewModel
  * @returns {Promise<{zip: JSZip, slideCount: number, mergeStrategy: string} | null>}
  */
+// 실제 제목 토큰만 치환하고, 반복 목차의 번호를 별도 16pt 런으로 붙인다.
+// 분산 런/공백 토큰과 XML 특수문자를 지원하며 단락·본문 서식은 유지한다.
+function replaceRepeatedSlideTitle(doc, title, page, total, labels = ['[제목]']) {
+  const A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+  const clean = s => String(s).replace(/\s/g, '');
+  for (const p of Array.from(doc.getElementsByTagNameNS(A, 'p'))) {
+    const runs = Array.from(p.getElementsByTagNameNS(A, 'r'));
+    const texts = runs.map(r => r.getElementsByTagNameNS(A, 't')[0]);
+    const original = texts.map(t => t?.textContent || '').join('');
+    const normalized = clean(original);
+    const label = labels.map(clean).find(s => s && normalized.includes(s));
+    if (!label) continue;
+    const indices = [];
+    for (let i = 0; i < original.length; i++) if (!/\s/.test(original[i])) indices.push(i);
+    const at = normalized.indexOf(label), start = indices[at], end = indices[at + label.length - 1] + 1;
+    let offset = 0, sourceRun = null;
+    texts.forEach((t, i) => {
+      const text = t?.textContent || '', from = offset, to = from + text.length; offset = to;
+      if (!t || to <= start || from >= end) return;
+      const first = from <= start;
+      if (first) sourceRun = runs[i];
+      t.textContent = text.slice(0, Math.max(0, start - from)) + (first ? title : '') + text.slice(Math.max(0, end - from));
+    });
+    if (total > 1 && sourceRun) {
+      const r = doc.createElementNS(A, 'a:r');
+      const sourcePr = sourceRun.getElementsByTagNameNS(A, 'rPr')[0];
+      const pr = sourcePr ? sourcePr.cloneNode(true) : doc.createElementNS(A, 'a:rPr');
+      pr.setAttribute('sz', '1600'); pr.setAttribute('i', '1');
+      r.appendChild(pr);
+      const t = doc.createElementNS(A, 'a:t'); t.textContent = ` (${page}/${total})`; r.appendChild(t);
+      const endPr = Array.from(p.childNodes).find(n => n.localName === 'endParaRPr');
+      p.insertBefore(r, endPr || null);
+    }
+    return true;
+  }
+  return false;
+}
+
 async function generateMenuPpt(menu, vm) {
   if (!menu || !menu.is_enabled) return null;
 
@@ -1115,12 +1153,11 @@ async function downloadProposalPpt(btn, selectedCodes = null) {
       compressionOptions: { level: 6 },
     });
 
-    const d = new Date();
-    const dateStr = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+    const safeName = value => String(value ?? '').replace(/[\\/:*?"<>|\u0000-\u001F\u007F]/g, '_');
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = '검토용_자동화PPT_' + (parsedData.projectTitle || '').slice(0, 10) + '_' + dateStr + '.pptx';
+    a.download = '[자동화][본문] ' + safeName(parsedData.clientOrg) + '_' + safeName(parsedData.projectTitle) + '.pptx';
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
     showAutoAlert('검토용 PPT를 다운로드했습니다. 생성 결과의 누락·검토 항목을 확인하세요.', false);

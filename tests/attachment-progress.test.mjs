@@ -28,7 +28,7 @@ async function app(t, options = {}) {
   const key = '__attachment_mock_' + seq++;
   const calls = [];
   const functions = [...source.matchAll(/import \{ (build\w+)/g)].map(m => m[1]);
-  const mock = { queryOne: async () => null, fetchClientLogo: async () => { throw new Error('No logo call without active master'); },
+  const mock = { queryOne: async sql => sql.includes('audit_projects') ? (options.project === null ? null : options.project || { project_name: '시험사업', client_org: '시험기관' }) : null, fetchClientLogo: async () => { throw new Error('No logo call without active master'); },
     prepareAttachmentMaster: async () => { throw new Error('No active master'); }, mergeWithAttachmentMaster: async () => { throw new Error('No active master'); },
     mergeDecksSharingMaster: async decks => {
     calls.push('merge'); if (options.fail === 'merge') throw new Error('합본 시험 오류');
@@ -100,6 +100,18 @@ test('attachment legacy binary response remains compatible and slide totals use 
   assert.equal(summary[0].slideCount, 1); // not personCount * 2
   const zip = await JSZip.loadAsync(await res.arrayBuffer());
   assert.equal(Object.keys(zip.files).filter(k => /slide\d+\.xml$/.test(k)).length, 3);
+});
+test('attachment filenames preserve full saved names for stream and binary; free filename is fixed', async t => {
+  const project = { project_name: '40자를 초과하는 사업명도 생략하지 않는 전체 사업명 검증입니다 '.repeat(3) + '끝/검증', client_org: '기관:원문' };
+  const { route } = await app(t, { project });
+  const expected = '[자동화][첨부] 기관_원문_' + project.project_name.replace('/', '_') + '.pptx';
+  const f = form(); f.set('projectName', '조작'); f.set('clientOrg', '조작');
+  assert.equal((await parser()(await request(route, f), () => {})).filename, expected);
+  const binary = await request(route, form(), 1, false);
+  assert.equal(decodeURIComponent(binary.headers.get('Content-Disposition').match(/filename="([^"]+)"/)[1]), expected);
+  assert.equal((await parser()(await request(route, form(), 0), () => {})).filename, '[자동화][첨부] 커스텀생성.pptx');
+  const missing = await app(t, { project: null });
+  await assert.rejects(() => request(missing.route).then(res => parser()(res, () => {})), /사업을 찾을 수 없습니다/);
 });
 test('attachment free mode preserves names keywords and projectId=0 options', async t => {
   const { route } = await app(t, { observe: (name, id, args) => {

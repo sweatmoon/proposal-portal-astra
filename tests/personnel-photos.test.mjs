@@ -379,19 +379,22 @@ test('NAS failure warning preserves cause; stale images cleared', async () => {
 
 test('partial PPT downloads without confirm, while report stays attached', async () => {
   let clicked = false;
+  const anchor = { click() { clicked = true; } };
   const alerts = [];
+  const projectTitle = '긴 사업명 전체 보존 '.repeat(12) + '끝/검증';
   const c = vm.createContext({
-    PptxGenJS: {}, JSZip: {}, parsedData: { projectTitle: '검증' },
+    PptxGenJS: {}, JSZip: {}, parsedData: { clientOrg: '기관:원문', projectTitle },
     setBtnState() {}, buildProjectViewModel: () => ({}),
     generateProposalPpt: async () => ({ proposalReport: { status: '부분 생성' }, generateAsync: async () => new Blob(['pptx']) }),
     URL: { createObjectURL: () => 'blob:test', revokeObjectURL() {} },
-    document: { createElement: () => ({ click() { clicked = true; } }) },
+    document: { createElement: () => anchor },
     setTimeout() {}, showAutoAlert: msg => alerts.push(msg), console,
     confirm() { throw new Error('confirmation must not block download'); },
   });
   vm.runInContext(engine.slice(engine.indexOf('async function downloadProposalPpt('), engine.indexOf('function invalidatePptMenuCache(')), c);
   await c.downloadProposalPpt(null);
   assert.equal(clicked, true);
+  assert.equal(anchor.download, '[자동화][본문] 기관_원문_' + projectTitle.replace('/', '_') + '.pptx');
   assert.ok(alerts.some(a => a.includes('다운로드했습니다')));
   assert.ok(!detail.slice(detail.indexOf('async function downloadPhotoAssignPptx('), detail.indexOf('// ── 전체 합본 PPT')).includes('confirm('));
 });

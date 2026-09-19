@@ -195,6 +195,7 @@ test('attachment bundle uses saved project/org and attachment-only active master
  assert(zip);assert.equal(calls.filter(c=>c.logo).length,1);assert.equal(calls.find(c=>c.logo).logo,'저장기관');
  assert(events.find(e=>e.type==='item'&&e.key==='master').detail.includes('첨부 전용'));
  assert(events.at(-1).totalSlides===2);
+ assert.equal(events.at(-1).filename,'[자동화][첨부] 저장기관_저장된 사업명.pptx');
  const text=nodes(doc(await zip.file('ppt/slideLayouts/slideLayout2.xml').async('string')),'t',A).map(n=>n.textContent).join('');assert(text.includes('저장된 사업명'));assert(!text.includes('임의사업명금지'));
 });
 test('attachment free mode reports preserved tokens and invalid active master fails without silent fallback',async t=>{
