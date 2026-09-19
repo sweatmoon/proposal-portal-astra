@@ -122,8 +122,13 @@ export interface PersonnelProjectCareer {
   remarks: string
 }
 
+/** 사업별 배정과 무관한 공통 인력정보만 허용한다. 누락 필드는 동기화하지 않는다. */
+export type MemberProfileUpdates = Partial<Pick<PersonnelData,
+  'is_fulltime' | 'auditor_grade' | 'auditor_cert_no' | 'phone' | 'education_hours'>>
+
 export interface ParsedPersonnel {
   personnel: PersonnelData
+  memberProfileUpdates: MemberProfileUpdates
   certifications: PersonnelCertification[]
   audit_history: PersonnelAuditHistory[]
   it_career: PersonnelItCareer[]
@@ -176,6 +181,7 @@ export function parsePersonnelHtml(html: string): ParsedPersonnel {
     null
   const t4 = basicTable?.rows ?? []
 
+  const memberProfileUpdates: MemberProfileUpdates = {}
   const personnel: PersonnelData = {
     name: '', position: '', is_fulltime: 1, company: '',
     email: '', phone: '', birthdate: '',
@@ -217,7 +223,14 @@ export function parsePersonnelHtml(html: string): ParsedPersonnel {
       if (mName) personnel.name = mName[1]
       const mPos  = raw.match(/[（(]([^,）)]+)/)
       if (mPos) personnel.position = mPos[1].trim()
-      personnel.is_fulltime = raw.includes('상근') ? 1 : 0
+      // '비상근'의 부분 문자열을 '상근'으로 판정하지 않는다. 명시된 단어만 인정한다.
+      const employment = raw.match(/(?:^|[\s,(（])(?:비상근|상근)(?=$|[\s,)）])/g)
+        ?.map(value => value.trim().replace(/^[,(（]/, '').trim()) ?? []
+      const statuses = new Set(employment)
+      if (statuses.size === 1) {
+        personnel.is_fulltime = statuses.has('비상근') ? 0 : 1
+        memberProfileUpdates.is_fulltime = personnel.is_fulltime
+      }
       // 회사: 마지막 셀 (index off+5 기준)
       personnel.company = vRow[off + 5] ?? vRow[vRow.length - 1] ?? ''
     }
@@ -324,6 +337,17 @@ export function parsePersonnelHtml(html: string): ParsedPersonnel {
     personnel.education_name  = dr[0] ?? ''
     personnel.education_hours = extractNumber(dr[1] ?? '') ?? 0
     personnel.education_org   = dr[2] ?? ''
+    // 기본값 0과 실제 0시간을 구분한다. 엉뚱한 index 4 표/범위/음수/불명확 값은 전파하지 않는다.
+    const headers = (t5[0] ?? []).join(' ')
+    const rawHours = dr[1] ?? ''
+    const hours = rawHours.match(/^((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(?:시간|h|hours?)?$/i)
+    if (headers.includes('교육') && headers.includes('시간') && hours) {
+      const value = Number(hours[1].replace(/,/g, ''))
+      if (Number.isFinite(value) && value >= 0) {
+        personnel.education_hours = value
+        memberProfileUpdates.education_hours = value
+      }
+    }
   }
 
   // ── 3. 감리실적 (헤더: 연월|사업명|주관기관|공공/민간|담당분야|역할|참여단계|참여율) ──
@@ -480,5 +504,11 @@ export function parsePersonnelHtml(html: string): ParsedPersonnel {
     })
   }
 
-  return { personnel, certifications, audit_history, it_career, project_career }
+  for (const key of ['auditor_grade', 'auditor_cert_no', 'phone'] as const) {
+    const value = personnel[key].trim()
+    if (value && !/^(?:[-–—]+|없음|미입력|미등록|미확인|확인필요|N\/?A|null|undefined)$/i.test(value)) {
+      memberProfileUpdates[key] = value
+    }
+  }
+  return { personnel, memberProfileUpdates, certifications, audit_history, it_career, project_career }
 }
