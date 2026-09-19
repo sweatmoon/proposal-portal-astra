@@ -2177,9 +2177,55 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
         const baseEndRPr     = itPara.getElementsByTagNameNS(A_NS, 'endParaRPr')[0] ?? null
         const baseEndRPrClone = baseEndRPr ? baseEndRPr.cloneNode(true) : null
 
-        function makeItPara(line) {
+        // 2인 장표만 명시적 런 서식 적용. 단락/글머리표와 다른 장표 서식은 유지한다.
+        function careerRPr(color, source, tag = 'rPr') {
+          const props = itDoc.createElementNS(A_NS, 'a:' + tag)
+          if (source) {
+            Array.from(source.attributes).forEach(a => props.setAttribute(a.name, a.value))
+            Array.from(source.childNodes).forEach(n => props.appendChild(n.cloneNode(true)))
+          }
+          props.setAttribute('sz', '900')
+          // 굵기는 전용 Bold/Medium 서체로 지정하여 합성 볼드 중복을 방지한다.
+          props.setAttribute('b', '0')
+          Array.from(props.childNodes).forEach(n => {
+            if (['noFill', 'solidFill', 'gradFill', 'blipFill', 'pattFill', 'grpFill', 'latin', 'ea', 'cs'].includes(n.localName)) props.removeChild(n)
+          })
+          const fill = itDoc.createElementNS(A_NS, 'a:solidFill')
+          const rgb = itDoc.createElementNS(A_NS, 'a:srgbClr')
+          rgb.setAttribute('val', color)
+          fill.appendChild(rgb)
+          props.insertBefore(fill, Array.from(props.childNodes).find(n => n.nodeType === 1 && n.localName !== 'ln') || null)
+          const fontAnchor = Array.from(props.childNodes).find(n => ['sym', 'hlinkClick', 'hlinkMouseOver', 'rtl', 'extLst'].includes(n.localName)) || null
+          for (const tag of ['latin', 'ea', 'cs']) {
+            const font = itDoc.createElementNS(A_NS, 'a:' + tag)
+            font.setAttribute('typeface', color === '404040' ? 'KoPub돋움체 Medium' : 'KoPub돋움체 Bold')
+            props.insertBefore(font, fontAnchor)
+          }
+          return props
+        }
+
+        function makeItPara(line, lineIndex = 0) {
           const p = itDoc.createElementNS(A_NS, 'a:p')
           if (basePPrClone) p.appendChild(basePPrClone.cloneNode(true))
+          if (N === 2) {
+            const contentColor = lineIndex === 0 ? 'E60012' : '404040'
+            // 앞 분류명만 분리. 공백·괄호·특수문자 및 내용은 그대로 보존한다.
+            const prefix = line.match(/^\s*\[[^\]\r\n]+\]/)?.[0] || ''
+            const parts = prefix
+              ? [[prefix, '1655A2'], [line.slice(prefix.length), contentColor]]
+              : [[line, contentColor]]
+            for (const [text, color] of parts) {
+              if (!text) continue
+              const r = itDoc.createElementNS(A_NS, 'a:r')
+              r.appendChild(careerRPr(color, baseRPrClone))
+              const t = itDoc.createElementNS(A_NS, 'a:t')
+              t.textContent = text
+              r.appendChild(t)
+              p.appendChild(r)
+            }
+            p.appendChild(careerRPr(contentColor, baseEndRPrClone || baseRPrClone, 'endParaRPr'))
+            return p
+          }
           if (line) {
             const r = itDoc.createElementNS(A_NS, 'a:r')
             if (baseRPrClone) r.appendChild(baseRPrClone.cloneNode(true))
@@ -2210,8 +2256,8 @@ async function buildPhotoPptxFromTemplate(pages, templateZips) {
         if (!itLines.length) {
           txBody.insertBefore(makeItPara(''), anchor)
         } else {
-          itLines.forEach(line => {
-            txBody.insertBefore(makeItPara(line), anchor)
+          itLines.forEach((line, lineIndex) => {
+            txBody.insertBefore(makeItPara(line, lineIndex), anchor)
           })
         }
         txBody.removeChild(itPara)

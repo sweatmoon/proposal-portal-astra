@@ -1408,7 +1408,7 @@ test('history rejects missing source relationships instead of inventing a layout
 const photoSource = detailSource.slice(detailSource.indexOf('const PHOTO_LAYOUT_META ='), detailSource.indexOf('// ── downloadPhotoAssignPptx'));
 const photoMarker = label => Buffer.concat([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64'), Buffer.from(label)]);
 const photoPicture = (id, x, y, rid) => `<p:pic><p:nvPicPr><p:cNvPr id="${id}" name="picture-${id}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="400000" cy="500000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>`;
-async function photoFixture(size) {
+async function photoFixture(size, withCareer = false) {
   const columns = size < 6 ? [600000, 5400000] : [600000, 3450000, 6300000];
   const rows = size === 2 ? [1500000] : size === 9 ? [1500000, 3300000, 5000000] : [1500000, 4000000];
   let body = '', slot = 0;
@@ -1416,6 +1416,14 @@ async function photoFixture(size) {
     slot++;
     body += photoPicture(100 + slot, x + 100000, y + 50000, 'rId2');
     body += `<p:sp><p:nvSpPr><p:cNvPr id="${200 + slot}" name="name-${slot}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${x + 650000}" y="${y}"/><a:ext cx="1600000" cy="240000"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/>${para('[이름]')}</p:txBody></p:sp>`;
+  }
+  if (withCareer) {
+    let careerSlot = 0;
+    for (const y of rows) for (const x of columns) {
+      careerSlot++;
+      const style = '<a:rPr sz="1200" b="1"><a:solidFill><a:schemeClr val="accent1"/></a:solidFill><a:latin typeface="Original"/><a:ea typeface="Original"/></a:rPr>';
+      body += `<p:sp><p:nvSpPr><p:cNvPr id="${300 + careerSlot}" name="career-${careerSlot}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${x + 650000}" y="${y + 600000}"/><a:ext cx="3000000" cy="1000000"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/>${para('고정 경력 제목')}<a:p><a:pPr marL="10000" indent="-5000"><a:buChar char="•"/></a:pPr><a:r>${style}<a:t>[ IT</a:t></a:r><a:r>${style}<a:t>경력 ]</a:t></a:r><a:endParaRPr sz="1200"/></a:p>${para('고정 끝 문구')}</p:txBody></p:sp>`;
+    }
   }
   // Shared rId2 outside the slide must remain the original placeholder.
   // rId3/rId4 deliberately overlap renumbered IDs to catch a second remap pass.
@@ -1494,6 +1502,63 @@ for (const size of [2, 4, 6, 9]) {
       for (let s = 2; s <= size; s++) assert.deepEqual(await photoBytes(c, zip, path, 100 + s), photoMarker(`person-${s - 1}`));
       for (const [id, media] of [[900, 1], [901, 2], [902, 3]]) assert.deepEqual(await photoBytes(c, zip, path, id), photoMarker(`original-${size}-${media}`));
     }
+  });
+}
+
+for (const size of [2, 4, 6, 9]) {
+  test(`${size}-person career formatting is scoped, preserves text/paragraphs and survives merge`, async () => {
+    const c = photoContext(), T = c.ProposalTemplate, templates = await photoTemplates();
+    templates[size] = await photoFixture(size, true);
+    const values = ['  [시스템개발] 첫 내용 & <검증>\n[운영] 두 번째\n분류 없는 세 번째\n[분류만]\n닫히지 않은 [괄호', '분류 없는 첫 내용\n [개발] 일반 내용', '', '\n[재시작] 다음 장 첫 경력\n[기타] 후속'];
+    const pages = [0, 1].map(i => ({ sheetSize: size, slotPeople: {
+      1: { name: `인력${i}A`, profile: { IT경력: values[i * 2] } },
+      2: { name: `인력${i}B`, profile: { IT경력: values[i * 2 + 1] } },
+    } }));
+    const zip = await c.buildPhotoPptxFromTemplate(pages, templates);
+    const check = async (deck, paths) => {
+      for (let page = 0; page < 2; page++) {
+        const doc = T.parse(await deck.file(paths[page]).async('string'));
+        for (let slot = 1; slot <= 2; slot++) {
+          const sp = T.nodes(doc, 'sp', P).find(s => T.nodes(s, 'cNvPr', P)[0]?.getAttribute('id') === String(300 + slot));
+          assert(sp);
+          const paragraphs = T.nodes(sp, 'p');
+          assert.equal(T.text(paragraphs[0]), '고정 경력 제목');
+          assert.equal(T.text(paragraphs.at(-1)), '고정 끝 문구');
+          const lines = values[page * 2 + slot - 1].split('\n').filter(l => l.trim());
+          const content = paragraphs.slice(1, -1);
+          assert.equal(content.length, lines.length || 1);
+          for (let i = 0; i < content.length; i++) {
+            assert.equal(T.text(content[i]), lines[i] || '');
+            assert.equal(T.nodes(content[i], 'pPr')[0].getAttribute('marL'), '10000');
+            assert.equal(T.nodes(content[i], 'buChar')[0].getAttribute('char'), '•');
+            const runs = T.nodes(content[i], 'r'), prefix = (lines[i] || '').match(/^\s*\[[^\]\r\n]+\]/)?.[0];
+            for (let j = 0; j < runs.length; j++) {
+              const props = T.nodes(runs[j], 'rPr')[0];
+              if (size !== 2) {
+                assert.equal(props.getAttribute('sz'), '1200');
+                assert.equal(T.nodes(props, 'schemeClr')[0].getAttribute('val'), 'accent1');
+                assert.equal(T.nodes(props, 'ea')[0].getAttribute('typeface'), 'Original');
+                continue;
+              }
+              const color = prefix && j === 0 ? '1655A2' : i === 0 ? 'E60012' : '404040';
+              assert.equal(props.getAttribute('sz'), '900');
+              assert.equal(props.getAttribute('b'), '0');
+              assert.equal(T.nodes(props, 'srgbClr')[0].getAttribute('val'), color);
+              assert.equal(T.nodes(props, 'schemeClr').length, 0);
+              for (const font of ['latin', 'ea', 'cs']) assert.equal(T.nodes(props, font)[0].getAttribute('typeface'), color === '404040' ? 'KoPub돋움체 Medium' : 'KoPub돋움체 Bold');
+            }
+            if (size === 2) {
+              assert.equal(runs.length, lines[i] ? (prefix && prefix.length < lines[i].length ? 2 : 1) : 0);
+              assert.equal(T.nodes(content[i], 'endParaRPr')[0].getAttribute('sz'), '900');
+            }
+          }
+        }
+      }
+    };
+    await check(zip, await T.slidePaths(zip));
+    const base = await JSZip.loadAsync(await template(shape(para('앞 장표'))), { base64: true });
+    const merged = await c.mergePresentationZips([{ zip: base }, { zip, mergeStrategy: 'FOREIGN_TEMPLATE' }]);
+    await check(merged, (await T.slidePaths(merged)).slice(1));
   });
 }
 
